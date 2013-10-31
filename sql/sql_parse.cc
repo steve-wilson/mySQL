@@ -3690,7 +3690,7 @@ end_with_restore_list:
 
     res= mysql_load(thd, lex->exchange, first_table, lex->field_list,
                     lex->update_list, lex->value_list, lex->duplicates,
-                    lex->ignore, (bool) lex->local_file);
+                    lex->ignore, (bool) lex->local_file, (bool) lex->schema_merge);
     break;
   }
 

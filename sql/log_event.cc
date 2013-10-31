@@ -6497,7 +6497,7 @@ int Load_log_event::do_apply_event(NET* net, Relay_log_info const *rli,
       List<Item> tmp_list;
       if (open_temporary_tables(thd, &tables) ||
           mysql_load(thd, &ex, &tables, field_list, tmp_list, tmp_list,
-                     handle_dup, ignore, net != 0))
+                     handle_dup, ignore, net != 0, thd->lex->schema_merge))
         thd->is_slave_error= 1;
       if (thd->cuted_fields)
       {

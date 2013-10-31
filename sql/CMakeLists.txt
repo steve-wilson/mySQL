@@ -127,6 +127,7 @@ SET(SQL_SHARED_SOURCES
   sql_lex.cc 
   sql_list.cc
   sql_load.cc
+  adapt_schema.cc
   sql_locale.cc
   sql_manager.cc
   sql_optimizer.cc

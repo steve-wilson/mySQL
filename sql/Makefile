@@ -582,6 +582,30 @@ abstract_query_plan.cc.s:
 	cd /home/steve/mysql-server/mysql-5.6 && $(MAKE) -f sql/CMakeFiles/sql.dir/build.make sql/CMakeFiles/sql.dir/abstract_query_plan.cc.s
 .PHONY : abstract_query_plan.cc.s
 
+adapt_schema.o: adapt_schema.cc.o
+.PHONY : adapt_schema.o
+
+# target to build an object file
+adapt_schema.cc.o:
+	cd /home/steve/mysql-server/mysql-5.6 && $(MAKE) -f sql/CMakeFiles/sql.dir/build.make sql/CMakeFiles/sql.dir/adapt_schema.cc.o
+.PHONY : adapt_schema.cc.o
+
+adapt_schema.i: adapt_schema.cc.i
+.PHONY : adapt_schema.i
+
+# target to preprocess a source file
+adapt_schema.cc.i:
+	cd /home/steve/mysql-server/mysql-5.6 && $(MAKE) -f sql/CMakeFiles/sql.dir/build.make sql/CMakeFiles/sql.dir/adapt_schema.cc.i
+.PHONY : adapt_schema.cc.i
+
+adapt_schema.s: adapt_schema.cc.s
+.PHONY : adapt_schema.s
+
+# target to generate assembly for a file
+adapt_schema.cc.s:
+	cd /home/steve/mysql-server/mysql-5.6 && $(MAKE) -f sql/CMakeFiles/sql.dir/build.make sql/CMakeFiles/sql.dir/adapt_schema.cc.s
+.PHONY : adapt_schema.cc.s
+
 binlog.o: binlog.cc.o
 .PHONY : binlog.o
 
@@ -4933,6 +4957,9 @@ help:
 	@echo "... abstract_query_plan.o"
 	@echo "... abstract_query_plan.i"
 	@echo "... abstract_query_plan.s"
+	@echo "... adapt_schema.o"
+	@echo "... adapt_schema.i"
+	@echo "... adapt_schema.s"
 	@echo "... binlog.o"
 	@echo "... binlog.i"
 	@echo "... binlog.s"

@@ -40,6 +40,7 @@
 #include "debug_sync.h"         // DEBUG_SYNC
 #include <my_bit.h>
 #include <list>
+#include <iostream>
 
 #ifdef WITH_PARTITION_STORAGE_ENGINE
 #include "ha_partition.h"
@@ -7190,6 +7191,7 @@ int handler::ha_reset()
 
 int handler::ha_write_row(uchar *buf)
 {
+  std::cerr<<"WRITING TO TABLE:"<<buf<<std::endl;
   int error;
   Log_func *log_func= Write_rows_log_event::binlog_row_logging_function;
   DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE ||

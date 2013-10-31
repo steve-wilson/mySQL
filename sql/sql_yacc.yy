@@ -1509,6 +1509,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  RTREE_SYM
 %token  SAVEPOINT_SYM                 /* SQL-2003-R */
 %token  SCHEDULE_SYM
+%token  SCHEMA_MERGE_SYM
 %token  SCHEMA_NAME_SYM               /* SQL-2003-N */
 %token  SECOND_MICROSECOND_SYM
 %token  SECOND_SYM                    /* SQL-2003-R */
@@ -1718,7 +1719,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
         opt_natural_language_mode opt_query_expansion
         opt_ev_status opt_ev_on_completion ev_on_completion opt_ev_comment
         ev_alter_on_schedule_completion opt_ev_rename_to opt_ev_sql_stmt
-        trg_action_time trg_event
+        trg_action_time trg_event opt_schema_merge
 
 /*
   Bit field of MYSQL_START_TRANS_OPT_* flags.
@@ -13075,11 +13076,18 @@ load:
           }
           opt_load_data_charset
           { Lex->exchange->cs= $15; }
+          opt_schema_merge
+          { Lex->schema_merge = $17; }
           opt_xml_rows_identified_by
           opt_field_term opt_line_term opt_ignore_lines opt_field_or_var_spec
           opt_load_data_set_spec
           {}
           ;
+
+opt_schema_merge:
+            /* empty */ { $$=0; }
+        | SCHEMA_MERGE_SYM { $$=1; }
+        ;
 
 data_or_xml:
         DATA_SYM  { $$= FILETYPE_CSV; }
@@ -14363,6 +14371,7 @@ keyword_sp:
         | ROW_SYM                  {}
         | RTREE_SYM                {}
         | SCHEDULE_SYM             {}
+        | SCHEMA_MERGE_SYM         {}
         | SCHEMA_NAME_SYM          {}
         | SECOND_SYM               {}
         | SERIAL_SYM               {}
