@@ -21,6 +21,6 @@ class LoadCSV {
   }
 
   vector<vector<string>* >* load(int numberOfRows); 
-  vector<TypeInstance*> calculateColumnTypes();
+  vector<TypeInstance> calculateColumnTypes();
 };
 

@@ -3,10 +3,10 @@
 #include "loadcsv.h"
 #include "csv_parser.hpp"
 
-void print(string tableName, vector<string> header, vector<TypeInstance*> data){
+void print(string tableName, vector<string> header, vector<TypeInstance> data){
   cout << tableName << "(";
   for(unsigned int i=0; i<data.size(); i++) {
-    cout << header[i] << " " << *data.at(i) << ((i<data.size()-1)? ", " : "");
+    cout << header[i] << " " << data.at(i) << ((i<data.size()-1)? ", " : "");
   }
   cout << ")";
 
@@ -49,7 +49,7 @@ LoadCSV::LoadCSV(string fn){
     header.push_back(row[i]);
   }
 }
-
+/*
 vector<vector<string>* >* LoadCSV::load(int numberOfRows){
   vector<vector<string>* >* ret = new vector<vector<string>* >();
   while(file_parser.has_more_rows() && numberOfRows-->0) {
@@ -66,13 +66,13 @@ vector<vector<string>* >* LoadCSV::load(int numberOfRows){
 
   return ret;
 }
-
-vector<TypeInstance*> LoadCSV::calculateColumnTypes() {
-  vector<TypeInstance*> typeForRow;
+*/
+vector<TypeInstance> LoadCSV::calculateColumnTypes() {
+  vector<TypeInstance> typeForRow;
   int numColumns = header.size();
 			
   for(int i=0; i<numColumns; i++) {
-    typeForRow.push_back(new TypeInstance(TNULL, 0));
+    typeForRow.push_back(TypeInstance(TNULL, 0));
   }
 
   long start = time(0);			
@@ -83,7 +83,9 @@ vector<TypeInstance*> LoadCSV::calculateColumnTypes() {
     csv_row row = file_parser.get_row();
     for (i = 0; i < row.size(); i++) {
       for(unsigned int a=0; a<row.size(); a++) {
-        typeForRow[a] = tm.leastCommonSuperType(typeForRow.at(a), tm.inferType(row[a]));
+        typeForRow[a] = tm.leastCommonSuperType(typeForRow.at(a), tm.inferType(&row[a]));
+//        typeForRow[a] = tm.leastCommonSuperType(typeForRow.at(a), TypeInstance(TNULL, 0));
+
       }
     }
 

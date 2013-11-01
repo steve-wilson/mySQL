@@ -1,15 +1,21 @@
 #include <map>
-#include <regex.h>
+#include <string>
+#include "regex.h"
 
-#define TYPECOUNT 8
+#define TYPECOUNT 13
 
 enum Type {
   TNULL=0,
   NVARCHAR,
   BIT,
+  TINYINT,
+  UTINYINT,
   SMALLINT,
   USMALLINT,
+  MEDIUMINT,
+  UMEDIANINT,
   INTEGER,
+  UINTEGER,
   DECIMAL,
   DATE
 };
@@ -35,38 +41,41 @@ class TypeInstance {
     scale = -1;
   }
 
-  TypeInstance(Type t, int p, int s) {
+  TypeInstance(Type t, int p, short s) {
     type = t;
     precision = p;
     scale = s;
   }
 
-  bool hasScale() {
+  inline bool hasScale() {
     return scale!=-1;
   }
 
-  bool hasPrecision() {
+  inline bool hasPrecision() {
     return precision!=-1;
   }
 
-  bool isUnsigned() {
+  inline bool isUnsigned() {
     switch(type) {
+      case UTINYINT:
       case USMALLINT:
+      case UMEDIUMINT:
+      case UINTEGER:
         return true;
     }
 
     return false;
   }
 
-  Type getType(){
+  inline Type getType(){
     return type;
   }
 
-  int getPrecision() {
+  inline int getPrecision() {
     return precision;
   }
 
-  int getScale() {
+  inline int getScale() {
     return scale;
   }
 
@@ -146,7 +155,7 @@ class TypeManager {
     children[t].push_back(s);
   }
 
-  int fudgeFactor(Type t) {
+  inline int fudgeFactor(Type t) {
     switch(t) {
       case TNULL:
       case NVARCHAR: 
@@ -167,19 +176,11 @@ class TypeManager {
     regcomp(&INTEGER_REGEX, "^-{0,1}[0-9]+$", REG_EXTENDED | REG_NOSUB);
     regcomp(&DECIMAL_REGEX, "^-{0,1}[0-9]*\\.[0-9]+$", REG_EXTENDED | REG_NOSUB);
 
-    rank[NVARCHAR]=0;
-    rank[BIT]=0;
-    rank[SMALLINT]=0;
-    rank[USMALLINT]=0;
-    rank[INTEGER]=0;
-    rank[DECIMAL]=0;
-    rank[TNULL]=0;
-    rank[DATE]=0;
-
     rootType = NVARCHAR;
 
-    setParent(BIT, USMALLINT);
-    setParent(USMALLINT, INTEGER);
+    setParent(BIT, UTINYINT);
+    setParent(UTINYINT, USMALLINT);
+    setParent(USMALLINT, UINTEGER);
     setParent(SMALLINT, INTEGER);
     setParent(INTEGER, DECIMAL);
     setParent(DECIMAL, rootType);
@@ -194,13 +195,32 @@ class TypeManager {
     }
   }
   
-  bool match(regex_t* exp, string value) {
-    return regexec(exp, value.c_str(), 0, NULL, 0)==0;
+  inline bool matchInt(const char* d, unsigned int length) {
+    for(unsigned int i=0; i<length; i++) {
+      if(d[i]<'0' || d[i]>'9')
+        return false;
+    }
+
+    return true;
   }
 
-  int parseInt(string value) {
+  inline bool matchDouble(const char* d, unsigned int length) {
+    bool dot = false;
+    for(unsigned int i=0; i<length; i++) {
+      if(d[i]<'0' || d[i]>'9') {
+        if(d[i]=='.' && !dot)
+          dot = true;
+        else
+          return false;
+      }
+    }
+
+    return dot;
+  }
+
+  int parseInt(const char* value) {
     int i;
-    sscanf(value.c_str(), "%d", &i);
+    sscanf(value, "%d", &i);
     return i;
   }
 
@@ -210,32 +230,35 @@ class TypeManager {
   * @param value
   * @return
   */
-  TypeInstance* inferType(string value) {
-    if(value.empty())
-      return new TypeInstance(TNULL);
-	
-    if(match(&INTEGER_REGEX, value)) {
-      int length = value.length();
-      if(value.c_str()[0]=='-')
-        length--;
-			
-      int v = parseInt(value);
-      if(v<0 && v>=-32768)
-        return new TypeInstance(SMALLINT, length);
-      else if(v<65535)
-        return new TypeInstance(USMALLINT, length);
-      else
-        return new TypeInstance(INTEGER, length);
-    } else if(match(&DECIMAL_REGEX, value)) {
-      int length = value.length()-1;
-      int scale = value.length() - value.find(".") - 1;
-      if(value.c_str()[0]=='-')
+  inline TypeInstance inferType(string* value) {
+    unsigned int length = value->length();
+    const char* d = value->c_str();
+    if(length==0)
+      return TypeInstance(TNULL);
+
+    if(matchInt(d, length)) {
+      if(d[0]=='-')
         length--;
 
-       return new TypeInstance(DECIMAL, length, scale);
+      int v = atoi(d);
+      if(v<0 && v>=-32768)
+        return TypeInstance(SMALLINT, length);
+      else if(v<65535)
+        return TypeInstance(USMALLINT, length);
+      else
+        return TypeInstance(INTEGER, length);
+    } else if(matchDouble(d, length)) {
+      int l = length-1;
+      int scale = l - value->find(".") - 1;
+      if(d[0]=='-')
+        length--;
+
+       return TypeInstance(DECIMAL, l, scale);
     } else {
-      return new TypeInstance(NVARCHAR, value.length());
-    }
+      return TypeInstance(NVARCHAR, length);
+   }
+
+    return TypeInstance(TNULL);
   }
 
   std::map<Type,int> getMap() {
@@ -246,21 +269,21 @@ class TypeManager {
     return lcs[type1][type2];
   }
 
-  TypeInstance* leastCommonSuperType(TypeInstance* original, TypeInstance* newType) {
-    Type type = getLeastCommonType(original->getType(), newType->getType());
+  inline TypeInstance leastCommonSuperType(TypeInstance original, TypeInstance newType) {
+    Type type = getLeastCommonType(original.getType(), newType.getType());
 
     // Make sure the precision of the new type fits all possible data
-    int op = original->getPrecision();
-    if(type!=original->getType())
-      op += fudgeFactor(original->getType());
+    int op = original.getPrecision();
+    if(type!=original.getType())
+      op += fudgeFactor(original.getType());
 		
-    int np = newType->getPrecision();
-    if(type!=newType->getType())
-      np += fudgeFactor(newType->getType());
+    int np = newType.getPrecision();
+    if(type!=newType.getType())
+      np += fudgeFactor(newType.getType());
 		
     int precision = std::max(op, np);
-    int scale = std::max(original->getScale(), newType->getScale());
+    int scale = std::max(original.getScale(), newType.getScale());
 		
-    return new TypeInstance(type, precision, scale);
+    return TypeInstance(type, precision, scale);
   }
 };
