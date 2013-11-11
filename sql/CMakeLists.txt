@@ -128,6 +128,8 @@ SET(SQL_SHARED_SOURCES
   sql_list.cc
   sql_load.cc
   adapt_schema.cc
+  loadcsv.cc
+  reader.cc
   sql_locale.cc
   sql_manager.cc
   sql_optimizer.cc

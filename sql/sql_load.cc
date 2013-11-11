@@ -18,6 +18,7 @@
 /* Copy data from a textfile to table */
 /* 2006-12 Erik Wetterberg : LOAD XML added */
 
+#include <fstream>
 #include "sql_priv.h"
 #include "unireg.h"
 #include "sql_load.h"
@@ -41,6 +42,8 @@
 #include "sql_show.h"
 #include "adapt_schema.h"
 #include <algorithm>
+
+#include "reader.h"
 
 #include <iostream>
 
@@ -204,6 +207,37 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
   bool transactional_table;
   DBUG_ENTER("mysql_load");
 
+  const int escape_char= (escaped->length() && (ex->escaped_given() ||
+                          !(thd->variables.sql_mode & MODE_NO_BACKSLASH_ESCAPES)))
+                          ? (*escaped)[0] : INT_MAX;
+
+  // make changes to schema if desired and required
+  if (merge_with_table_schema) {
+#ifndef EMBEDDED_LIBRARY
+    if (read_file_from_client)
+    {
+      (void)net_request_file(&thd->net,ex->file_name);
+      file = -1;
+    }
+#endif
+
+    if (update_schema_to_accomodate_data(file, 0,
+                      ex->cs ? ex->cs : thd->variables.collation_database,
+		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
+		      escape_char, read_file_from_client, is_fifo, thd, ex, table_list, SCHEMA_UPDATE_NIAVE))
+          DBUG_RETURN(TRUE);
+    skip_lines++;
+  }
+ 
+/*
+  // make changes to schema if desired and required
+  if (merge_with_table_schema)
+      if (update_schema_to_accomodate_data(file, 0,
+                      ex->cs ? ex->cs : thd->variables.collation_database,
+		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
+		      escape_char, read_file_from_client, is_fifo, ex, SCHEMA_UPDATE_NIAVE))
+          DBUG_RETURN(TRUE);
+*/
   /*
     Bug #34283
     mysqlbinlog leaves tmpfile after termination if binlog contains
@@ -232,12 +266,6 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
                  WARN_NON_ASCII_SEPARATOR_NOT_IMPLEMENTED,
                  ER(WARN_NON_ASCII_SEPARATOR_NOT_IMPLEMENTED));
   } 
-
-  // make changes to schema if desired and required
-  if (merge_with_table_schema)
-      if (update_schema_to_accomodate_data(thd, ex, table_list, SCHEMA_UPDATE_NIAVE))
-          DBUG_RETURN(TRUE);
-
   if (open_and_lock_tables(thd, table_list, TRUE, 0))
     DBUG_RETURN(TRUE);
   if (setup_tables_and_check_access(thd, &thd->lex->select_lex.context,
@@ -307,10 +335,6 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
     if (setup_fields(thd, Ref_ptr_array(), set_values, MARK_COLUMNS_READ, 0, 0))
       DBUG_RETURN(TRUE);
   }
-
-  const int escape_char= (escaped->length() && (ex->escaped_given() ||
-                          !(thd->variables.sql_mode & MODE_NO_BACKSLASH_ESCAPES)))
-                          ? (*escaped)[0] : INT_MAX;
 
   /* We can't give an error in the middle when using LOCAL files */
   if (read_file_from_client && handle_duplicates == DUP_ERROR)
@@ -443,16 +467,24 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
     if ((stat_info.st_mode & S_IFIFO) == S_IFIFO)
       is_fifo= 1;
 #endif
+
     if ((file= mysql_file_open(key_file_load,
-                               name, O_RDONLY, MYF(MY_WME))) < 0)
-
+                               name, O_RDONLY, MYF(MY_WME))) < 0){
       DBUG_RETURN(TRUE);
+    }
   }
-
+/*
+      std::ofstream outfile;
+      outfile.open("/tmp/update_schema_artifact");
+      outfile << "test123" << "\n";
+      outfile << file << "\n";
+      outfile.close();
+*/
   READ_INFO read_info(file,tot_length,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
 		      info.escape_char, read_file_from_client, is_fifo);
+
   if (read_info.error)
   {
     if (file >= 0)

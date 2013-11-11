@@ -76,10 +76,6 @@ LoadCSV::LoadCSV(READER * r)
   reader->next_line();
 }
 
-LoadCSV::~LoadCSV() {
-  delete reader;
-}
-
 vector<TypeInstance> LoadCSV::calculateColumnTypes() {
   vector<TypeInstance> typeForRow;
   int numColumns = header.size();

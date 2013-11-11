@@ -18,7 +18,6 @@ class LoadCSV {
   public:
 
   LoadCSV(READER * reader);
-  ~LoadCSV();
 
   vector<string> getHeader() {
     return header;
