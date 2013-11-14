@@ -5,7 +5,8 @@
 #include <deque>
 #include <sstream>
 #include <vector>
-	 
+#include <locale>
+
 using namespace std;
 
 #define UNSIGNED_STRING "UNSIGNED"
@@ -403,13 +404,20 @@ typeAndMD getTypeMDObjFromString(string typeString)
 	return typeMD;
 }
 
+void stringToUpper(string &s)
+{
+	for(int i = 0; i < s.length(); ++i)
+		s[i] = toupper(s[i]);
+}
+
 void getNameAndTypeMD(string &schema, size_t endingPos, size_t delimiterLength, string &name, typeAndMD &typeMD)
 {
 	string typeString;
 
 	name = getField(schema, 0, " ");
+	stringToUpper(name);
+	
 	typeString = getType(schema, " ", endingPos);	
-
 	typeMD = getTypeMDObjFromString(typeString);
 }
 
