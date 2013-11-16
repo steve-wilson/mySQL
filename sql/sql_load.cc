@@ -39,7 +39,6 @@
 #include "sp_head.h"
 #include "sql_trigger.h"
 #include "sql_show.h"
-#include "adapt_schema.h"
 #include <algorithm>
 
 #include <iostream>
@@ -176,7 +175,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
 	        List<Item> &fields_vars, List<Item> &set_fields,
                 List<Item> &set_values,
                 enum enum_duplicates handle_duplicates, bool ignore,
-                bool read_file_from_client, bool merge_with_table_schema)
+                bool read_file_from_client, schema_update_method  merge_method)
 {
   // reaches this line, (verified via gdb) but cerr doesn't go to terminal
   //std::cerr << "in mysql_load() from sql/sql_load.cc" << std::endl;
@@ -234,9 +233,11 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
   } 
 
   // make changes to schema if desired and required
-  if (merge_with_table_schema)
-      if (update_schema_to_accomodate_data(thd, ex, table_list, SCHEMA_UPDATE_NIAVE))
+  if (merge_method !=  SCHEMA_UPDATE_NONE)
+      if (update_schema_to_accomodate_data(thd, ex, table_list, merge_method))
           DBUG_RETURN(TRUE);
+
+// TODO: create table if it does not already exist
 
   if (open_and_lock_tables(thd, table_list, TRUE, 0))
     DBUG_RETURN(TRUE);

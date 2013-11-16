@@ -2,6 +2,8 @@
 #include "adapt_schema.h"
 #include <fstream>
 #include <iostream>
+#include <my_global.h>
+#include <mysql.h>
 
 bool update_schema_to_accomodate_data(THD *thd, sql_exchange *ex, TABLE_LIST *table_list, schema_update_method method){
     /*
@@ -21,4 +23,24 @@ bool update_schema_to_accomodate_data(THD *thd, sql_exchange *ex, TABLE_LIST *ta
     outfile << "The function was actually called!\n";
     outfile.close();
     return 0;
+/*
+    MYSQL *con = mysql_init(NULL);
+    if (con == NULL){
+        return 1;
+    }
+
+    if (mysql_real_connect(con, "localhost", "root", "", NULL, 0, NULL, 0)==NULL)
+    {
+        mysql_close(con);
+        return 1;
+    }
+
+    if (mysql_query(con, "CREATE TABLE test_table")){
+        mysql_close(con);
+        return 1;
+    }
+
+    mysql_close(con);
+    return 0;
+    */
 }

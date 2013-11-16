@@ -28,6 +28,7 @@
 #include "sql_array.h"
 #include "mem_root_array.h"
 #include "sql_alter.h"                // Alter_info
+#include "adapt_schema.h"
 
 /* YACC and LEX Definitions */
 
@@ -2392,7 +2393,7 @@ struct LEX: public Query_tables_list
   /* 
     Use schema merging when loading data from CSV file
   */
-  bool schema_merge;
+  schema_update_method schema_merge;
 
   bool drop_if_exists, drop_temporary, local_file, one_shot_set;
   bool autocommit;

@@ -2406,6 +2406,11 @@ static const String default_field_term("\t",default_charset_info);
 static const String default_xml_row_term("<row>", default_charset_info);
 static const String my_empty_string("",default_charset_info);
 
+// Defaults for csv format
+static const String csv_default_line_term("\r\n",default_charset_info);
+static const String csv_default_enclosed("\"",default_charset_info);
+static const String csv_default_field_term(",",default_charset_info);
+
 
 sql_exchange::sql_exchange(char *name, bool flag,
                            enum enum_filetype filetype_arg)
@@ -2425,6 +2430,12 @@ bool sql_exchange::escaped_given(void)
   return escaped != &default_escaped;
 }
 
+void sql_exchange::use_csv_defaults(){
+    field_term = &csv_default_field_term;
+    enclosed = &csv_default_enclosed;
+    line_term = &csv_default_line_term;
+    opt_enclosed = 1;
+}
 
 bool select_send::send_result_set_metadata(List<Item> &list, uint flags)
 {

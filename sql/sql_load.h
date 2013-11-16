@@ -21,6 +21,7 @@
 class Item;
 
 #include "sql_class.h"                          /* enum_duplicates */
+#include "adapt_schema.h"                       /* schema_update_method */
 
 class sql_exchange;
 
@@ -28,7 +29,7 @@ int mysql_load(THD *thd, sql_exchange *ex, TABLE_LIST *table_list,
 	        List<Item> &fields_vars, List<Item> &set_fields,
                 List<Item> &set_values_list,
                 enum enum_duplicates handle_duplicates, bool ignore,
-                bool local_file, bool schema_merge);
+                bool local_file, schema_update_method method);
 
 
 #endif /* SQL_LOAD_INCLUDED */

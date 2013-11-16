@@ -68,6 +68,7 @@
 #include "set_var.h"
 #include "opt_explain_traditional.h"
 #include "opt_explain_json.h"
+#include "adapt_schema.h"
 
 /* this is to get the bison compilation windows warnings out */
 #ifdef _MSC_VER
@@ -1069,6 +1070,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  ASCII_SYM                     /* MYSQL-FUNC */
 %token  ASENSITIVE_SYM                /* FUTURE-USE */
 %token  AT_SYM                        /* SQL-2003-R */
+%token  AUTO_SYM
 %token  AUTOEXTEND_SIZE_SYM
 %token  AUTO_INC
 %token  AVG_ROW_LENGTH
@@ -1719,7 +1721,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
         opt_natural_language_mode opt_query_expansion
         opt_ev_status opt_ev_on_completion ev_on_completion opt_ev_comment
         ev_alter_on_schedule_completion opt_ev_rename_to opt_ev_sql_stmt
-        trg_action_time trg_event opt_schema_merge
+        trg_action_time trg_event opt_schema_merge_method
 
 /*
   Bit field of MYSQL_START_TRANS_OPT_* flags.
@@ -13077,7 +13079,11 @@ load:
           opt_load_data_charset
           { Lex->exchange->cs= $15; }
           opt_schema_merge
-          { Lex->schema_merge = $17; }
+          {
+            // set defaults to CSV file format
+            DBUG_ASSERT(Lex->exchange != 0);
+            Lex->exchange->use_csv_defaults();
+          }
           opt_xml_rows_identified_by
           opt_field_term opt_line_term opt_ignore_lines opt_field_or_var_spec
           opt_load_data_set_spec
@@ -13085,9 +13091,16 @@ load:
           ;
 
 opt_schema_merge:
-            /* empty */ { $$=0; }
-        | SCHEMA_MERGE_SYM { $$=1; }
+            /* empty */ { Lex->schema_merge = SCHEMA_UPDATE_NONE; }
+        | SCHEMA_MERGE_SYM opt_schema_merge_method
         ;
+
+opt_schema_merge_method:
+            /* empty */ { Lex->schema_merge = SCHEMA_UPDATE_DEFAULT;}
+            | ALTER { Lex->schema_merge = SCHEMA_UPDATE_ALTER;}
+            | VIEW_SYM { Lex->schema_merge = SCHEMA_UPDATE_VIEW;}
+            | AUTO_SYM { Lex->schema_merge = SCHEMA_UPDATE_AUTO;}
+            ;
 
 data_or_xml:
         DATA_SYM  { $$= FILETYPE_CSV; }
@@ -14147,6 +14160,7 @@ keyword_sp:
         | ANALYSE_SYM              {}
         | ANY_SYM                  {}
         | AT_SYM                   {}
+        | AUTO_SYM                 {}
         | AUTO_INC                 {}
         | AUTOEXTEND_SIZE_SYM      {}
         | AVG_ROW_LENGTH           {}
