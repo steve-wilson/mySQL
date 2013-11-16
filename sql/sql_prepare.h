@@ -90,6 +90,17 @@ public:
   virtual ~Server_runnable();
 };
 
+/**
+ * Execute one SQL statement in an isolated context.
+ */
+class Execute_sql_statement: public Server_runnable
+{
+public:
+  Execute_sql_statement(LEX_STRING sql_text);
+  virtual bool execute_server_code(THD *thd);
+private:
+  LEX_STRING m_sql_text;
+};
 
 /**
   Execute direct interface.
@@ -298,6 +309,10 @@ public:
   {
     m_current_rset= m_current_rset->m_next_rset;
     return test(m_current_rset);
+  }
+
+  THD* getTHD() {
+    return m_thd;
   }
 
   ~Ed_connection() { free_old_result(); }

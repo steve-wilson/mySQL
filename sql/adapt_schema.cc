@@ -1,11 +1,39 @@
-
 #include "adapt_schema.h"
+#include <sstream>
 #include <fstream>
 #include <iostream>
-#include <my_global.h>
-#include <mysql.h>
+#include "loadcsv.h"
+#include "sql_parse.h"
+#include "transaction.h"
+#include "sql_prepare.h"
+#include "simplesql.h"
+#include "computeNextSchema.h"
 
-bool update_schema_to_accomodate_data(THD *thd, sql_exchange *ex, TABLE_LIST *table_list, schema_update_method method){
+string toUpper(string str) {
+  std::transform(str.begin(), str.end(), str.begin(), ::toupper);
+
+  return str;
+}
+
+string resultToSchema(string db, string table, List<Ed_row> list) {
+  List_iterator<Ed_row> it(list);
+
+  std::stringstream ss;
+
+  ss << db << "." << table << "(";
+  int first = 0;
+  Ed_row* row;
+  while((row=it++)!=NULL) {
+    ss << ((first++)? ", " : "") << 
+        row->get_column(0)->str << " " << 
+        toUpper(row->get_column(1)->str);
+  }
+  ss << ")";
+
+  return ss.str();
+}
+
+bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_INFO *cs, const String &field_term, const String &line_start, const String &line_term, const String &enclosed, int escape, bool get_it_from_net, bool is_fifo, THD* thd, sql_exchange *ex, TABLE_LIST *table_list, schema_update_method method){
     /*
         In this function we can make whatever calls are necessary
         in order to update the schema to accomodate the incoming data
@@ -15,32 +43,38 @@ bool update_schema_to_accomodate_data(THD *thd, sql_exchange *ex, TABLE_LIST *ta
         Update: ex->file_name is the name of the csv file
     */
 
-    //for now, just writing something to a file to prove that this function is getting called
+    Ed_connection c(thd);
+
+    // Get existing schema
+    List<Ed_row> it = executeQuery(c, "describe " + string(table_list->db)  + "." + string(table_list->table_name)); 
+    string oldSchema = resultToSchema(table_list->db, table_list->table_name, it);
+
+    // Get new schema
+    READER reader(file, tot_length,
+                        cs, field_term, line_start, line_term, enclosed,
+                        escape, get_it_from_net, is_fifo);
+    LoadCSV csv(table_list->db, table_list->table_name, &reader);
+
+    string newSchema = csv.calculateSchema();
+
+    // Printf generated schema to outfile
     std::ofstream outfile;
-    outfile.open("/tmp/update_schema_artifact");
-    if (!outfile.is_open())
-        return 1;
-    outfile << "The function was actually called!\n";
+    outfile.open("/tmp/update_schema_artifact", ios::out);
+    outfile << oldSchema << std::endl;
+    outfile << newSchema << std::endl;
     outfile.close();
+
+    vector<column> matches = csv.match(oldSchema, newSchema);
+
+    switch(method) {
+        case SCHEMA_UPDATE_NAIVE: 
+          prepareNaive(thd, oldSchema, newSchema, matches);
+          break;
+        case SCHEMA_UPDATE_VIEW:
+          prepareViews(thd, oldSchema, newSchema, matches);
+          break;
+    }
+
     return 0;
-/*
-    MYSQL *con = mysql_init(NULL);
-    if (con == NULL){
-        return 1;
-    }
-
-    if (mysql_real_connect(con, "localhost", "root", "", NULL, 0, NULL, 0)==NULL)
-    {
-        mysql_close(con);
-        return 1;
-    }
-
-    if (mysql_query(con, "CREATE TABLE test_table")){
-        mysql_close(con);
-        return 1;
-    }
-
-    mysql_close(con);
-    return 0;
-    */
 }
+
