@@ -1,8 +1,10 @@
+#include <sstream>
 #include <ctime>
 #include "loadcsv.h"
 
-std::ostream & operator<<(std::ostream & Str, TypeInstance& v) { 
-  Str << v.toString();
+/*
+std::ostream & operator<<(std::ostream & Str, typeAndMD& v) { 
+    Str << v.toString();
   if(v.hasPrecision()) {
     if(v.hasScale()) {
       Str << "(" << v.precision << "," << v.scale << ")";
@@ -15,7 +17,7 @@ std::ostream & operator<<(std::ostream & Str, TypeInstance& v) {
   return Str;
 }
 
-void print(string tableName, vector<string> header, vector<TypeInstance> data){
+void print(string tableName, vector<string> header, vector<typeAndMD> data){
   cout << tableName << "(";
   for(unsigned int i=0; i<data.size(); i++) {
     cout << header[i] << " " << data.at(i) << ((i<data.size()-1)? ", " : "");
@@ -34,38 +36,14 @@ void print(vector<vector<string>* >* data){
     cout << endl;
   }
 }
-/*
-int main(int argc, const char* argV[]) {
-  if(argc!=3) {
-    cout << "USAGE: loadcsv TableName /path/path/file.csv\n";
-    exit(1);
-  }
-
-  FILE * file = my_fopen(argV[2], O_RDONLY, MYF(MY_WME));
-  File f = my_fileno(file);
-
-  uint tot_length = 0;
-  const CHARSET_INFO *cs = &my_charset_bin;
-  const String field_term(",", cs);
-  const String line_start("", cs);
-
-  String line_term("\n", cs);
-  const String enclosed("\"", cs);
-  int escape = 0;
-  bool get_it_from_net = false;
-  bool is_fifo = false;
-
-  READER * reader = new READER(f, tot_length, cs, field_term, line_start, line_term,
-                        enclosed, escape, get_it_from_net, is_fifo);
-
-  LoadCSV csv(reader);
-  print(argV[1], csv.getHeader(), csv.calculateColumnTypes());
-}
 */
 
-LoadCSV::LoadCSV(READER * r)
+LoadCSV::LoadCSV(string dbs, string tables, READER * r)
 {
+  db = dbs;
+  table = tables;
   reader = r;
+
   // Get header
   while(!reader->read_field()) {
     uint length = reader->row_end-reader->row_start;
@@ -76,12 +54,38 @@ LoadCSV::LoadCSV(READER * r)
   reader->next_line();
 }
 
-vector<TypeInstance> LoadCSV::calculateColumnTypes() {
-  vector<TypeInstance> typeForRow;
+vector<column> LoadCSV::match(string schema1, string schema2) {
+  int pos1 = schema1.find("("); 
+  int pos2 = schema2.find("("); 
+  string s1 = schema1.substr(pos1+1, schema1.size()-pos1-2);
+  string s2 = schema2.substr(pos2+1, schema2.size()-pos2-2);
+  return tm.generateNewSchema(s1, s2);
+}
+
+string LoadCSV::calculateSchema() {
+  vector<string> header = getHeader();
+  vector<typeAndMD> data = calculateColumnTypes();
+
+  std::stringstream ss;
+  ss << db << "." << table << "(";
+
+  for(uint i=0; i<header.size(); i++) {
+    ss << header[i] << " " << 
+        toString(data.at(i)) << ((i<data.size()-1)? ", " : "");
+  }
+
+  ss << ")";
+
+  return ss.str();
+}
+
+vector<typeAndMD> LoadCSV::calculateColumnTypes() {
+  vector<typeAndMD> typeForRow;
   int numColumns = header.size();
 			
   for(int i=0; i<numColumns; i++) {
-    typeForRow.push_back(TypeInstance(TNULL, 0));
+    typeAndMD t = {(Type)-1, "NULL",-1,-1,false};
+    typeForRow.push_back(t);
   }
 
   long start = time(0);			
@@ -93,7 +97,8 @@ vector<TypeInstance> LoadCSV::calculateColumnTypes() {
       uint length = reader->row_end-reader->row_start;
       reader->row_start[length] = '\0';
 
-      typeForRow[a] = tm.leastCommonSuperType(typeForRow.at(a), tm.inferType((char*)reader->row_start, length));
+      typeAndMD inferredType = tm.inferType((char*)reader->row_start, length);
+      typeForRow[a] = tm.leastCommonTypeAndMD(typeForRow.at(a), inferredType);
       a++;
     }
 

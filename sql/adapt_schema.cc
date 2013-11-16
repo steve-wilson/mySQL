@@ -6,6 +6,32 @@
 #include "sql_parse.h"
 #include "transaction.h"
 #include "sql_prepare.h"
+#include "simplesql.h"
+#include "computeNextSchema.h"
+
+string toUpper(string str) {
+  std::transform(str.begin(), str.end(), str.begin(), ::toupper);
+
+  return str;
+}
+
+string resultToSchema(string db, string table, List<Ed_row> list) {
+  List_iterator<Ed_row> it(list);
+
+  std::stringstream ss;
+
+  ss << db << "." << table << "(";
+  int first = 0;
+  Ed_row* row;
+  while((row=it++)!=NULL) {
+    ss << ((first++)? ", " : "") << 
+        row->get_column(0)->str << " " << 
+        toUpper(row->get_column(1)->str);
+  }
+  ss << ")";
+
+  return ss.str();
+}
 
 bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_INFO *cs, const String &field_term, const String &line_start, const String &line_term, const String &enclosed, int escape, bool get_it_from_net, bool is_fifo, THD* thd, sql_exchange *ex, TABLE_LIST *table_list, schema_update_method method){
     /*
@@ -17,34 +43,38 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
         Update: ex->file_name is the name of the csv file
     */
 
+    Ed_connection c(thd);
+
+    // Get existing schema
+    List<Ed_row> it = executeQuery(c, "describe " + string(table_list->db)  + "." + string(table_list->table_name)); 
+    string oldSchema = resultToSchema(table_list->db, table_list->table_name, it);
+
+    // Get new schema
     READER reader(file, tot_length,
                         cs, field_term, line_start, line_term, enclosed,
                         escape, get_it_from_net, is_fifo);
+    LoadCSV csv(table_list->db, table_list->table_name, &reader);
 
-    LoadCSV csv(&reader);
- 
-    vector<string> header = csv.getHeader();
-    vector<TypeInstance> data = csv.calculateColumnTypes();
-
-    std::stringstream ss;
-    ss << "CREATE TABLE " << table_list->db << "." << table_list->table_name << "(";
-    for(uint i=0; i<header.size(); i++) {
-      ss << header[i] << " " << data.at(i) << ((i<data.size()-1)? ", " : "");
-    }
-    ss << ")";
+    string newSchema = csv.calculateSchema();
 
     // Printf generated schema to outfile
     std::ofstream outfile;
     outfile.open("/tmp/update_schema_artifact", ios::out);
-    outfile << ss.str() << std::endl;
+    outfile << oldSchema << std::endl;
+    outfile << newSchema << std::endl;
     outfile.close();
 
-    LEX_STRING query = {(char*)ss.str().c_str(), ss.str().length()};
+    vector<column> matches = csv.match(oldSchema, newSchema);
 
-    Execute_sql_statement st(query);
-    st.execute_server_code(thd);
-
-    thd->reset_for_next_command();
+    switch(method) {
+        case SCHEMA_UPDATE_NAIVE: 
+          prepareNaive(thd, oldSchema, newSchema, matches);
+          break;
+        case SCHEMA_UPDATE_VIEW:
+          prepareViews(thd, oldSchema, newSchema, matches);
+          break;
+    }
 
     return 0;
 }
+

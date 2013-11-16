@@ -3,27 +3,32 @@
 
 #include <string>
 #include <vector>
-#include "types.h"
+#include "computeNextSchema.h"
 #include "reader.h"
 
 using namespace std;
 
 class LoadCSV {
-  READER * reader;
+  string db;
+  string table;
 
-  TypeManager tm;
+  typeManager tm;
+
+  READER * reader;
 
   vector<string> header;
 
   public:
 
-  LoadCSV(READER * reader);
+  LoadCSV(string db, string table, READER * reader);
 
   vector<string> getHeader() {
     return header;
   }
 
-  vector<TypeInstance> calculateColumnTypes();
+  vector<typeAndMD> calculateColumnTypes();
+  string calculateSchema();
+  vector<column> match(string schema1, string schema2);
 };
 
 #endif

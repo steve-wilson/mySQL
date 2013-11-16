@@ -42,7 +42,6 @@
 #include "sql_show.h"
 #include "adapt_schema.h"
 #include <algorithm>
-
 #include "reader.h"
 
 #include <iostream>
@@ -224,7 +223,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
     if (update_schema_to_accomodate_data(file, 0,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
-		      escape_char, read_file_from_client, is_fifo, thd, ex, table_list, SCHEMA_UPDATE_NIAVE))
+		      escape_char, read_file_from_client, is_fifo, thd, ex, table_list, SCHEMA_UPDATE_NAIVE))
           DBUG_RETURN(TRUE);
     skip_lines++;
   }
@@ -235,7 +234,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
       if (update_schema_to_accomodate_data(file, 0,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
-		      escape_char, read_file_from_client, is_fifo, ex, SCHEMA_UPDATE_NIAVE))
+		      escape_char, read_file_from_client, is_fifo, ex, SCHEMA_UPDATE_NAIVE))
           DBUG_RETURN(TRUE);
 */
   /*

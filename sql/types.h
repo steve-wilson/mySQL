@@ -13,7 +13,7 @@ using namespace std;
 
 enum Type {
   TNULL=0,
-  NVARCHAR,
+  VARCHAR,
   BIT,
   SMALLINT,
   USMALLINT,
@@ -81,7 +81,7 @@ class TypeInstance {
   string toString() {
     switch(type) {
       case TNULL: return "NULL";
-      case NVARCHAR: return "NVARCHAR";
+      case VARCHAR: return "NVARCHAR";
       case BIT: return "BIT";
       case SMALLINT: return "SMALLINT";
       case USMALLINT: return "SMALLINT";
@@ -143,7 +143,7 @@ class TypeManager {
   inline int fudgeFactor(Type t) {
     switch(t) {
       case TNULL:
-      case NVARCHAR: 
+      case VARCHAR: 
       case BIT:
       case DATE: return 0;
       case SMALLINT:
@@ -161,7 +161,7 @@ class TypeManager {
     regcomp(&INTEGER_REGEX, "^-{0,1}[0-9]+$", REG_EXTENDED | REG_NOSUB);
     regcomp(&DECIMAL_REGEX, "^-{0,1}[0-9]*\\.[0-9]+$", REG_EXTENDED | REG_NOSUB);
 
-    rootType = NVARCHAR;
+    rootType = VARCHAR;
 
     setParent(BIT, USMALLINT);
     setParent(USMALLINT, INTEGER);
@@ -252,7 +252,7 @@ class TypeManager {
          return TypeInstance(DECIMAL, l, scale);
       }
       case P_ELSE:
-        return TypeInstance(NVARCHAR, length);
+        return TypeInstance(VARCHAR, length);
     }
 
     return TypeInstance(TNULL);

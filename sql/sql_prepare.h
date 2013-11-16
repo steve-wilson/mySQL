@@ -311,6 +311,10 @@ public:
     return test(m_current_rset);
   }
 
+  THD* getTHD() {
+    return m_thd;
+  }
+
   ~Ed_connection() { free_old_result(); }
 private:
   Diagnostics_area m_diagnostics_area;

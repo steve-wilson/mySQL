@@ -129,6 +129,9 @@ SET(SQL_SHARED_SOURCES
   sql_load.cc
   adapt_schema.cc
   loadcsv.cc
+  computeNextSchema.cc
+  prepare_naive.cc
+  prepare_view.cc
   reader.cc
   sql_locale.cc
   sql_manager.cc
