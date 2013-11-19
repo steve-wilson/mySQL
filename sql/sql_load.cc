@@ -217,8 +217,79 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
       (void)net_request_file(&thd->net,ex->file_name);
       file = -1;
     }
+  else
+#endif
+  {
+#ifdef DONT_ALLOW_FULL_LOAD_DATA_PATHS
+    ex->file_name+=dirname_length(ex->file_name);
+#endif
+    if (!dirname_length(ex->file_name))
+    {
+      strxnmov(name, FN_REFLEN-1, mysql_real_data_home, tdb, NullS);
+      (void) fn_format(name, ex->file_name, name, "",
+		       MY_RELATIVE_PATH | MY_UNPACK_FILENAME);
+    }
+    else
+    {
+      (void) fn_format(name, ex->file_name, mysql_real_data_home, "",
+                       MY_RELATIVE_PATH | MY_UNPACK_FILENAME |
+                       MY_RETURN_REAL_PATH);
+    }
+
+    if (thd->slave_thread)
+    {
+#if defined(HAVE_REPLICATION) && !defined(MYSQL_CLIENT)
+      DBUG_ASSERT(active_mi != NULL);
+      if (strncmp(active_mi->rli->slave_patternload_file, name,
+                  active_mi->rli->slave_patternload_file_size))
+      {
+        /*
+          LOAD DATA INFILE in the slave SQL Thread can only read from 
+          --slave-load-tmpdir". This should never happen. Please, report a bug.
+        */
+
+        sql_print_error("LOAD DATA INFILE in the slave SQL Thread can only read from --slave-load-tmpdir. " \
+                        "Please, report a bug.");
+        my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--slave-load-tmpdir");
+        DBUG_RETURN(TRUE);
+      }
+#else
+      /*
+        This is impossible and should never happen.
+      */
+      DBUG_ASSERT(FALSE); 
+#endif
+    }
+    else if (!is_secure_file_path(name))
+    {
+      /* Read only allowed from within dir specified by secure_file_priv */
+      my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--secure-file-priv");
+      DBUG_RETURN(TRUE);
+    }
+
+#if !defined(__WIN__) && ! defined(__NETWARE__)
+    MY_STAT stat_info;
+    if (!my_stat(name, &stat_info, MYF(MY_WME)))
+      DBUG_RETURN(TRUE);
+
+    // if we are not in slave thread, the file must be:
+    if (!thd->slave_thread &&
+        !((stat_info.st_mode & S_IFLNK) != S_IFLNK &&   // symlink
+          ((stat_info.st_mode & S_IFREG) == S_IFREG ||  // regular file
+           (stat_info.st_mode & S_IFIFO) == S_IFIFO)))  // named pipe
+    {
+      my_error(ER_TEXTFILE_NOT_READABLE, MYF(0), name);
+      DBUG_RETURN(TRUE);
+    }
+    if ((stat_info.st_mode & S_IFIFO) == S_IFIFO)
+      is_fifo= 1;
 #endif
 
+    if ((file= mysql_file_open(key_file_load,
+                               name, O_RDONLY, MYF(MY_WME))) < 0){
+      DBUG_RETURN(TRUE);
+    }
+  }
     if (update_schema_to_accomodate_data(file, 0,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
