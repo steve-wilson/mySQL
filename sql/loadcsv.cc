@@ -84,7 +84,7 @@ vector<typeAndMD> LoadCSV::calculateColumnTypes() {
   int numColumns = header.size();
 			
   for(int i=0; i<numColumns; i++) {
-    typeAndMD t = {(Type)-1, "NULL",-1,-1,false};
+    typeAndMD t = {(TypeWrapper::Type)-1, "NULL",-1,-1,false};
     typeForRow.push_back(t);
   }
 

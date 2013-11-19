@@ -1,5 +1,6 @@
 #include <iostream>
 #include <string>
+#include <cstring>
 #include <set>
 #include <map>
 #include <deque>
@@ -21,17 +22,17 @@ set<string> mTypes(mTypesArray, mTypesArray + sizeof(mTypesArray) / sizeof(mType
 set<string> dTypes(dTypesArray, dTypesArray + sizeof(dTypesArray) / sizeof(dTypesArray[0]) );
 set<string> intTypes(intTypesArray, intTypesArray + sizeof(intTypesArray) / sizeof(intTypesArray[0]) );
 		
-map<string, Type> stringToEnum;
-map<Type, string> enumToString;
+map<string, TypeWrapper::Type> stringToEnum;
+map<TypeWrapper::Type, string> enumToString;
 
 void lcs::printlctMatrix()
 {
-	for(Type t1 = BIT; t1 < TYPECOUNT; t1 = Type(t1 + 1))
-		for(Type t2 = BIT; t2 < TYPECOUNT; t2 = Type(t2 + 1))
+	for(TypeWrapper::Type t1 = TypeWrapper::BIT; t1 < TypeWrapper::TYPECOUNT; t1 = TypeWrapper::Type(t1 + 1))
+		for(TypeWrapper::Type t2 = TypeWrapper::BIT; t2 < TypeWrapper::TYPECOUNT; t2 = TypeWrapper::Type(t2 + 1))
 		{
-			Type type = getLeastCommonSupertype(t1, t2);
-			if(type < TYPECOUNT)
-				cout << "lct of " << enumToString[t1] << " and " << enumToString[t2] << " = " << enumToString[static_cast<Type>(type)] << endl;
+			TypeWrapper::Type type = getLeastCommonSupertype(t1, t2);
+			if(type < TypeWrapper::TYPECOUNT)
+				cout << "lct of " << enumToString[t1] << " and " << enumToString[t2] << " = " << enumToString[static_cast<TypeWrapper::Type>(type)] << endl;
 		}
 }
 
@@ -47,11 +48,11 @@ void lcs::printOrderStack()
 
 void lcs::printTypesAndParents()
 {
-	map<Type, set<Type> >::iterator it;
+	map<TypeWrapper::Type, set<TypeWrapper::Type> >::iterator it;
     for(it = typeToParents.begin(); it != typeToParents.end(); ++it)
     {
         cout << it->first;
-        set<Type>::iterator it2;
+        set<TypeWrapper::Type>::iterator it2;
         for(it2 = it->second.begin(); it2 != it->second.end(); ++it2)
         {
             cout << " " << *it2;
@@ -100,68 +101,68 @@ void lcs::initializeGraph(Graph &g)
 
 void initializeStringsAndEnumsMaps()
 {
-	stringToEnum.insert(pair<string, Type>("BIT", BIT));
-	enumToString.insert(pair<Type, string>(BIT, "BIT"));
-	stringToEnum.insert(pair<string, Type>("TINYINT", TINYINT));
-	enumToString.insert(pair<Type, string>(TINYINT, "TINYINT"));
-	stringToEnum.insert(pair<string, Type>("SMALLINT", SMALLINT));
-	enumToString.insert(pair<Type, string>(SMALLINT, "SMALLINT"));
-	stringToEnum.insert(pair<string, Type>("MEDIUMINT", MEDIUMINT));
-	enumToString.insert(pair<Type, string>(MEDIUMINT, "MEDIUMINT"));
-	stringToEnum.insert(pair<string, Type>("INT", INT));
-    enumToString.insert(pair<Type, string>(INT, "INT"));
-	stringToEnum.insert(pair<string, Type>("INTEGER", INTEGER));
-	enumToString.insert(pair<Type, string>(INTEGER, "INTEGER"));
-	stringToEnum.insert(pair<string, Type>("BIGINT", BIGINT));
-	enumToString.insert(pair<Type, string>(BIGINT, "BIGINT"));
-	stringToEnum.insert(pair<string, Type>("REAL", REAL));
-	enumToString.insert(pair<Type, string>(REAL, "REAL"));
-	stringToEnum.insert(pair<string, Type>("DOUBLE", DOUBLE));
-	enumToString.insert(pair<Type, string>(DOUBLE, "DOUBLE"));
-	stringToEnum.insert(pair<string, Type>("DOUBLE_PRECISION", DOUBLE_PRECISION));
-	enumToString.insert(pair<Type, string>(DOUBLE_PRECISION, "DOUBLE_PRECISION"));
-	stringToEnum.insert(pair<string, Type>("FLOAT", FLOAT));
-	enumToString.insert(pair<Type, string>(FLOAT, "FLOAT"));
-	stringToEnum.insert(pair<string, Type>("DECIMAL", DECIMAL));
-	enumToString.insert(pair<Type, string>(DECIMAL, "DECIMAL"));
-	stringToEnum.insert(pair<string, Type>("DEC", DEC));
-	enumToString.insert(pair<Type, string>(DEC, "DEC"));
-	stringToEnum.insert(pair<string, Type>("NUMERIC", NUMERIC));
-	enumToString.insert(pair<Type, string>(NUMERIC, "NUMERIC"));
-	stringToEnum.insert(pair<string, Type>("DATE", DATE));
-	enumToString.insert(pair<Type, string>(DATE, "DATE"));
-	stringToEnum.insert(pair<string, Type>("TIME", TIME));
-	enumToString.insert(pair<Type, string>(TIME, "TIME"));
-	stringToEnum.insert(pair<string, Type>("TIMESTAMP", TIMESTAMP));
-	enumToString.insert(pair<Type, string>(TIMESTAMP, "TIMESTAMP"));
-	stringToEnum.insert(pair<string, Type>("DATETIME", DATETIME));
-	enumToString.insert(pair<Type, string>(DATETIME, "DATETIME"));
-	stringToEnum.insert(pair<string, Type>("YEAR", YEAR));
-	enumToString.insert(pair<Type, string>(YEAR, "YEAR"));
-	stringToEnum.insert(pair<string, Type>("CHAR", CHAR));
-	enumToString.insert(pair<Type, string>(CHAR, "CHAR"));
-	stringToEnum.insert(pair<string, Type>("VARCHAR", VARCHAR));
-	enumToString.insert(pair<Type, string>(VARCHAR, "VARCHAR"));
-	stringToEnum.insert(pair<string, Type>("BINARY", BINARY));
-	enumToString.insert(pair<Type, string>(BINARY, "BINARY"));
-	stringToEnum.insert(pair<string, Type>("VARBINARY", VARBINARY));
-	enumToString.insert(pair<Type, string>(VARBINARY, "VARBINARY"));
-	stringToEnum.insert(pair<string, Type>("TINYBLOB", TINYBLOB));
-    enumToString.insert(pair<Type, string>(TINYBLOB, "TINYBLOB"));
-    stringToEnum.insert(pair<string, Type>("BLOB", BLOB));
-    enumToString.insert(pair<Type, string>(BLOB, "BLOB"));
-	stringToEnum.insert(pair<string, Type>("MEDIUMBLOB", MEDIUMBLOB));
-    enumToString.insert(pair<Type, string>(MEDIUMBLOB, "MEDIUMBLOB"));
-	stringToEnum.insert(pair<string, Type>("LONGBLOB", LONGBLOB));
-    enumToString.insert(pair<Type, string>(LONGBLOB, "LONGBLOB"));
-	stringToEnum.insert(pair<string, Type>("TINYTEXT", TINYTEXT));
-	enumToString.insert(pair<Type, string>(TINYTEXT, "TINYTEXT"));
-	stringToEnum.insert(pair<string, Type>("TEXT", TEXT));
-	enumToString.insert(pair<Type, string>(TEXT, "TEXT"));
-	stringToEnum.insert(pair<string, Type>("MEDIUMTEXT", MEDIUMTEXT));
-	enumToString.insert(pair<Type, string>(MEDIUMTEXT, "MEDIUMTEXT"));
-	stringToEnum.insert(pair<string, Type>("LONGTEXT", LONGTEXT));
-	enumToString.insert(pair<Type, string>(LONGTEXT, "LONGTEXT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("BIT", TypeWrapper::BIT));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::BIT, "BIT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("TINYINT", TypeWrapper::TINYINT));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::TINYINT, "TINYINT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("SMALLINT", TypeWrapper::SMALLINT));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::SMALLINT, "SMALLINT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("MEDIUMINT", TypeWrapper::MEDIUMINT));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::MEDIUMINT, "MEDIUMINT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("INT", TypeWrapper::INT));
+    enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::INT, "INT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("INTEGER", TypeWrapper::INTEGER));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::INTEGER, "INTEGER"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("BIGINT", TypeWrapper::BIGINT));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::BIGINT, "BIGINT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("REAL", TypeWrapper::REAL));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::REAL, "REAL"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("DOUBLE", TypeWrapper::DOUBLE));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::DOUBLE, "DOUBLE"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("DOUBLE_PRECISION", TypeWrapper::DOUBLE_PRECISION));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::DOUBLE_PRECISION, "DOUBLE_PRECISION"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("FLOAT", TypeWrapper::FLOAT));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::FLOAT, "FLOAT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("DECIMAL", TypeWrapper::DECIMAL));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::DECIMAL, "DECIMAL"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("DEC", TypeWrapper::DEC));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::DEC, "DEC"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("NUMERIC", TypeWrapper::NUMERIC));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::NUMERIC, "NUMERIC"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("DATE", TypeWrapper::DATE));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::DATE, "DATE"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("TIME", TypeWrapper::TIME));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::TIME, "TIME"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("TIMESTAMP", TypeWrapper::TIMESTAMP));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::TIMESTAMP, "TIMESTAMP"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("DATETIME", TypeWrapper::DATETIME));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::DATETIME, "DATETIME"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("YEAR", TypeWrapper::YEAR));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::YEAR, "YEAR"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("CHAR", TypeWrapper::CHAR));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::CHAR, "CHAR"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("VARCHAR", TypeWrapper::VARCHAR));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::VARCHAR, "VARCHAR"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("BINARY", TypeWrapper::BINARY));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::BINARY, "BINARY"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("VARBINARY", TypeWrapper::VARBINARY));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::VARBINARY, "VARBINARY"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("TINYBLOB", TypeWrapper::TINYBLOB));
+    enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::TINYBLOB, "TINYBLOB"));
+    stringToEnum.insert(pair<string, TypeWrapper::Type>("BLOB", TypeWrapper::BLOB));
+    enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::BLOB, "BLOB"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("MEDIUMBLOB", TypeWrapper::MEDIUMBLOB));
+    enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::MEDIUMBLOB, "MEDIUMBLOB"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("LONGBLOB", TypeWrapper::LONGBLOB));
+    enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::LONGBLOB, "LONGBLOB"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("TINYTEXT", TypeWrapper::TINYTEXT));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::TINYTEXT, "TINYTEXT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("TEXT", TypeWrapper::TEXT));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::TEXT, "TEXT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("MEDIUMTEXT", TypeWrapper::MEDIUMTEXT));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::MEDIUMTEXT, "MEDIUMTEXT"));
+	stringToEnum.insert(pair<string, TypeWrapper::Type>("LONGTEXT", TypeWrapper::LONGTEXT));
+	enumToString.insert(pair<TypeWrapper::Type, string>(TypeWrapper::LONGTEXT, "LONGTEXT"));
 }   
 
 lcs::lcs()
@@ -170,28 +171,28 @@ lcs::lcs()
 	Graph g;
 	initializeGraph(g);
 
-	set<Type> visitedTypes;
+	set<TypeWrapper::Type> visitedTypes;
 	g.topologicalSort(visitedTypes, orderStack);
 	
-	for(Type t = BIT; t < TYPECOUNT; t = Type(t + 1))
+	for(TypeWrapper::Type t = TypeWrapper::BIT; t < TypeWrapper::TYPECOUNT; t = TypeWrapper::Type(t + 1))
     {
-        set<Type> visited;
+        set<TypeWrapper::Type> visited;
         g.DFS(t, visited);
-        typeToParents.insert(pair<Type, set<Type> >(t, visited));
+        typeToParents.insert(pair<TypeWrapper::Type, set<TypeWrapper::Type> >(t, visited));
     }
 
 	// For each pair of types compute least common subtype
-    for(Type t1 = BIT; t1 < TYPECOUNT; t1 = Type(t1 + 1))
-        for(Type t2 = BIT; t2 < TYPECOUNT; t2 = Type(t2 + 1))
+    for(TypeWrapper::Type t1 = TypeWrapper::BIT; t1 < TypeWrapper::TYPECOUNT; t1 = TypeWrapper::Type(t1 + 1))
+        for(TypeWrapper::Type t2 = TypeWrapper::BIT; t2 < TypeWrapper::TYPECOUNT; t2 = TypeWrapper::Type(t2 + 1))
             lct[t1][t2] = generateLeastCommonSupertypes(t1, t2);
 }
 
-Type lcs::getLeastCommonSupertype(Type type1, Type type2)
+TypeWrapper::Type lcs::getLeastCommonSupertype(TypeWrapper::Type type1, TypeWrapper::Type type2)
 {
 	return lct[type1][type2];
 }
 
-Type lcs::generateLeastCommonSupertypes(Type type1, Type type2)
+TypeWrapper::Type lcs::generateLeastCommonSupertypes(TypeWrapper::Type type1, TypeWrapper::Type type2)
 {
     if(type1 == type2)
 		return type1;
@@ -199,34 +200,34 @@ Type lcs::generateLeastCommonSupertypes(Type type1, Type type2)
     {
 		for(unsigned int i = 0; i < orderStack.size(); ++i)
 		{
-			Type current = orderStack[i];
+			TypeWrapper::Type current = orderStack[i];
 			
 			if(typeToParents[type1].find(current) != typeToParents[type1].end() &&
 			   typeToParents[type2].find(current) != typeToParents[type2].end())
 				return current;
 		}
 	}
-	return TYPECOUNT;
+	return TypeWrapper::TYPECOUNT;
 }
 
 void Graph::addEdge(string from, string to)
 {
-    set<Type> adjList;
+    set<TypeWrapper::Type> adjList;
  
     // Check if we need to insert v into map adj
-    adj.insert(pair<Type, set<Type> >(stringToEnum[from], adjList));
+    adj.insert(pair<TypeWrapper::Type, set<TypeWrapper::Type> >(stringToEnum[from], adjList));
 
     adj[stringToEnum[from]].insert(stringToEnum[to]); // Add wint to vint’s list.
 }
 
 // DFS traversal of the vertices reachable from v
-void Graph::DFS(Type v, set<Type> &visited)
+void Graph::DFS(TypeWrapper::Type v, set<TypeWrapper::Type> &visited)
 {
     // Mark the current node as visited.
     visited.insert(v);
  
     // Recur for all the vertices adjacent to this vertex
-    set<Type>::iterator i;
+    set<TypeWrapper::Type>::iterator i;
     for(i = adj[v].begin(); i != adj[v].end(); ++i)
         // Check if node is not visited
 		if(visited.find(*i) == visited.end())
@@ -234,13 +235,13 @@ void Graph::DFS(Type v, set<Type> &visited)
 }
 
 // A recursive function used by topologicalSort
-void Graph::topologicalSortUtil(Type v, set<Type> &visited, deque<Type> &orderStack)
+void Graph::topologicalSortUtil(TypeWrapper::Type v, set<TypeWrapper::Type> &visited, deque<TypeWrapper::Type> &orderStack)
 {
     // Mark the current node as visited.
     visited.insert(v);
  
     // Recur for all the vertices adjacent to this vertex
-    set<Type>::iterator i;
+    set<TypeWrapper::Type>::iterator i;
     for(i = adj[v].begin(); i != adj[v].end(); ++i)
         // Check if node is not visited
         if(visited.find(*i) == visited.end())
@@ -251,11 +252,11 @@ void Graph::topologicalSortUtil(Type v, set<Type> &visited, deque<Type> &orderSt
 }
  
 // The function to do Topological Sort. It uses recursive topologicalSortUtil()
-void Graph::topologicalSort(set<Type> &visited, deque<Type> &orderStack)
+void Graph::topologicalSort(set<TypeWrapper::Type> &visited, deque<TypeWrapper::Type> &orderStack)
 {
     // Call the recursive helper function to store Topological Sort
     // starting from all vertices one by one
-    for (Type t = BIT; t < TYPECOUNT; t = Type(t + 1))
+    for (TypeWrapper::Type t = TypeWrapper::BIT; t < TypeWrapper::TYPECOUNT; t = TypeWrapper::Type(t + 1))
 	 	// Check if node is not visited
         if(visited.find(t) == visited.end())        
 	    	topologicalSortUtil(t, visited, orderStack);
@@ -432,7 +433,7 @@ void printOutputSchema(const vector<column> &outputSchema)
 	for(unsigned int i = 0; i < outputSchema.size(); ++i)
 	{
 		column c = outputSchema[i];
-		cout << "Column Names: " << c.name << " Type: " << c.typeMD.type << " M: " << c.typeMD.m 
+		cout << "Column Names: " << c.name << " TypeWrapper::Type: " << c.typeMD.type << " M: " << c.typeMD.m 
 			 << " D: " << c.typeMD.d << " Unsigned Bit: " << c.typeMD.unsignedVal << endl;
 	}
 }
@@ -527,7 +528,7 @@ typeAndMD typeManager::leastCommonTypeAndMD(typeAndMD &type1, typeAndMD &type2) 
     bool typeUnsigned;
 
 	type = lcsO.getLeastCommonSupertype(type1.typeEnum, type2.typeEnum);
- 	lcsType = enumToString[static_cast<Type>(type)];
+ 	lcsType = enumToString[static_cast<TypeWrapper::Type>(type)];
 
 			// if both are unsigned then output unsigned
 	typeUnsigned = type1.unsignedVal && type2.unsignedVal;
@@ -535,7 +536,7 @@ typeAndMD typeManager::leastCommonTypeAndMD(typeAndMD &type1, typeAndMD &type2) 
     finalM = findOutputM(type1, type2, lcsType, typeUnsigned);
     finalD = max(type1.d, type2.d);
 
-    typeAndMD ret = {static_cast<Type>(type),lcsType,finalM, finalD, typeUnsigned};
+    typeAndMD ret = {static_cast<TypeWrapper::Type>(type),lcsType,finalM, finalD, typeUnsigned};
     return ret;
 }
 
@@ -552,7 +553,7 @@ inline ParsedType typeManager::match(const char* d, unsigned int length, int & d
 
 typeAndMD typeManager::inferType(char* value, unsigned int length) {
   if(length==0)
-    return (typeAndMD){(Type)-1, NULL,-1,-1,false};
+    return (typeAndMD){(TypeWrapper::Type)-1, NULL,-1,-1,false};
 
   int position = 0;
   ParsedType t = match(value, length, position);
@@ -567,22 +568,22 @@ typeAndMD typeManager::inferType(char* value, unsigned int length) {
 
       if(v<0) {
         if(v>=-128)   
-          return (typeAndMD){TINYINT, "TINYINT", length, -1, false};
+          return (typeAndMD){TypeWrapper::TINYINT, "TINYINT", length, -1, false};
         else if(v>=-32768)   
-          return (typeAndMD){SMALLINT, "SMALLINT", length, -1, false};
+          return (typeAndMD){TypeWrapper::SMALLINT, "SMALLINT", length, -1, false};
         else if(v>=-8388608)   
-          return (typeAndMD){MEDIUMINT, "MEDIUMINT", length, -1, false};
+          return (typeAndMD){TypeWrapper::MEDIUMINT, "MEDIUMINT", length, -1, false};
         else   
-          return (typeAndMD){INT, "INT", length, -1, false};
+          return (typeAndMD){TypeWrapper::INT, "INT", length, -1, false};
       } else {
         if(v<=255)
-            return (typeAndMD){TINYINT, "TINYINT", length, -1, true};
+            return (typeAndMD){TypeWrapper::TINYINT, "TINYINT", length, -1, true};
         else if(v<=65535)
-            return (typeAndMD){SMALLINT, "SMALLINT", length, -1, true};
+            return (typeAndMD){TypeWrapper::SMALLINT, "SMALLINT", length, -1, true};
         else if(v<=16777215)
-            return (typeAndMD){MEDIUMINT, "MEDIUMINT", length, -1, true};
+            return (typeAndMD){TypeWrapper::MEDIUMINT, "MEDIUMINT", length, -1, true};
         else if(v<=16777215)
-            return (typeAndMD){INT, "INT", length, -1, true};
+            return (typeAndMD){TypeWrapper::INT, "INT", length, -1, true};
       }   
     }
     case P_DECIMAL:
@@ -593,13 +594,13 @@ typeAndMD typeManager::inferType(char* value, unsigned int length) {
       if(value[0]=='-')
         l--;
    
-      return (typeAndMD){DECIMAL, "DECIMAL", l, scale, false};
+      return (typeAndMD){TypeWrapper::DECIMAL, "DECIMAL", l, scale, false};
     }   
     case P_ELSE:
-      return (typeAndMD){VARCHAR, "VARCHAR", length, -1, false};    
+      return (typeAndMD){TypeWrapper::VARCHAR, "VARCHAR", length, -1, false};    
   }
 
-  return (typeAndMD){(Type)-1, NULL, -1, -1, false};    
+  return (typeAndMD){(TypeWrapper::Type)-1, NULL, -1, -1, false};    
 }
 
 vector<column> typeManager::generateNewSchema(string existingSchema, string insertSchema)
@@ -645,7 +646,7 @@ vector<column> typeManager::generateNewSchema(string existingSchema, string inse
 			*/
 			typeAndMD type = leastCommonTypeAndMD(curCol.typeMD, it->second);
 /*
-            lcsType = enumToString[static_cast<Type>(type)];
+            lcsType = enumToString[static_cast<TypeWrapper::Type>(type)];
 
 			// if both are unsigned then output unsigned
 			typeUnsigned = curCol.typeMD.unsignedVal && it->second.unsignedVal;

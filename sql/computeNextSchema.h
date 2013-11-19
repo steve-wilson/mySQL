@@ -9,50 +9,55 @@
 #include <sstream>
 #include <vector>
 #include <locale>
+#include <cstdlib>
 #include "regex.h"
 
 #define UNSIGNED_STRING "UNSIGNED"
 
 using namespace std;
 
-enum Type {
-  	BIT = 0,
- 	TINYINT,
-  	SMALLINT,
-	MEDIUMINT,
-	INT,
-	INTEGER,
-  	BIGINT,
-	REAL,
-	DOUBLE,
-	DOUBLE_PRECISION,
-	FLOAT,
-	DECIMAL,
-	DEC,
-	NUMERIC,
-  	DATE,
-	TIME,
-	TIMESTAMP,
-	DATETIME,
-	YEAR,
-	CHAR,
-	VARCHAR,
-	BINARY,
-	VARBINARY,
-	TINYBLOB,
-	BLOB,
-	MEDIUMBLOB,
-	LONGBLOB,
-	TINYTEXT,
-	TEXT,
-	MEDIUMTEXT,
-	LONGTEXT,
-	TYPECOUNT
+// Using wrapper to avoid conflicts with other enums with same names
+class TypeWrapper{
+    public:
+    enum Type {
+        BIT = 0,
+        TINYINT,
+        SMALLINT,
+        MEDIUMINT,
+        INT,
+        INTEGER,
+        BIGINT,
+        REAL,
+        DOUBLE,
+        DOUBLE_PRECISION,
+        FLOAT,
+        DECIMAL,
+        DEC,
+        NUMERIC,
+        DATE,
+        TIME,
+        TIMESTAMP,
+        DATETIME,
+        YEAR,
+        CHAR,
+        VARCHAR,
+        BINARY,
+        VARBINARY,
+        TINYBLOB,
+        BLOB,
+        MEDIUMBLOB,
+        LONGBLOB,
+        TINYTEXT,
+        TEXT,
+        MEDIUMTEXT,
+        LONGTEXT,
+        TYPECOUNT
+    };
 };
 
 struct typeAndMD
 {
-    Type typeEnum;
+    TypeWrapper::Type typeEnum;
     string type;
 	int m;
 	int d;
@@ -68,26 +73,26 @@ struct column
 // Graph class represents a directed graph using adjacency list           representation 
 class Graph
 {
-   map<Type, set<Type> > adj;    // Maps vertex to vector of adjacency list
-  void topologicalSortUtil(Type v, set<Type> &visited, deque<Type>         
+   map<TypeWrapper::Type, set<TypeWrapper::Type> > adj;    // Maps vertex to vector of adjacency list
+  void topologicalSortUtil(TypeWrapper::Type v, set<TypeWrapper::Type> &visited, deque<TypeWrapper::Type>         
   &orderStack);
 public:
   void addEdge(string v, string w);   // function to add an edge to graph
-  void DFS(Type v, set<Type> &visited);    // DFS traversal of the             vertices reachable from v
-  void topologicalSort(set<Type> &visited, deque<Type> &orderStack);  //       prints a Topological Sort of the complete graph    
+  void DFS(TypeWrapper::Type v, set<TypeWrapper::Type> &visited);    // DFS traversal of the             vertices reachable from v
+  void topologicalSort(set<TypeWrapper::Type> &visited, deque<TypeWrapper::Type> &orderStack);  //       prints a Topological Sort of the complete graph    
 };
              
 // Least common supertype class computes matrix of least common supertypes
 class lcs
 {
-    map<Type, set<Type> > typeToParents;	// A map from type to all its parent types
-	deque<Type> orderStack;			// Topological ordering of graph
-	Type lct[TYPECOUNT][TYPECOUNT];		// Matrix containing all least common type for all input type pairs
+    map<TypeWrapper::Type, set<TypeWrapper::Type> > typeToParents;	// A map from type to all its parent types
+	deque<TypeWrapper::Type> orderStack;			// Topological ordering of graph
+	TypeWrapper::Type lct[TypeWrapper::TYPECOUNT][TypeWrapper::TYPECOUNT];		// Matrix containing all least common type for all input type pairs
 	void initializeGraph(Graph &g); 	// Adds all edges for type graph
-    Type generateLeastCommonSupertypes(Type type1, Type type2); // Finds first type of parent based off topological ordering
+    TypeWrapper::Type generateLeastCommonSupertypes(TypeWrapper::Type type1, TypeWrapper::Type type2); // Finds first type of parent based off topological ordering
 public:
     lcs();
-	Type getLeastCommonSupertype(Type type1, Type type2); 	// Returns lookup from lct matrix
+	TypeWrapper::Type getLeastCommonSupertype(TypeWrapper::Type type1, TypeWrapper::Type type2); 	// Returns lookup from lct matrix
 	void printTypesAndParents();	// Prints all parent types of a type
 	void printOrderStack();  	// Prints topological ordering
 	void printlctMatrix();		// Prints all combinations least common type

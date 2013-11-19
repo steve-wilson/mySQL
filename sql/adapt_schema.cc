@@ -67,11 +67,20 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
     vector<column> matches = csv.match(oldSchema, newSchema);
 
     switch(method) {
-        case SCHEMA_UPDATE_NAIVE: 
+        //case SCHEMA_UPDATE_NAIVE:
+        case SCHEMA_UPDATE_ALTER:
+        // TODO: move default to AUTO once completed
+        case SCHEMA_UPDATE_DEFAULT:
           prepareNaive(thd, oldSchema, newSchema, matches);
           break;
         case SCHEMA_UPDATE_VIEW:
           prepareViews(thd, oldSchema, newSchema, matches);
+          break;
+        case SCHEMA_UPDATE_AUTO:
+          // call to decision engine here
+          break;
+        case SCHEMA_UPDATE_NONE:
+          // shouldn't get here, i.e. there is a check that method isn't none earlier
           break;
     }
 
