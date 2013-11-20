@@ -23,3 +23,5 @@ bld/
 *.exe
 *.out
 *.app
+
+*.swp

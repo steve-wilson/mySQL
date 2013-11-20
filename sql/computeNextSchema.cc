@@ -405,7 +405,7 @@ void outputCol(string name, string type, int m, int d, bool typeUnsigned, bool &
 }
 
 // Adds column to output schema vector
-void addToOutputSchema(vector<column> &outputSchema, string existingColName, string insertColName, string type, int m, int d, bool typeUnsigned)
+void addToOutputSchema(vector<column> &outputSchema, string existingColName, string insertColName, string type, int m, int d, bool typeUnsigned, bool changedFromExisting)
 {
 	column outputCol;
 	typeAndMD typeMD;
@@ -421,6 +421,7 @@ void addToOutputSchema(vector<column> &outputSchema, string existingColName, str
 	typeMD.m = m;
 	typeMD.d = d;
 	typeMD.unsignedVal = typeUnsigned;
+	typeMD.changedFromExisting = changedFromExisting;
 
 	outputCol.name = existingColName + ',' + insertColName;
 	outputCol.typeMD = typeMD;
@@ -603,6 +604,23 @@ typeAndMD typeManager::inferType(char* value, unsigned int length) {
   return (typeAndMD){(TypeWrapper::Type)-1, NULL, -1, -1, false};    
 }
 
+bool changedFromExisting(typeAndMD existingTypeMD, typeAndMD resultTypeMD)
+{
+    bool changesFound = false;
+
+    if(existingTypeMD.type != resultTypeMD.type)
+        changesFound = true;
+    else
+    {
+        if((existingTypeMD.m >= 0 && existingTypeMD.m < resultTypeMD.m)
+           || (existingTypeMD.d >= 0 && existingTypeMD.d < resultTypeMD.d)
+           || (existingTypeMD.unsignedVal != resultTypeMD.unsignedVal))
+            changesFound = true;
+    }
+
+    return changesFound;
+}
+
 vector<column> typeManager::generateNewSchema(string existingSchema, string insertSchema)
 {
 	vector<column> outputSchema; 
@@ -656,21 +674,22 @@ vector<column> typeManager::generateNewSchema(string existingSchema, string inse
 		
 			addToOutputSchema(outputSchema, curCol.name, curCol.name, lcsType, finalM, finalD, typeUnsigned);
 */
-			addToOutputSchema(outputSchema, curCol.name, curCol.name, type.type, type.m, type.d, type.unsignedVal);
+			type.changedFromExisting = changedFromExisting(curCol.typeMD, type);
+			addToOutputSchema(outputSchema, curCol.name, curCol.name, type.type, type.m, type.d, type.unsignedVal, type.changedFromExisting);
 			// Remove col from insertSchema map.
 			insertSchemaNameToType.erase(it);
 		}
 		// Can't find column name from existingSchema in insertSchema
 		else
 		{
-			addToOutputSchema(outputSchema, curCol.name, "", curCol.typeMD.type, curCol.typeMD.m, curCol.typeMD.d, curCol.typeMD.unsignedVal);
+			addToOutputSchema(outputSchema, curCol.name, "", curCol.typeMD.type, curCol.typeMD.m, curCol.typeMD.d, curCol.typeMD.unsignedVal, false);
 		}
 	}
 
 	// Add remaining cols from insertSchema that were not matched successfully to something in the existingSchema
 	for(it = insertSchemaNameToType.begin(); it != insertSchemaNameToType.end(); ++it)
 	{
-		addToOutputSchema(outputSchema, "", it->first, it->second.type, it->second.m, it->second.d, it->second.unsignedVal);
+		addToOutputSchema(outputSchema, "", it->first, it->second.type, it->second.m, it->second.d, it->second.unsignedVal, false);
 	}
 	
 	return outputSchema;

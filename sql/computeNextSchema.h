@@ -62,6 +62,7 @@ struct typeAndMD
 	int m;
 	int d;
 	bool unsignedVal;
+	bool changedFromExisting;
 };	
 
 struct column
@@ -116,4 +117,5 @@ public:
 };
 
 string toString(typeAndMD& type);
+void addColToMap(map<string, typeAndMD> &insertSchemaNameToType, string &insertSchema, size_t insertPos, size_t delimiterLength);
 #endif
