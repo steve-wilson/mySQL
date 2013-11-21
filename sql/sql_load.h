@@ -21,7 +21,7 @@
 class Item;
 
 #include "sql_class.h"                          /* enum_duplicates */
-#include "adapt_schema.h"                       /* schema_update_method */
+#include "adapt_schema_methods.h"                       /* schema_update_method */
 
 class sql_exchange;
 
