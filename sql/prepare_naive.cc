@@ -60,7 +60,7 @@ string makeAlterStatement(string newSchema, vector<column> matches)
 		addToMap(nameToNameAndType, newSchema, string::npos, 0);	
 
 	map<string, string>::iterator it;
-	for(int i = 0; i < matches.size(); ++i)
+	for(unsigned int i = 0; i < matches.size(); ++i)
     {               
         column curCol = matches[i];
 		string outputColName = findOutputColName(curCol.name);

@@ -293,7 +293,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
     if (update_schema_to_accomodate_data(file, 0,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
-		      escape_char, read_file_from_client, is_fifo, thd, ex, table_list, merge_method))
+		      escape_char, read_file_from_client, is_fifo, thd, ex, &table_list, merge_method))
           DBUG_RETURN(TRUE);
     skip_lines++;
   }
@@ -754,6 +754,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
 
   /* ok to client sent only after binlog write and engine commit */
   my_ok(thd, info.stats.copied + info.stats.deleted, 0L, name);
+
 err:
   DBUG_ASSERT(transactional_table ||
               !(info.stats.copied || info.stats.deleted) ||
@@ -761,6 +762,11 @@ err:
   table->file->ha_release_auto_increment();
   table->auto_increment_field_not_null= FALSE;
   thd->abort_on_warning= 0;
+
+//  if (merge_method != SCHEMA_UPDATE_NONE){
+//      finalize_schema_update(thd, table_list, merge_method);
+//  }
+
   DBUG_RETURN(error);
 }
 

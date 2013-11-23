@@ -33,7 +33,7 @@ string resultToSchema(string db, string table, List<Ed_row> list) {
   return ss.str();
 }
 
-bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_INFO *cs, const String &field_term, const String &line_start, const String &line_term, const String &enclosed, int escape, bool get_it_from_net, bool is_fifo, THD* thd, sql_exchange *ex, TABLE_LIST *table_list, schema_update_method method){
+bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_INFO *cs, const String &field_term, const String &line_start, const String &line_term, const String &enclosed, int escape, bool get_it_from_net, bool is_fifo, THD* thd, sql_exchange *ex, TABLE_LIST **table_list_ptr, schema_update_method method){
     /*
         In this function we can make whatever calls are necessary
         in order to update the schema to accomodate the incoming data
@@ -44,6 +44,7 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
     */
 
     Ed_connection c(thd);
+    TABLE_LIST * table_list = *table_list_ptr;
 
     // Get existing schema
     List<Ed_row> it = executeQuery(c, "describe " + string(table_list->db)  + "." + string(table_list->table_name)); 
@@ -74,7 +75,7 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
           prepareNaive(thd, oldSchema, newSchema, matches);
           break;
         case SCHEMA_UPDATE_VIEW:
-          prepareViews(thd, oldSchema, newSchema, matches);
+          prepareViews(thd, oldSchema, newSchema, matches, table_list_ptr);
           break;
         case SCHEMA_UPDATE_AUTO:
           // call to decision engine here
@@ -87,3 +88,12 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
     return 0;
 }
 
+bool finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_method method){
+    
+    if (method==SCHEMA_UPDATE_VIEW){
+        string table_name = table_list->table_name;
+        swapTableWithView(thd, table_name);
+    }
+    return 0;
+
+}
