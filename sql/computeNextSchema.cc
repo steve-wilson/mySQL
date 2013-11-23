@@ -339,7 +339,7 @@ void getNameAndTypeMD(string &schema, size_t endingPos, size_t delimiterLength, 
 	string typeString;
 
 	name = getField(schema, 0, " ");
-	stringToUpper(name);
+	//stringToUpper(name);
 	
 	typeString = getType(schema, " ", endingPos);	
 	typeMD = getTypeMDObjFromString(typeString);

@@ -38,6 +38,19 @@ void print(vector<vector<string>* >* data){
 }
 */
 
+string sanitize_fieldname(string& fn) {
+  const char* str = fn.c_str();
+  for(unsigned int i=0; i<fn.length(); i++)
+    if(!((str[i]>='a'&&str[i]<='z') ||
+       (str[i]>='A'&&str[i]<='Z') ||
+       (str[i]>='0'&&str[i]<='9') ||
+       str[i]=='$'|| str[i]=='_'
+      ))
+      fn.replace(i,1,"_");
+
+  return fn;
+}
+
 LoadCSV::LoadCSV(string dbs, string tables, READER * r)
 {
   db = dbs;
@@ -48,7 +61,8 @@ LoadCSV::LoadCSV(string dbs, string tables, READER * r)
   while(!reader->read_field()) {
     uint length = reader->row_end-reader->row_start;
     reader->row_start[length] = '\0';
-    header.push_back((char*)reader->row_start);
+    string s = string((char*)reader->row_start);
+    header.push_back(sanitize_fieldname(s));
   }
 
   reader->next_line();

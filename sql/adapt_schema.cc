@@ -33,7 +33,7 @@ string resultToSchema(string db, string table, List<Ed_row> list) {
   return ss.str();
 }
 
-bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_INFO *cs, const String &field_term, const String &line_start, const String &line_term, const String &enclosed, int escape, bool get_it_from_net, bool is_fifo, THD* thd, sql_exchange *ex, TABLE_LIST **table_list_ptr, schema_update_method method){
+bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_INFO *cs, const String &field_term, const String &line_start, const String &line_term, const String &enclosed, int escape, bool get_it_from_net, bool is_fifo, THD* thd, sql_exchange *ex, TABLE_LIST **table_list_ptr, List<Item>& fields_vars, vector<string>& header, schema_update_method method){
     /*
         In this function we can make whatever calls are necessary
         in order to update the schema to accomodate the incoming data
@@ -55,6 +55,16 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
                         cs, field_term, line_start, line_term, enclosed,
                         escape, get_it_from_net, is_fifo);
     LoadCSV csv(table_list->db, table_list->table_name, &reader);
+
+    header = csv.getHeader();
+
+    if(fields_vars.elements==0) {
+      for(unsigned int i=0; i<header.size(); i++) {
+        //string* s = new string(header[i]);
+        Item_field* f = new (thd->mem_root) Item_field(thd->lex->current_context(),NullS, NullS, header[i].c_str());
+        fields_vars.push_back(f);
+      }
+    }
 
     string newSchema = csv.calculateSchema();
 
