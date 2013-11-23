@@ -51,7 +51,8 @@ class TypeWrapper{
         TEXT,
         MEDIUMTEXT,
         LONGTEXT,
-        TYPECOUNT
+        TYPECOUNT,
+		TNULL
     };
 };
 
@@ -62,13 +63,15 @@ struct typeAndMD
 	int m;
 	int d;
 	bool unsignedVal;
-	bool changedFromExisting;
 };	
 
 struct column
 {
-	string name;
+	string existingName;
+	string newName;
 	typeAndMD typeMD;
+	bool addedFromExisting;	
+	bool changedFromExisting;
 };
 
 // Graph class represents a directed graph using adjacency list           representation 
@@ -117,5 +120,4 @@ public:
 };
 
 string toString(typeAndMD& type);
-void addColToMap(map<string, typeAndMD> &insertSchemaNameToType, string &insertSchema, size_t insertPos, size_t delimiterLength);
 #endif

@@ -28,7 +28,7 @@
 #include "sql_array.h"
 #include "mem_root_array.h"
 #include "sql_alter.h"                // Alter_info
-#include "adapt_schema.h"
+#include "adapt_schema_methods.h"
 
 /* YACC and LEX Definitions */
 

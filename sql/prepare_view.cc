@@ -68,30 +68,30 @@ void prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> m
         string sub_table_name1 = getSubTableName(table_name,i+1);
         string sub_table_name2 = getSubTableName(table_name,i+2);
         executeQuery(c, "RENAME TABLE " + table_name + " TO " + sub_table_name1);
-        // TODO: can probably combine these into one sql command with some extra string parsing
         executeQuery(c, "CREATE TABLE " + newSchema);
         executeQuery(c, "RENAME TABLE " + table_name + " TO " + sub_table_name2);
 
         // get fields to select from old table with NULL wherever field is missing
         // use to create the view
-        stringstream uf;
+        stringstream uf1;
+        stringstream uf2;
         for (vector<column>::iterator it = matches.begin(); it!=matches.end(); it++){
-            unsigned int comma_pos = it->name.find(",");
-            string old_name = it->name.substr(0,comma_pos);
-            string new_name = it->name.substr(comma_pos+1);
-            if(!old_name.length()){
-                uf << "NULL";
+            if(it->addedFromExisting){
+                uf1 << "NULL";
             }
             else{
-                uf << old_name;
+                uf1 << it->existingName;
             }
+            uf2 << it->newName;
             if( it+1 != matches.end()){
-                uf << ", ";
+                uf1 << ", ";
+                uf2 << ", ";
             }
         }
-        string union_fields = uf.str();
-        executeQuery(c, "CREATE VIEW " + table_name + " AS SELECT * FROM " + sub_table_name2 
-                + " UNION ALL SELECT " + union_fields + " FROM " + sub_table_name1);
+        string union_fields1 = uf1.str();
+        string union_fields2 = uf2.str();
+        executeQuery(c, "CREATE VIEW " + table_name + " AS SELECT " + union_fields2 + " FROM " + sub_table_name2 
+                + " UNION ALL SELECT " + union_fields1 + " FROM " + sub_table_name1);
 
         // save the original table in aux list, just in case it is needed later
         // then clear the table list

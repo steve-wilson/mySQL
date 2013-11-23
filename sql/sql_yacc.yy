@@ -68,7 +68,6 @@
 #include "set_var.h"
 #include "opt_explain_traditional.h"
 #include "opt_explain_json.h"
-#include "adapt_schema.h"
 
 /* this is to get the bison compilation windows warnings out */
 #ifdef _MSC_VER

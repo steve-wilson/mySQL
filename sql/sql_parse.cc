@@ -100,7 +100,6 @@
 #include "global_threads.h"
 #include "sql_analyse.h"
 #include "table_cache.h" // table_cache_manager
-#include "adapt_schema.h" // finalize_schema_update
 
 #include <algorithm>
 using std::max;

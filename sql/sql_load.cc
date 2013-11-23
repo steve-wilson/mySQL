@@ -18,6 +18,7 @@
 /* Copy data from a textfile to table */
 /* 2006-12 Erik Wetterberg : LOAD XML added */
 
+#include "adapt_schema.h"
 #include <fstream>
 #include "sql_priv.h"
 #include "unireg.h"

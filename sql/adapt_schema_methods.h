@@ -1,0 +1,12 @@
+#ifndef ADAPT_SCHEMA_METHODS
+#define ADAPT_SCHEMA_METHODS
+
+enum schema_update_method {
+    SCHEMA_UPDATE_NONE = 0, 
+    SCHEMA_UPDATE_DEFAULT, 
+    SCHEMA_UPDATE_ALTER, 
+    SCHEMA_UPDATE_VIEW, 
+    SCHEMA_UPDATE_AUTO };
+
+#endif
+
