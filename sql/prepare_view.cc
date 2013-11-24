@@ -50,27 +50,21 @@ void swapTableWithView(THD* thd, string table_name){
 
 // TODO: add commands/pseudo-triggers to clean up all of the sub tables used to make views work
 void prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr) {
-
     TABLE_LIST* table_list = *table_list_ptr;
 
-    // If there were no changes, nothing should be done
-    // TODO: maybe move this check into adapt_schema.cc
-    if (oldSchema == newSchema){
-        return;
-    }
-
     string table_name = table_list->table_name;
+    string db = table_list->db;
 
     int i = getHighestTID(thd,table_name);
     Ed_connection c(thd);
-    List<Ed_row> results = executeQuery(c, "SHOW TABLES LIKE \"" + table_name + "\";");
+    List<Ed_row> results = executeQuery(c, "SHOW TABLES FROM " + db + " LIKE \"" + table_name + "\";");
     if (!results.is_empty()){
 
         string sub_table_name1 = getSubTableName(table_name,i+1);
         string sub_table_name2 = getSubTableName(table_name,i+2);
-        executeQuery(c, "RENAME TABLE " + table_name + " TO " + sub_table_name1);
+        executeQuery(c, "RENAME TABLE " + db+"."+table_name + " TO " + db+"."+sub_table_name1);
         executeQuery(c, "CREATE TABLE " + newSchema);
-        executeQuery(c, "RENAME TABLE " + table_name + " TO " + sub_table_name2);
+        executeQuery(c, "RENAME TABLE " + db+"."+table_name + " TO " + db+"."+sub_table_name2);
 
         // get fields to select from old table with NULL wherever field is missing
         // use to create the view
@@ -91,8 +85,8 @@ void prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> m
         }
         string union_fields1 = uf1.str();
         string union_fields2 = uf2.str();
-        executeQuery(c, "CREATE VIEW " + table_name + " AS SELECT " + union_fields2 + " FROM " + sub_table_name2 
-                + " UNION ALL SELECT " + union_fields1 + " FROM " + sub_table_name1);
+        executeQuery(c, "CREATE VIEW " + db+"."+table_name + " AS SELECT " + union_fields2 + " FROM " + db+"."+sub_table_name2 
+                + " UNION ALL SELECT " + union_fields1 + " FROM " + db+"."+sub_table_name1);
 
         // save the original table in aux list, just in case it is needed later
         // then clear the table list
@@ -103,18 +97,28 @@ void prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> m
         char * sub_table_name2_cstr = new char[sub_table_name2.length()];
         strcpy(sub_table_name2_cstr, sub_table_name2.c_str());
 
+        char * db_cstr = new char[db.length()];
+        strcpy(db_cstr, db.c_str());
+
         // create lex string in order to create a new table identifier
         LEX_STRING table_ls = { C_STRING_WITH_LEN(sub_table_name2_cstr) };
         table_ls.length = sub_table_name2.length();
-        Table_ident tid(table_ls);
+
+        LEX_STRING db_ls = { C_STRING_WITH_LEN(db_cstr) };
+        db_ls.length = db.length();
+
+        Table_ident* tid = new Table_ident(thd, db_ls, table_ls, true);
 
         // add the new table (the one data should be loaded into) to the table list
-        thd->lex->select_lex.add_table_to_list(thd, new Table_ident(table_ls), NULL, TL_OPTION_UPDATING,
+        thd->lex->select_lex.add_table_to_list(thd, tid, NULL, TL_OPTION_UPDATING,
                                                 TL_WRITE_DEFAULT, MDL_SHARED_WRITE, NULL, 0);
+
 
         // changing table_list itself to point to the new table
         // load data can now proceed
         *table_list_ptr = thd->lex->select_lex.table_list.first;
+        // BL:  I had to add this line to get autocalculating the field list to work
+        thd->lex->select_lex.context.first_name_resolution_table = thd->lex->select_lex.table_list.first;
 
         // delete this block of code after it makes it to the repo once
         /*
