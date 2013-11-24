@@ -19,9 +19,10 @@ static int getHighestTID(THD* thd, string table_name){
     if (!results.is_empty()){
         while((row=it++)){
             string tbl = row->get_column(0)->str;
-            unsigned int pos = tbl.find(sub_table_name);
+            unsigned int start_pos = sub_table_name.length();
+            unsigned int end_pos = tbl.length();
             // atoi returns 0 if cannot convert
-            int i = atoi(tbl.substr(pos).c_str());
+            int i = atoi(tbl.substr(start_pos,end_pos).c_str());
             max_i = (max_i>i) ? max_i:i;
         }
     }

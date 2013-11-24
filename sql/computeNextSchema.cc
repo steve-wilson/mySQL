@@ -361,17 +361,26 @@ void addColToVector(vector<column> &existingSchemaCols, string &existingSchema, 
   
 string toString(typeAndMD& type)
 {
-	stringstream ss;
-
+    stringstream ss;
+    bool showD = false;
+    switch(type.typeEnum) {
+      case TypeWrapper::REAL: showD = true; break;
+      case TypeWrapper::DOUBLE: showD = true; break;
+      case TypeWrapper::DOUBLE_PRECISION: showD = true; break;
+      case TypeWrapper::FLOAT: showD = true; break;
+      case TypeWrapper::DECIMAL: showD = true; break;
+      case TypeWrapper::DEC: showD = true; break;
+      case TypeWrapper::NUMERIC: showD = true; break;
+      default: showD = false; break;
+    }
     ss << type.type;
-    if(type.m >= 0 && type.d >= 0)
-		ss << "(" << type.m << "," << type.d << ")";
-	else if(type.m >= 0)
-		ss << "(" << type.m << ")";
-	
-	if(type.unsignedVal)
-		ss << " " << UNSIGNED_STRING;
-
+    if(type.m >= 0 && type.d >= 0 && showD)
+        ss << "(" << type.m << "," << type.d << ")";
+    else if(type.m >= 0)
+        ss << "(" << type.m << ")";
+    
+    if(type.unsignedVal)
+        ss << " " << UNSIGNED_STRING;
     return ss.str();
 }
 
