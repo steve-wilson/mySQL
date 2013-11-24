@@ -613,13 +613,13 @@ bool changedFromExisting(typeAndMD existingTypeMD, typeAndMD resultTypeMD)
     return changesFound;
 }
 
-vector<column>::iterator foundInInsertSchema(vector<column> &insertSchemaCols, string	existingName)
+vector<column>::iterator foundInExistingSchema(vector<column> &existingSchemaCols, string insertName)
 {
 	vector<column>::iterator it;
 
-	for(it = insertSchemaCols.begin(); it != insertSchemaCols.end(); ++it)
+	for(it = existingSchemaCols.begin(); it != existingSchemaCols.end(); ++it)
 	{
-		if(it->existingName == existingName)
+		if(it->existingName == insertName)
 			return it;
 	}
 
@@ -654,48 +654,32 @@ vector<column> typeManager::generateNewSchema(string existingSchema, string inse
         addColToVector(insertSchemaCols, insertSchema, string::npos, 0);
 
 	vector<column>::iterator it;
-	for(unsigned int i = 0; i < existingSchemaCols.size(); ++i)
+	for(unsigned int i = 0; i < insertSchemaCols.size(); ++i)
 	{
-		column curCol = existingSchemaCols[i];
+		column curCol = insertSchemaCols[i];
 
 		// Found a column name match from existingSchema in insertSchema
-		if((it = foundInInsertSchema(insertSchemaCols, curCol.existingName)) != insertSchemaCols.end()) 
+		if((it = foundInExistingSchema(existingSchemaCols, curCol.existingName)) != existingSchemaCols.end()) 
 		{
-            /*
-			string lcsType;
-			int type, finalM, finalD;
-			bool typeUnsigned;
-			type = lcs1.getLeastCommonSupertype(stringToEnum[curCol.typeMD.type], stringToEnum[it->typeMD.type]);
-			*/
-			typeAndMD type = leastCommonTypeAndMD(curCol.typeMD, it->typeMD);
-/*
-            lcsType = enumToString[static_cast<TypeWrapper::Type>(type)];
-
-			// if both are unsigned then output unsigned
-			typeUnsigned = curCol.typeMD.unsignedVal && it->second.unsignedVal;
+			typeAndMD type = leastCommonTypeAndMD(it->typeMD, curCol.typeMD);
 			
-			finalM = findOutputM(curCol.typeMD, it->second, lcsType, typeUnsigned);
-			finalD = max(curCol.typeMD.d, it->second.d);
-		
-			addToOutputSchema(outputSchema, curCol.name, curCol.name, lcsType, finalM, finalD, typeUnsigned);
-*/
-			bool modifiedType = changedFromExisting(curCol.typeMD, type);
-			addToOutputSchema(outputSchema, curCol.existingName, it->existingName, type.type, type.m, type.d, type.unsignedVal, modifiedType, false);
+			bool modifiedType = changedFromExisting(it->typeMD, type);
+			addToOutputSchema(outputSchema, it->existingName, curCol.existingName, type.type, type.m, type.d, type.unsignedVal, modifiedType, false);
 		
 			// Remove elt from insertSchemaCols
-			insertSchemaCols.erase(it);
+			existingSchemaCols.erase(it);
 		}
 		// Can't find column name from existingSchema in insertSchema
 		else
 		{
-			addToOutputSchema(outputSchema, curCol.existingName, "", curCol.typeMD.type, curCol.typeMD.m, curCol.typeMD.d, curCol.typeMD.unsignedVal, false, false);
+			addToOutputSchema(outputSchema, "", curCol.existingName, curCol.typeMD.type, curCol.typeMD.m, curCol.typeMD.d, curCol.typeMD.unsignedVal, false, true);
 		}
 	}
 
 	// Add remaining cols from insertSchema that were not matched successfully to something in the existingSchema
-	for(it = insertSchemaCols.begin(); it != insertSchemaCols.end(); ++it)
+	for(it = existingSchemaCols.begin(); it != existingSchemaCols.end(); ++it)
 	{
-		addToOutputSchema(outputSchema, "", it->existingName, it->typeMD.type, it->typeMD.m, it->typeMD.d, it->typeMD.unsignedVal, false, true);
+		addToOutputSchema(outputSchema, it->existingName, "", it->typeMD.type, it->typeMD.m, it->typeMD.d, it->typeMD.unsignedVal, false, false);
 	}
 	
 	return outputSchema;

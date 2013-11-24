@@ -19,26 +19,35 @@ bool oldSchemaDoesntExist(string oldSchema)
 	return false;
 }
 
+string getColName(const column &curCol)
+{
+	if(curCol.existingName == "")
+		return curCol.newName;
+
+	return curCol.existingName;
+}
+
 string makeAlterStatement(string tableName, const vector<column> &matches)
 {
-	string alterString = "";
+	string alterStatement = "";
 	bool firstAlter = true;
+	string priorColName = "";
 
 	for(unsigned int i = 0; i < matches.size(); ++i)
     {               
         column curCol = matches[i];
-                    
+		                    
         // Found name in old and new schemas              
         if(curCol.existingName.length() > 0 && curCol.newName.length() > 0)
         {           
             if(curCol.changedFromExisting)
             {       
                 if(!firstAlter)
-                    alterString += ", ";
+                    alterStatement += ", ";
                 else
-                    alterString = "ALTER TABLE " + tableName + ' ';
+                    alterStatement = "ALTER TABLE " + tableName + ' ';
                
-                alterString += "MODIFY " + curCol.newName + " " + toString(curCol.typeMD);
+                alterStatement += "MODIFY " + curCol.newName + " " + toString(curCol.typeMD);
                 firstAlter = false;
             }       
         }           
@@ -46,16 +55,25 @@ string makeAlterStatement(string tableName, const vector<column> &matches)
         else if(curCol.addedFromExisting)       
         {           
             if(!firstAlter)
-                alterString += ", ";
+                alterStatement += ", ";
             else 
-                alterString = "ALTER TABLE " + tableName + ' ';
+                alterStatement = "ALTER TABLE " + tableName + ' ';
 
-            alterString += "ADD " + curCol.newName + " " + toString(curCol.typeMD);
+            alterStatement += "ADD " + curCol.newName + " " + toString(curCol.typeMD);
+
+			// Add column in correct location
+			if(priorColName == "")
+				alterStatement += " FIRST";
+			else 
+				alterStatement += " AFTER " + priorColName;
+
             firstAlter = false;
-        }           
+        }
+
+		priorColName = getColName(curCol);           
     }               
                     
-    return alterString;
+    return alterStatement;
 }
                                                                                       
 void prepareNaive(THD* thd, string oldSchema, string newSchema, vector<column> matches) {
