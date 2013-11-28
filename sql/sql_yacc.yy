@@ -1187,6 +1187,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  DO_SYM
 %token  DROP                          /* SQL-2003-R */
 %token  DUAL_SYM
+%token 	DUMMY_SYM
 %token  DUMPFILE
 %token  DUPLICATE_SYM
 %token  DYNAMIC_SYM                   /* SQL-2003-R */
@@ -13098,7 +13099,8 @@ opt_schema_merge_method:
             /* empty */ { Lex->schema_merge = SCHEMA_UPDATE_DEFAULT;}
             | ALTER { Lex->schema_merge = SCHEMA_UPDATE_ALTER;}
             | VIEW_SYM { Lex->schema_merge = SCHEMA_UPDATE_VIEW;}
-            | AUTO_SYM { Lex->schema_merge = SCHEMA_UPDATE_AUTO;}
+			| DUMMY_SYM { Lex->schema_merge = SCHEMA_UPDATE_DUMMY;}
+			| AUTO_SYM { Lex->schema_merge = SCHEMA_UPDATE_AUTO;}
             ;
 
 data_or_xml:
@@ -14216,7 +14218,8 @@ keyword_sp:
         | DISABLE_SYM              {}
         | DISCARD                  {}
         | DISK_SYM                 {}
-        | DUMPFILE                 {}
+        | DUMMY_SYM 			   {}
+		| DUMPFILE                 {}
         | DUPLICATE_SYM            {}
         | DYNAMIC_SYM              {}
         | ENDS_SYM                 {}

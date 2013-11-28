@@ -132,6 +132,7 @@ SET(SQL_SHARED_SOURCES
   computeNextSchema.cc
   prepare_naive.cc
   prepare_view.cc
+  prepare_dummy.cc
   reader.cc
   sql_locale.cc
   sql_manager.cc
