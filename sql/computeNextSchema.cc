@@ -685,7 +685,7 @@ vector<column> typeManager::generateNewSchema(string existingSchema, string inse
 		}
 	}
 
-	// Add remaining cols from insertSchema that were not matched successfully to something in the existingSchema
+	// Add remaining cols from existingSchema that were not matched successfully to something in the insertSchema
 	for(it = existingSchemaCols.begin(); it != existingSchemaCols.end(); ++it)
 	{
 		addToOutputSchema(outputSchema, it->existingName, "", it->typeMD.type, it->typeMD.m, it->typeMD.d, it->typeMD.unsignedVal, false, false);

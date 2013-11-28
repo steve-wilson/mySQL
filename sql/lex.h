@@ -187,6 +187,7 @@ static SYMBOL symbols[] = {
   { "DOUBLE",		SYM(DOUBLE_SYM)},
   { "DROP",		SYM(DROP)},
   { "DUAL",		SYM(DUAL_SYM)},
+  { "DUMMY",     SYM(DUMMY_SYM)},  
   { "DUMPFILE",		SYM(DUMPFILE)},
   { "DUPLICATE",	SYM(DUPLICATE_SYM)},
   { "DYNAMIC",		SYM(DYNAMIC_SYM)},

@@ -9,6 +9,23 @@
 #include "simplesql.h"
 #include "computeNextSchema.h"
 
+// Gets table name from schema and removes this from schema.
+string findTableName(string &schema)
+{
+    string tableName = schema.substr(0, schema.find('('));
+    schema = schema.substr(schema.find('(') + 1, string::npos);
+
+    return tableName;
+}
+
+bool oldSchemaDoesntExist(string oldSchema)
+{
+    if((oldSchema.find(')') - oldSchema.find('(')) <= 1)
+        return true;
+    
+    return false;
+}
+
 string toUpper(string str) {
   std::transform(str.begin(), str.end(), str.begin(), ::toupper);
 
@@ -84,7 +101,10 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
           case SCHEMA_UPDATE_VIEW:
             prepareViews(thd, oldSchema, newSchema, matches, table_list_ptr);
             break;
-          case SCHEMA_UPDATE_AUTO:
+		  case SCHEMA_UPDATE_DUMMY:
+			prepareDummy(thd, oldSchema, newSchema, matches, table_list_ptr);
+			break;
+		  case SCHEMA_UPDATE_AUTO:
             // call to decision engine here
             break;
           case SCHEMA_UPDATE_NONE:

@@ -2,23 +2,6 @@
 #include "sql_prepare.h"
 #include "simplesql.h"
 
-// Gets table name from schema and removes this from schema.
-string findTableName(string &schema)
-{
-	string tableName = schema.substr(0, schema.find('('));
-	schema = schema.substr(schema.find('(') + 1, string::npos);
-
-	return tableName;
-}
-
-bool oldSchemaDoesntExist(string oldSchema)
-{
-	if((oldSchema.find(')') - oldSchema.find('(')) <= 1)
-		return true;
-	
-	return false;
-}
-
 string getColName(const column &curCol)
 {
 	if(curCol.existingName == "")
@@ -33,7 +16,7 @@ string makeAlterStatement(string tableName, const vector<column> &matches)
 	bool firstAlter = true;
 	string priorColName = "";
 
-	for(unsigned int i = 0; i < matches.size(); ++i)
+	for(int i = 0; i < matches.size(); ++i)
     {               
         column curCol = matches[i];
 		                    
