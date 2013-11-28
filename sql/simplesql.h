@@ -2,8 +2,9 @@
 #define SIMPLESQL
 
 #include "sql_prepare.h"
+#include <string>
 
-inline List<Ed_row> executeQuery(Ed_connection &c, string queryStr) {
+inline List<Ed_row> executeQuery(Ed_connection &c, std::string queryStr) {
     LEX_STRING query = {(char*)queryStr.c_str(), queryStr.length()};
 
     Execute_sql_statement st(query);

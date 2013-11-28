@@ -16,7 +16,8 @@ string makeAlterStatement(string tableName, const vector<column> &matches)
 	bool firstAlter = true;
 	string priorColName = "";
 
-	for(int i = 0; i < matches.size(); ++i)
+    // unsigned to avoid compiler warnings, size() returns unsigned
+	for(unsigned int i = 0; i < matches.size(); ++i)
     {               
         column curCol = matches[i];
 		                    

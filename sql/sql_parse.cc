@@ -100,6 +100,7 @@
 #include "global_threads.h"
 #include "sql_analyse.h"
 #include "table_cache.h" // table_cache_manager
+#include "sql_finalize.h"
 
 #include <algorithm>
 using std::max;
@@ -4944,6 +4945,10 @@ create_sp_error:
     /* Conditionally writes to binlog */
     if (!(res= mysql_user_password_expire(thd, lex->users_list)))
       my_ok(thd);
+    break;
+  case SQLCOM_FINALIZE:
+    if(!(res =finalize_schema(thd)))
+        my_ok(thd);
     break;
 #endif
   default:

@@ -1029,7 +1029,8 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
   Currently there are 161 shift/reduce conflicts.
   We should not introduce new conflicts any more.
 */
-%expect 161
+/*%expect 161*/
+%expect 183
 
 /*
    Comments for TOKENS.
@@ -1226,6 +1227,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  FAULTS_SYM
 %token  FETCH_SYM                     /* SQL-2003-R */
 %token  FILE_SYM
+%token  FINALIZE_SYM
 %token  FIRST_SYM                     /* SQL-2003-N */
 %token  FIXED_SYM
 %token  FLOAT_NUM
@@ -1854,7 +1856,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
         select_item_list select_item values_list no_braces
         opt_limit_clause delete_limit_clause fields opt_values values
         opt_procedure_analyse_params
-        handler
+        handler finalize
         opt_precision opt_ignore opt_column opt_restrict
         grant revoke set lock unlock string_list field_options field_option
         field_opt_list opt_binary ascii unicode table_lock_list table_lock
@@ -2036,6 +2038,7 @@ statement:
         | drop
         | execute
         | flush
+        | finalize
         | get_diagnostics
         | grant
         | handler
@@ -13041,6 +13044,22 @@ use:
           }
         ;
 
+/* cleanup after schema_merge */
+
+finalize:
+          FINALIZE_SYM table_ident
+          {
+              THD *thd= YYTHD;
+              LEX *lex= thd->lex;
+              lex->sql_command= SQLCOM_FINALIZE;
+              if (!lex->current_select->add_table_to_list(lex->thd, $2, NULL,
+                                                          TL_OPTION_UPDATING,
+                                                          TL_READ_NO_INSERT,
+                                                          MDL_SHARED_UPGRADABLE))
+                MYSQL_YYABORT;
+          }
+        ;
+
 /* import, export of files */
 
 load:
@@ -14240,6 +14259,7 @@ keyword_sp:
         | EXTENT_SIZE_SYM          {}
         | FAULTS_SYM               {}
         | FAST_SYM                 {}
+        | FINALIZE_SYM             {}
         | FOUND_SYM                {}
         | ENABLE_SYM               {}
         | FULL                     {}

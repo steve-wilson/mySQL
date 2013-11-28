@@ -127,6 +127,7 @@ SET(SQL_SHARED_SOURCES
   sql_lex.cc 
   sql_list.cc
   sql_load.cc
+  sql_finalize.cc
   adapt_schema.cc
   loadcsv.cc
   computeNextSchema.cc
@@ -134,6 +135,7 @@ SET(SQL_SHARED_SOURCES
   prepare_view.cc
   prepare_dummy.cc
   reader.cc
+  subtables.cc
   sql_locale.cc
   sql_manager.cc
   sql_optimizer.cc
