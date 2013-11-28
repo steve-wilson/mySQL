@@ -73,7 +73,6 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
     vector<column> matches = csv.match(oldSchema, newSchema);
 
     // If there were no changes, nothing should be done
-    // TODO: maybe move this check into adapt_schema.cc
     if (oldSchema != newSchema){
       switch(method) {
           //case SCHEMA_UPDATE_NAIVE:
@@ -89,7 +88,7 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
             // call to decision engine here
             break;
           case SCHEMA_UPDATE_NONE:
-            // shouldn't get here, i.e. there is a check that method isn't none earlier
+            // shouldn't get here, i.e. there is a check that method isn't 'none' earlier
             break;
       }
     }
