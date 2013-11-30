@@ -50,7 +50,27 @@ string resultToSchema(string db, string table, List<Ed_row> list) {
   return ss.str();
 }
 
-bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_INFO *cs, const String &field_term, const String &line_start, const String &line_term, const String &enclosed, int escape, bool get_it_from_net, bool is_fifo, THD* thd, sql_exchange *ex, TABLE_LIST **table_list_ptr, List<Item>& fields_vars, vector<string>& header, schema_update_method method, bool relaxed_schema_inference, unsigned int infer_sample_size){
+string schema_from_row(string& db, string& table, vector<string>& header, vector<string>& row) {
+  typeManager tm;
+  vector<typeAndMD> types;
+  for(unsigned int i=0; i<row.size(); i++) {
+    types.push_back(tm.inferType((char*)row[i].c_str(), row[i].size()));
+  }
+
+  std::stringstream ss;
+  ss << db << "." << table << "(";
+
+  for(uint i=0; i<header.size(); i++) {
+    ss << header[i] << " " << 
+        toString(types[i]) << ((i<types.size()-1)? ", " : "");
+  }
+
+  ss << ")";
+
+  return ss.str();
+}
+
+bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_INFO *cs, const String &field_term, const String &line_start, const String &line_term, const String &enclosed, int escape, bool get_it_from_net, bool is_fifo, THD* thd, sql_exchange *ex, TABLE_LIST **table_list_ptr, List<Item>& fields_vars, vector<string>& header, map<int,uchar*>* buffers, schema_update_method method, string& newSchema){
     /*
         In this function we can make whatever calls are necessary
         in order to update the schema to accomodate the incoming data
@@ -73,19 +93,21 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
     // Get new schema
     READER reader(file, tot_length,
                         cs, field_term, line_start, line_term, enclosed,
-                        escape, get_it_from_net, is_fifo);
+                        escape, get_it_from_net, is_fifo, buffers);
     LoadCSV csv(table_list->db, table_list->table_name, &reader);
 
-    header = csv.getHeader();
+    if(newSchema.length()==0) {
+      header = csv.getHeader();
 
-    string newSchema = csv.calculateSchema(relaxed_schema_inference, infer_sample_size);
+      string newSchema = csv.calculateSchema(relaxed_schema_inference, infer_sample_size);
 
-    // Printf generated schema to outfile
-    std::ofstream outfile;
-    outfile.open("/tmp/update_schema_artifact", ios::out);
-    outfile << oldSchema << std::endl;
-    outfile << newSchema << std::endl;
-    outfile.close();
+      // Printf generated schema to outfile
+      std::ofstream outfile;
+      outfile.open("/tmp/update_schema_artifact", ios::out);
+      outfile << oldSchema << std::endl;
+      outfile << newSchema << std::endl;
+      outfile.close();
+    }
 
     vector<column> matches = csv.match(oldSchema, newSchema);
 
@@ -115,22 +137,20 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
 
     if(fields_vars.elements==0) {
       for(unsigned int i=0; i<header.size(); i++) {
-        //string* s = new string(header[i]);
         Item_field* f = new (thd->mem_root) Item_field(&thd->lex->select_lex.context, NullS, NullS, header[i].c_str());
         fields_vars.push_back(f);
       }
     }
 
-    return 0;
+  return 0;
 }
 
 bool finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_method method){
-    
     if (method==SCHEMA_UPDATE_VIEW){
         string table_name = table_list->table_name;
         string db = table_list->db;
         swapTableWithView(thd, db, table_name);
     }
-    return 0;
 
+    return 0;
 }

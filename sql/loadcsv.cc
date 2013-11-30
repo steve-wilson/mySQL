@@ -2,42 +2,6 @@
 #include <ctime>
 #include "loadcsv.h"
 
-/*
-std::ostream & operator<<(std::ostream & Str, typeAndMD& v) { 
-    Str << v.toString();
-  if(v.hasPrecision()) {
-    if(v.hasScale()) {
-      Str << "(" << v.precision << "," << v.scale << ")";
-    } else {
-      Str << "(" << v.precision << ")";
-    }
-  }                        
-                        
-  Str << (v.isUnsigned()? " UNSIGNED" : "");
-  return Str;
-}
-
-void print(string tableName, vector<string> header, vector<typeAndMD> data){
-  cout << tableName << "(";
-  for(unsigned int i=0; i<data.size(); i++) {
-    cout << header[i] << " " << data.at(i) << ((i<data.size()-1)? ", " : "");
-  }
-  cout << ")";
-
-  cout << endl;
-}
-
-void print(vector<vector<string>* >* data){
-  for(unsigned int i=0; i<data->size(); i++){
-    for(unsigned int j=0; j<data->at(i)->size(); j++){
-      cout << data->at(i)->at(j) << "\t";
-    }
-
-    cout << endl;
-  }
-}
-*/
-
 string sanitize_fieldname(string& fn) {
   const char* str = fn.c_str();
   for(unsigned int i=0; i<fn.length(); i++)
@@ -56,16 +20,22 @@ LoadCSV::LoadCSV(string dbs, string tables, READER * r)
   db = dbs;
   table = tables;
   reader = r;
+}
 
-  // Get header
-  while(!reader->read_field()) {
-    uint length = reader->row_end-reader->row_start;
-    reader->row_start[length] = '\0';
-    string s = string((char*)reader->row_start);
-    header.push_back(sanitize_fieldname(s));
+vector<string> LoadCSV::getHeader() {
+  if(header.empty()) {
+    // Get header
+    while(!reader->read_field()) {
+      uint length = reader->row_end-reader->row_start;
+      reader->row_start[length] = '\0';
+      string s = string((char*)reader->row_start);
+      header.push_back(sanitize_fieldname(s));
+    }  
+
+    reader->next_line();
   }
 
-  reader->next_line();
+  return header;
 }
 
 vector<column> LoadCSV::match(string schema1, string schema2) {
@@ -78,7 +48,7 @@ vector<column> LoadCSV::match(string schema1, string schema2) {
 
 string LoadCSV::calculateSchema(bool relaxed, unsigned int sample_size) {
   vector<string> header = getHeader();
-  vector<typeAndMD> data = calculateColumnTypes();
+  vector<typeAndMD> data = calculateColumnTypes(rows);
 
   std::stringstream ss;
   ss << db << "." << table << "(";
@@ -93,7 +63,7 @@ string LoadCSV::calculateSchema(bool relaxed, unsigned int sample_size) {
   return ss.str();
 }
 
-vector<typeAndMD> LoadCSV::calculateColumnTypes() {
+vector<typeAndMD> LoadCSV::calculateColumnTypes(int rows) {
   vector<typeAndMD> typeForRow;
   int numColumns = header.size();
 			
@@ -117,7 +87,7 @@ vector<typeAndMD> LoadCSV::calculateColumnTypes() {
     }
 
     count++;
-  } while(!reader->next_line());
+  } while(!reader->next_line() && rows > count);
 
   long duration = time(0) - start;
   cout << "loaded " << count << " rows in " << duration << " seconds\n";

@@ -43,9 +43,11 @@
 #include "sql_show.h"
 #include <algorithm>
 #include "reader.h"
-
+#include <map>
 #include <iostream>
+#include "transaction.h"
 
+using std::map;
 using std::min;
 using std::max;
 
@@ -87,13 +89,20 @@ public:
   uchar	*row_start,			/* Found row starts here */
 	*row_end;			/* Found row ends here */
   const CHARSET_INFO *read_charset;
+  map<int,uchar*>* buffers;
+  vector<string> lastRow;
+  vector<uchar*> freeBuffers;
+
+  uint read_pos;
+  uint last_start_pos;
+  uchar *line_start, *line_end;
 
   READ_INFO(File file,uint tot_length,const CHARSET_INFO *cs,
 	    const String &field_term,
             const String &line_start,
             const String &line_term,
 	    const String &enclosed,
-            int escape,bool get_it_from_net, bool is_fifo);
+            int escape,bool get_it_from_net, bool is_fifo, map<int,uchar*>* buffers);
   ~READ_INFO();
   int read_field();
   int read_fixed_length(void);
@@ -106,6 +115,7 @@ public:
   int read_value(int delim, String *val);
   int read_xml();
   int clear_level(int level);
+  int reset_line();
 
   /*
     We need to force cache close before destructor is invoked to log
@@ -129,18 +139,18 @@ static int read_fixed_length(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                              List<Item> &fields_vars, List<Item> &set_fields,
                              List<Item> &set_values, READ_INFO &read_info,
 			     ulong skip_lines,
-			     bool ignore_check_option_errors);
+			     bool ignore_check_option_errors, bool& checkSchema);
 static int read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                           List<Item> &fields_vars, List<Item> &set_fields,
                           List<Item> &set_values, READ_INFO &read_info,
 			  const String &enclosed, ulong skip_lines,
-			  bool ignore_check_option_errors);
+			  bool ignore_check_option_errors, bool& checkSchema, vector<string>& lastRow);
 
 static int read_xml_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                           List<Item> &fields_vars, List<Item> &set_fields,
                           List<Item> &set_values, READ_INFO &read_info,
                           ulong skip_lines,
-                          bool ignore_check_option_errors);
+                          bool ignore_check_option_errors, bool& checkSchema);
 
 #ifndef EMBEDDED_LIBRARY
 static bool write_execute_load_query_log_event(THD *thd, sql_exchange* ex,
@@ -152,7 +162,6 @@ static bool write_execute_load_query_log_event(THD *thd, sql_exchange* ex,
                                                bool transactional_table,
                                                int errocode);
 #endif /* EMBEDDED_LIBRARY */
-
 /*
   Execute LOAD DATA query
 
@@ -181,6 +190,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
                 bool read_file_from_client, schema_update_method  merge_method,
                 bool relaxed_schema_inference, unsigned int infer_sample_size)
 {
+  map<int,uchar*> buffers;
   vector<string> header;
   // reaches this line, (verified via gdb) but cerr doesn't go to terminal
   //std::cerr << "in mysql_load() from sql/sql_load.cc" << std::endl;
@@ -206,14 +216,49 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
   char *tdb= thd->db ? thd->db : db;		// Result is never null
   ulong skip_lines= ex->skip_lines;
   bool transactional_table;
+  bool checkSchema = false;
+  vector<string> lastRow;
+
+  string newSchema = "";
+
+  string db_s = string(db);
+  string table_name_s = string(table_list->table_name);
+
   DBUG_ENTER("mysql_load");
 
   const int escape_char= (escaped->length() && (ex->escaped_given() ||
                           !(thd->variables.sql_mode & MODE_NO_BACKSLASH_ESCAPES)))
                           ? (*escaped)[0] : INT_MAX;
 
-  // make changes to schema if desired and required
-  if (merge_method !=  SCHEMA_UPDATE_NONE) {
+  /*
+    Bug #34283
+    mysqlbinlog leaves tmpfile after termination if binlog contains
+    load data infile, so in mixed mode we go to row-based for
+    avoiding the problem.
+  */
+  thd->set_current_stmt_binlog_format_row_if_mixed();
+
+#ifdef EMBEDDED_LIBRARY
+  read_file_from_client  = 0; //server is always in the same process 
+#endif
+
+  if (escaped->length() > 1 || enclosed->length() > 1)
+  {
+    my_message(ER_WRONG_FIELD_TERMINATORS,ER(ER_WRONG_FIELD_TERMINATORS),
+	       MYF(0));
+    DBUG_RETURN(TRUE);
+  }
+
+  /* Report problems with non-ascii separators */
+  if (!escaped->is_ascii() || !enclosed->is_ascii() ||
+      !field_term->is_ascii() ||
+      !ex->line_term->is_ascii() || !ex->line_start->is_ascii())
+  {
+    push_warning(thd, Sql_condition::WARN_LEVEL_WARN,
+                 WARN_NON_ASCII_SEPARATOR_NOT_IMPLEMENTED,
+                 ER(WARN_NON_ASCII_SEPARATOR_NOT_IMPLEMENTED));
+  } 
+
 #ifndef EMBEDDED_LIBRARY
     if (read_file_from_client)
     {
@@ -293,6 +338,9 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
       DBUG_RETURN(TRUE);
     }
   }
+
+  // make changes to schema if desired and required
+  if (merge_method !=  SCHEMA_UPDATE_NONE) {
     if (update_schema_to_accomodate_data(file, 0,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
@@ -301,35 +349,6 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
           DBUG_RETURN(TRUE);
     skip_lines++;
   }
- 
-  /*
-    Bug #34283
-    mysqlbinlog leaves tmpfile after termination if binlog contains
-    load data infile, so in mixed mode we go to row-based for
-    avoiding the problem.
-  */
-  thd->set_current_stmt_binlog_format_row_if_mixed();
-
-#ifdef EMBEDDED_LIBRARY
-  read_file_from_client  = 0; //server is always in the same process 
-#endif
-
-  if (escaped->length() > 1 || enclosed->length() > 1)
-  {
-    my_message(ER_WRONG_FIELD_TERMINATORS,ER(ER_WRONG_FIELD_TERMINATORS),
-	       MYF(0));
-    DBUG_RETURN(TRUE);
-  }
-
-  /* Report problems with non-ascii separators */
-  if (!escaped->is_ascii() || !enclosed->is_ascii() ||
-      !field_term->is_ascii() ||
-      !ex->line_term->is_ascii() || !ex->line_start->is_ascii())
-  {
-    push_warning(thd, Sql_condition::WARN_LEVEL_WARN,
-                 WARN_NON_ASCII_SEPARATOR_NOT_IMPLEMENTED,
-                 ER(WARN_NON_ASCII_SEPARATOR_NOT_IMPLEMENTED));
-  } 
 
   if (open_and_lock_tables(thd, table_list, TRUE, 0))
     DBUG_RETURN(TRUE);
@@ -458,86 +477,6 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
     my_error(ER_LOAD_FROM_FIXED_SIZE_ROWS_TO_VAR, MYF(0));
     DBUG_RETURN(TRUE);
   }
-
-#ifndef EMBEDDED_LIBRARY
-  if (read_file_from_client)
-  {
-    (void)net_request_file(&thd->net,ex->file_name);
-    file = -1;
-  }
-  else
-#endif
-  {
-#ifdef DONT_ALLOW_FULL_LOAD_DATA_PATHS
-    ex->file_name+=dirname_length(ex->file_name);
-#endif
-    if (!dirname_length(ex->file_name))
-    {
-      strxnmov(name, FN_REFLEN-1, mysql_real_data_home, tdb, NullS);
-      (void) fn_format(name, ex->file_name, name, "",
-		       MY_RELATIVE_PATH | MY_UNPACK_FILENAME);
-    }
-    else
-    {
-      (void) fn_format(name, ex->file_name, mysql_real_data_home, "",
-                       MY_RELATIVE_PATH | MY_UNPACK_FILENAME |
-                       MY_RETURN_REAL_PATH);
-    }
-
-    if (thd->slave_thread)
-    {
-#if defined(HAVE_REPLICATION) && !defined(MYSQL_CLIENT)
-      DBUG_ASSERT(active_mi != NULL);
-      if (strncmp(active_mi->rli->slave_patternload_file, name,
-                  active_mi->rli->slave_patternload_file_size))
-      {
-        /*
-          LOAD DATA INFILE in the slave SQL Thread can only read from 
-          --slave-load-tmpdir". This should never happen. Please, report a bug.
-        */
-
-        sql_print_error("LOAD DATA INFILE in the slave SQL Thread can only read from --slave-load-tmpdir. " \
-                        "Please, report a bug.");
-        my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--slave-load-tmpdir");
-        DBUG_RETURN(TRUE);
-      }
-#else
-      /*
-        This is impossible and should never happen.
-      */
-      DBUG_ASSERT(FALSE); 
-#endif
-    }
-    else if (!is_secure_file_path(name))
-    {
-      /* Read only allowed from within dir specified by secure_file_priv */
-      my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--secure-file-priv");
-      DBUG_RETURN(TRUE);
-    }
-
-#if !defined(__WIN__) && ! defined(__NETWARE__)
-    MY_STAT stat_info;
-    if (!my_stat(name, &stat_info, MYF(MY_WME)))
-      DBUG_RETURN(TRUE);
-
-    // if we are not in slave thread, the file must be:
-    if (!thd->slave_thread &&
-        !((stat_info.st_mode & S_IFLNK) != S_IFLNK &&   // symlink
-          ((stat_info.st_mode & S_IFREG) == S_IFREG ||  // regular file
-           (stat_info.st_mode & S_IFIFO) == S_IFIFO)))  // named pipe
-    {
-      my_error(ER_TEXTFILE_NOT_READABLE, MYF(0), name);
-      DBUG_RETURN(TRUE);
-    }
-    if ((stat_info.st_mode & S_IFIFO) == S_IFIFO)
-      is_fifo= 1;
-#endif
-
-    if ((file= mysql_file_open(key_file_load,
-                               name, O_RDONLY, MYF(MY_WME))) < 0){
-      DBUG_RETURN(TRUE);
-    }
-  }
 /*
       std::ofstream outfile;
       outfile.open("/tmp/update_schema_artifact");
@@ -548,7 +487,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
   READ_INFO read_info(file,tot_length,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
-		      info.escape_char, read_file_from_client, is_fifo);
+		      info.escape_char, read_file_from_client, is_fifo, &buffers);
 
   if (read_info.error)
   {
@@ -599,18 +538,58 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
 
     thd->abort_on_warning= (!ignore && thd->is_strict_mode());
 
-    if (ex->filetype == FILETYPE_XML) /* load xml */
-      error= read_xml_field(thd, info, table_list, fields_vars,
-                            set_fields, set_values, read_info,
-                            skip_lines, ignore);
-    else if (!field_term->length() && !enclosed->length())
-      error= read_fixed_length(thd, info, table_list, fields_vars,
-                               set_fields, set_values, read_info,
-			       skip_lines, ignore);
-    else
-      error= read_sep_field(thd, info, table_list, fields_vars,
-                            set_fields, set_values, read_info,
-			    *enclosed, skip_lines, ignore);
+    // Insert records until a warning, then check if we need to update the schema
+    checkSchema = false;
+    while(true) {
+      if (ex->filetype == FILETYPE_XML) /* load xml */
+        error= read_xml_field(thd, info, table_list, fields_vars,
+                              set_fields, set_values, read_info,
+                              skip_lines, ignore, checkSchema);
+      else if (!field_term->length() && !enclosed->length())
+        error= read_fixed_length(thd, info, table_list, fields_vars,
+                                 set_fields, set_values, read_info,
+		  	       skip_lines, ignore, checkSchema);
+      else
+        error= read_sep_field(thd, info, table_list, fields_vars,
+                             set_fields, set_values, read_info,
+	  		    *enclosed, skip_lines, ignore, checkSchema, lastRow);
+
+      // If there was warning on the last row, check to see if we can update the schema
+      if(checkSchema) { 
+        table->file->ha_end_bulk_insert();
+        cout << "Fixing schema: " << newSchema << "\n";
+        read_info.reset_line();
+        lastRow.clear();
+        while(!read_info.read_field()) {
+          (*read_info.row_end)='\0';
+          lastRow.push_back((const char*)read_info.row_start);
+        }
+        read_info.reset_line();
+        newSchema = schema_from_row(db_s, table_name_s, header, lastRow);  
+        cout << newSchema << "\n";
+/*
+        THD_STAGE_INFO(thd, stage_query_end);
+        if (thd->one_shot_set && lex->sql_command != SQLCOM_SET_OPTION)
+          reset_one_shot_variables(thd);
+*/
+        thd->get_stmt_da()->set_overwrite_status(true);
+        trans_commit_stmt(thd);
+        thd->get_stmt_da()->set_overwrite_status(false);
+
+        thd->reset_for_next_command();
+        if (update_schema_to_accomodate_data(file, 0,
+                      ex->cs ? ex->cs : thd->variables.collation_database,
+		        *field_term,*ex->line_start, *ex->line_term, *enclosed,
+		        escape_char, read_file_from_client, is_fifo, thd, ex, &table_list, 
+                fields_vars, header, &buffers, merge_method, newSchema))
+          DBUG_RETURN(TRUE);
+
+        break;
+      } else {
+        break;
+      }
+    }
+
     if (thd->locked_tables_mode <= LTM_LOCK_TABLES &&
         table->file->ha_end_bulk_insert() && !error)
     {
@@ -899,7 +878,7 @@ static int
 read_fixed_length(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                   List<Item> &fields_vars, List<Item> &set_fields,
                   List<Item> &set_values, READ_INFO &read_info,
-                  ulong skip_lines, bool ignore_check_option_errors)
+                  ulong skip_lines, bool ignore_check_option_errors, bool& checkSchema)
 {
   List_iterator_fast<Item> it(fields_vars);
   Item_field *sql_field;
@@ -1042,7 +1021,8 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                List<Item> &fields_vars, List<Item> &set_fields,
                List<Item> &set_values, READ_INFO &read_info,
 	       const String &enclosed, ulong skip_lines,
-	       bool ignore_check_option_errors)
+	       bool ignore_check_option_errors, bool& checkSchema,
+           vector<string>& lastRow)
 {
   List_iterator_fast<Item> it(fields_vars);
   Item *item;
@@ -1050,16 +1030,22 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
   uint enclosed_length;
   bool err;
   DBUG_ENTER("read_sep_field");
+  uint rownum = 0;
 
-  enclosed_length=enclosed.length();
-
+  uint warning_count = thd->get_stmt_da()->current_statement_warn_count();
+  uint wc = warning_count;
   for (;;it.rewind())
   {
+    rownum++;
+    if(rownum==1001)
+      cout << "Error\n";
+
     if (thd->killed)
     {
       thd->send_kill_message();
       DBUG_RETURN(1);
     }
+
 
     restore_record(table, s->default_values);
     /*
@@ -1154,6 +1140,7 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
       }
     }
 
+
     if (thd->is_error())
       read_info.error= 1;
 
@@ -1229,15 +1216,27 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
       DBUG_RETURN(-1);
     }
 
-    err= write_record(thd, table, &info, NULL);
-    table->auto_increment_field_not_null= FALSE;
-    if (err)
-      DBUG_RETURN(1);
+    wc = thd->get_stmt_da()->current_statement_warn_count();
+    if(wc>warning_count) {
+      warning_count = wc;
+      cout << "warning for line " << rownum << "\n";
+      checkSchema = true;
+    } else {
+      err= write_record(thd, table, &info, NULL);
+      table->auto_increment_field_not_null= FALSE;
+      if (err)
+        DBUG_RETURN(1);
+    }
     /*
       We don't need to reset auto-increment field since we are restoring
       its default value at the beginning of each loop iteration.
+
+      It is important that checkSchema comes first because we need to reset the line
+      in order to retry the insert.
     */
-    if (read_info.next_line())			// Skip to next line
+    if (checkSchema)
+      break;
+    else if(read_info.next_line())			// Skip to next line
       break;
     if (read_info.line_cuted)
     {
@@ -1263,7 +1262,7 @@ read_xml_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                List<Item> &fields_vars, List<Item> &set_fields,
                List<Item> &set_values, READ_INFO &read_info,
                ulong skip_lines,
-               bool ignore_check_option_errors)
+               bool ignore_check_option_errors, bool& checkSchema)
 {
   List_iterator_fast<Item> it(fields_vars);
   Item *item;
@@ -1458,10 +1457,10 @@ READ_INFO::READ_INFO(File file_par, uint tot_length, const CHARSET_INFO *cs,
                      const String &line_start,
                      const String &line_term,
                      const String &enclosed_par,
-                     int escape, bool get_it_from_net, bool is_fifo)
+                     int escape, bool get_it_from_net, bool is_fifo, map<int,uchar*>* buff)
   :file(file_par), buff_length(tot_length), escape_char(escape),
    found_end_of_line(false), eof(false), need_end_io_cache(false),
-   error(false), line_cuted(false), found_null(false), read_charset(cs)
+   error(false), line_cuted(false), found_null(false), read_charset(cs), buffers(buff), read_pos(0), last_start_pos(0)
 {
   field_term_ptr= field_term.ptr();
   field_term_length= field_term.length();
@@ -1513,7 +1512,7 @@ READ_INFO::READ_INFO(File file_par, uint tot_length, const CHARSET_INFO *cs,
     }
     else
     {
-      /*
+        /*
 	init_io_cache() will not initialize read_function member
 	if the cache is READ_NET. So we work around the problem with a
 	manual assignment
@@ -1535,6 +1534,18 @@ READ_INFO::READ_INFO(File file_par, uint tot_length, const CHARSET_INFO *cs,
 
 READ_INFO::~READ_INFO()
 {
+  map<int,uchar*>::iterator it;
+  for(it=buffers->begin(); it!=buffers->end(); it++) {
+    uchar* add = it->second;
+    delete[] add;
+  }
+
+  while(!freeBuffers.empty()) {
+    uchar* add = freeBuffers.back();
+    delete[] add;
+    freeBuffers.pop_back();
+  }
+
   if (need_end_io_cache)
     ::end_io_cache(&cache);
 
@@ -1546,8 +1557,47 @@ READ_INFO::~READ_INFO()
     delete(t);
 }
 
+int READ_INFO::reset_line() {
+  cache.read_pos = line_start;
+  cache.read_end = line_end;
+  read_pos = last_start_pos;
+  cache.request_pos = buffers->at(last_start_pos);
+  found_end_of_line = false;
+}
 
-#define GET (stack_pos != stack ? *--stack_pos : my_b_get(&cache))
+#define my_b_get3(info, cache, read_pos) \
+      ((info)->read_pos != (info)->read_end ?\
+          ((info)->read_pos++, (int) (uchar) (info)->read_pos[-1]) :\
+          do_read(info, cache, read_pos, freeBuffers))
+
+int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, uint& read_pos, vector<uchar*>& freeBuffers) {
+  read_pos++;
+  if(buffers->find(read_pos)!=buffers->end()) {
+    uchar* bu = (*buffers)[read_pos];
+    cache->request_pos = bu;
+    cache->read_pos = cache->request_pos+1;
+    int read_end = *(int*)(bu + cache->buffer_length);
+    cache->read_end = bu + read_end;
+
+    return (int)*cache->request_pos;
+  }
+ 
+  uchar* buf;
+  if(freeBuffers.empty()) {
+    buf = new uchar[cache->buffer_length+sizeof(int)];
+  } else {
+    buf = freeBuffers.back();
+    freeBuffers.pop_back();
+  }
+  *((int*)(buf+cache->buffer_length)) = (int)(cache->read_end-cache->request_pos);
+  (*buffers)[read_pos] = buf;
+  cache->request_pos = buf;
+
+  int r = _my_b_get(cache);
+  return r;
+}
+
+#define GET (stack_pos != stack ? *--stack_pos : my_b_get3(&cache, buffers, read_pos))
 #define PUSH(A) *(stack_pos++)=(A)
 
 
@@ -1569,7 +1619,6 @@ inline int READ_INFO::terminator(const char *ptr,uint length)
     PUSH((uchar) *--ptr);
   return 0;
 }
-
 
 int READ_INFO::read_field()
 {
@@ -1816,16 +1865,21 @@ found_eof:
 
 int READ_INFO::next_line()
 {
+  int ret = 0;
+
   line_cuted=0;
   start_of_line= line_start_ptr != 0;
   if (found_end_of_line || eof)
   {
     found_end_of_line=0;
-    return eof;
+    ret = eof;
+    goto end;
   }
   found_end_of_line=0;
-  if (!line_term_length)
-    return 0;					// No lines
+  if (!line_term_length) {
+    ret = 0;					// No lines
+    goto end;
+  }
   for (;;)
   {
     int chr = GET;
@@ -1833,7 +1887,8 @@ int READ_INFO::next_line()
     if (chr == my_b_EOF)
     {
       eof= 1;
-      return 1;
+      ret = 1;
+      goto end;
     }
    if (my_mbcharlen(read_charset, chr) > 1)
    {
@@ -1848,19 +1903,46 @@ int READ_INFO::next_line()
    if (chr == my_b_EOF)
    {
       eof=1;
-      return 1;
+      ret = 1;
+      goto end;
     }
     if (chr == escape_char)
     {
       line_cuted=1;
-      if (GET == my_b_EOF)
-	return 1;
+      if (GET == my_b_EOF) {
+	    ret = 1;
+        goto end;
+      }
       continue;
     }
-    if (chr == line_term_char && terminator(line_term_ptr,line_term_length))
-      return 0;
+    if (chr == line_term_char && terminator(line_term_ptr,line_term_length)) {
+      ret = 0;
+      goto end;
+    }
     line_cuted=1;
   }
+
+end:
+  // We can delete all the unused buffers when next_line is called
+
+  line_start = cache.read_pos;
+  line_end = cache.read_end;
+
+  if(last_start_pos<read_pos) {
+    last_start_pos = read_pos;
+
+    int d = read_pos - 1;
+    while(true) {
+      if(buffers->find(d)==buffers->end())
+        break;
+      uchar* dbuff = buffers->at(d);
+      freeBuffers.push_back(dbuff);
+      buffers->erase(d);
+      d--;
+    }
+  }
+
+  return ret;
 }
 
 

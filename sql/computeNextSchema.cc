@@ -563,10 +563,14 @@ typeAndMD typeManager::inferType(char* value, unsigned int length) {
   switch(t) {
     case P_INTEGER:
     {
+      // If definitely too big, just return varchar
+      if(length>19)  
+        return (typeAndMD){TypeWrapper::VARCHAR, "VARCHAR", length, -1, false};    
+
       if(value[0]=='-')
-          
-      length--;
-      int v = atoi(value);
+          length--;
+
+      long long v = atoll(value);
 
       if(v<0) {
         if(v>=-128)   
@@ -584,8 +588,12 @@ typeAndMD typeManager::inferType(char* value, unsigned int length) {
             return (typeAndMD){TypeWrapper::SMALLINT, "SMALLINT", length, -1, true};
         else if(v<=16777215)
             return (typeAndMD){TypeWrapper::MEDIUMINT, "MEDIUMINT", length, -1, true};
-        else if(v<=16777215)
+        else if(v<=2147483647)
             return (typeAndMD){TypeWrapper::INT, "INT", length, -1, true};
+        else if(v<=18446744073709551615)
+            return (typeAndMD){TypeWrapper::BIGINT, "BIGINT", length, -1, true};
+        else
+            return (typeAndMD){TypeWrapper::VARCHAR, "VARCHAR", length, -1, false};    
       }   
     }
     case P_DECIMAL:

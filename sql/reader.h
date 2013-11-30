@@ -1,6 +1,7 @@
 #ifndef READER_H
 #define READER_H
 
+#include <vector>
 #include "sql_class.h"
 #include <my_dir.h>
 #include "my_sys.h"
@@ -11,13 +12,15 @@
 #include <algorithm>
 #include <iostream>
 #include "log_event.h"
-
+#include <map>
 #include <mysql.h>
 #include <hash.h>
 
 using std::min;
 using std::max;
 using std::cout;
+using std::vector;
+using std::map;
 
 class XMLTAG {
 public:
@@ -43,6 +46,9 @@ class READER {
   int        *stack,*stack_pos;
   bool        found_end_of_line,start_of_line,eof;
   bool  need_end_io_cache;
+  uchar *first_request_pos;
+
+
   IO_CACHE cache;
   NET *io_net;
   int level; /* for load xml */
@@ -52,13 +58,15 @@ public:
   uchar        *row_start,                        /* Found row starts here */
         *row_end;                        /* Found row ends here */
   const CHARSET_INFO *read_charset;
+  map<int,uchar*>* buffers;
+  int read_pos;
 
   READER(File file,uint tot_length,const CHARSET_INFO *cs,
             const String &field_term,
             const String &line_start,
             const String &line_term,
             const String &enclosed,
-            int escape,bool get_it_from_net, bool is_fifo);
+            int escape,bool get_it_from_net, bool is_fifo, map<int,uchar*>* buffers);
   ~READER();
   int read_field();
   int read_fixed_length(void);

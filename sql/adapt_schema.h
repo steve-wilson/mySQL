@@ -8,6 +8,8 @@
 
 using std::vector;
 
+static const int ROW_LIMIT = 1000;
+
 /*
     update schema to accomodate
 
@@ -15,6 +17,8 @@ using std::vector;
              true if error occurs
 */
 bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_INFO *cs, const String &field_term, const String &line_start, const String &line_term, const String &enclosed, int escape, bool get_it_from_net, bool is_fifo, THD* thd, sql_exchange *ex, TABLE_LIST **table_list_ptr, List<Item>& field_list, vector<string>& header, schema_update_method method, bool relaxed_schema_inference, unsigned int infer_sample_size);
+
+string schema_from_row(string& db, string& table_name, vector<string>& header, vector<string>& row);
 
 bool finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_method method);
 

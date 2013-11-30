@@ -1,9 +1,29 @@
 #include "reader.h"
 
+#include <vector>
 #include <iostream>
 
 using std::min;
 using std::max;
+using std::vector;
+
+#define my_b_get2(info, cache) \
+      ((info)->read_pos != (info)->read_end ?\
+          ((info)->read_pos++, (int) (uchar) (info)->read_pos[-1]) :\
+          do_read(info, cache, read_pos))
+
+int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, int& read_pos) {
+  read_pos++;
+  int r = _my_b_get(cache);
+
+  uchar* b = new uchar[cache->buffer_length+sizeof(int)];
+  strncpy((char*)b, (char*)cache->request_pos, cache->buffer_length);
+  *((int*)(b+cache->buffer_length)) = (int)(cache->read_end-cache->request_pos);
+  (*buffers)[read_pos] = b;
+
+  return r;
+}
+
 
 /* Unescape all escape characters, mark \N as null */
 
@@ -37,10 +57,10 @@ READER::READER(File file_par, uint tot_length, const CHARSET_INFO *cs,
                      const String &line_start,
                      const String &line_term,
                      const String &enclosed_par,
-                     int escape, bool get_it_from_net, bool is_fifo)
+                     int escape, bool get_it_from_net, bool is_fifo, map<int,uchar*>* buffs)
   :file(file_par), buff_length(tot_length), escape_char(escape),
    found_end_of_line(false), eof(false), need_end_io_cache(false),
-   error(false), line_cuted(false), found_null(false), read_charset(cs)
+   error(false), line_cuted(false), found_null(false), read_charset(cs), buffers(buffs), read_pos(0)
 {
   field_term_ptr= field_term.ptr();
   field_term_length= field_term.length();
@@ -111,11 +131,14 @@ READER::READER(File file_par, uint tot_length, const CHARSET_INFO *cs,
   }
 }
 
-
 READER::~READER()
 {
+//  while(!next_line());
+
+//  cache.request_pos = first_request_pos;
+
   if (need_end_io_cache)
-    ::end_io_cache(&cache);
+    end_io_cache();
 
   if (buffer != NULL)
     my_free(buffer);
@@ -124,9 +147,7 @@ READER::~READER()
   while ((t= xmlit++))
     delete(t);
 }
-
-
-#define GET (stack_pos != stack ? *--stack_pos : my_b_get(&cache))
+#define GET (stack_pos != stack ? *--stack_pos : my_b_get2(&cache, buffers))
 #define PUSH(A) *(stack_pos++)=(A)
 
 

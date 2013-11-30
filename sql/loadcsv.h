@@ -22,12 +22,10 @@ class LoadCSV {
 
   LoadCSV(string db, string table, READER * reader);
 
-  vector<string> getHeader() {
-    return header;
-  }
+  vector<string> getHeader();
 
-  vector<typeAndMD> calculateColumnTypes();
   string calculateSchema(bool relaxed, unsigned int sample_size);
+  vector<typeAndMD> calculateColumnTypes(int rows);
   vector<column> match(string schema1, string schema2);
 };
 
