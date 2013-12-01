@@ -21,16 +21,16 @@ const string sub_table_delimiter = "___";
 
 // find highest table number based on current name
 // e.g. if ___table___5 is the newest table, return 5
-int getHighestTID(THD* thd, string table_name);
+int getHighestTID(THD* thd, string db, string table_name);
 
 // generates a delimiter-enclosed string followed by i
-string getSubTableName(string table_name,int i);
+string getSubTableName(string table_name, int i);
 
 // do a name swap between the most recent table and the view
-void swapTableWithView(THD* thd, string table_name);
+void swapTableWithView(THD* thd, string db, string table_name);
 
 // do a "drop table" on all subtables
-void drop_all_subtables(THD * thd, string table_name);
+void drop_all_subtables(THD * thd, string db, string table_name);
 
 class SubTable{
     

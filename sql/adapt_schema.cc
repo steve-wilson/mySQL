@@ -128,7 +128,8 @@ bool finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_me
     
     if (method==SCHEMA_UPDATE_VIEW){
         string table_name = table_list->table_name;
-        swapTableWithView(thd, table_name);
+        string db = table_list->db;
+        swapTableWithView(thd, db, table_name);
     }
     return 0;
 

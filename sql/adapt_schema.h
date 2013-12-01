@@ -21,7 +21,7 @@ bool finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_me
 void prepareNaive(THD* thd, string oldSchema, string newSchema, vector<column> matches);
 void prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr);
 void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr);		
-void swapTableWithView(THD * thd, string table_name);
+void swapTableWithView(THD * thd, string db, string table_name);
 
 string findTableName(string &schema);
 bool oldSchemaDoesntExist(string oldSchema); 

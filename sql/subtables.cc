@@ -6,11 +6,11 @@
 
 // find highest table number based on current name
 // e.g. if ___table___5 is the newest table, return 5
-int getHighestTID(THD* thd, string table_name){
+int getHighestTID(THD* thd, string db, string table_name){
     Ed_connection c(thd);
     int max_i = 0;
     string sub_table_name = sub_table_delimiter + table_name + sub_table_delimiter;
-    List<Ed_row> results = executeQuery(c, "SHOW TABLES LIKE \"" + sub_table_name + "\%\";");
+    List<Ed_row> results = executeQuery(c, "SHOW TABLES FROM " + db + " LIKE \"" + sub_table_name + "\%\";");
     List_iterator<Ed_row> it(results);
     Ed_row* row;
     if (!results.is_empty()){
@@ -35,22 +35,22 @@ string getSubTableName(string table_name,int i){
 }
 
 // do a name swap between the most recent table and the view
-void swapTableWithView(THD* thd, string table_name){
-        int i = getHighestTID(thd, table_name);
+void swapTableWithView(THD* thd, string db, string table_name){
+        int i = getHighestTID(thd, db, table_name);
         // i.e., what the view will be named at the end of the swap
         string view_name = getSubTableName(table_name, i);
         Ed_connection c(thd);
         string tmp_name = "TEMP_SWAP_TABLE";
-        executeQuery(c, "RENAME TABLE " + table_name + " TO " + tmp_name);
-        executeQuery(c, "RENAME TABLE " + view_name + " TO " + table_name);
-        executeQuery(c, "RENAME TABLE " + tmp_name + " TO " + view_name);
+        executeQuery(c, "RENAME TABLE " + db + "." + table_name + " TO " + db + "." + tmp_name);
+        executeQuery(c, "RENAME TABLE " + db + "." + view_name + " TO " + db + "." + table_name);
+        executeQuery(c, "RENAME TABLE " + db + "." + tmp_name + " TO " + db + "." + view_name);
 }
 
-void drop_all_subtables(THD * thd, std::string table_name){
+void drop_all_subtables(THD * thd, std::string db, std::string table_name){
     Ed_connection c(thd);
     vector<string> to_drop;
     string sub_table_name = sub_table_delimiter + table_name + sub_table_delimiter;
-    List<Ed_row> results = executeQuery(c, "SHOW TABLES LIKE \"" + sub_table_name + "\%\";");
+    List<Ed_row> results = executeQuery(c, "SHOW TABLES FROM " + db + " LIKE \"" + sub_table_name + "\%\";");
     List_iterator<Ed_row> it(results);
     Ed_row* row;
     if (!results.is_empty()){
@@ -60,7 +60,7 @@ void drop_all_subtables(THD * thd, std::string table_name){
         }
     }
     for(vector<string>::iterator it=to_drop.begin(); it!=to_drop.end(); ++it){
-        executeQuery(c, "DROP TABLE " + *it);
+        executeQuery(c, "DROP TABLE " + db + "." + *it);
     }
 }
 
@@ -111,7 +111,7 @@ SubTableList::SubTableList(THD* thd, string table_name, string db_in) :
     db(db_in) {
     Ed_connection c(thd);
     string sub_table_name = sub_table_delimiter + table_name + sub_table_delimiter;
-    List<Ed_row> results = executeQuery(c, "SHOW TABLES LIKE \"" + sub_table_name + "\%\";");
+    List<Ed_row> results = executeQuery(c, "SHOW TABLES FROM " + db + " LIKE \"" + sub_table_name + "\%\";");
     List_iterator<Ed_row> it(results);
     Ed_row* row;
     if (!results.is_empty()){
