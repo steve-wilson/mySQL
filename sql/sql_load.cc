@@ -350,6 +350,65 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
     skip_lines++;
   }
 
+  uint tot_length=0;
+  bool use_blobs= 0, use_vars= 0;
+  List_iterator_fast<Item> it(fields_vars);
+  Item *item;
+
+  while ((item= it++))
+  {
+    Item *real_item= item->real_item();
+
+    if (real_item->type() == Item::FIELD_ITEM)
+    {
+      Field *field= ((Item_field*)real_item)->field;
+      if (field->flags & BLOB_FLAG)
+      {
+        use_blobs= 1;
+        tot_length+= 256;			// Will be extended if needed
+      }
+      else
+        tot_length+= field->field_length;
+    }
+    else if (item->type() == Item::STRING_ITEM)
+      use_vars= 1;
+  }
+  if (use_blobs && !ex->line_term->length() && !field_term->length())
+  {
+    my_message(ER_BLOBS_AND_NO_TERMINATED,ER(ER_BLOBS_AND_NO_TERMINATED),
+	       MYF(0));
+    DBUG_RETURN(TRUE);
+  }
+  if (use_vars && !field_term->length() && !enclosed->length())
+  {
+    my_error(ER_LOAD_FROM_FIXED_SIZE_ROWS_TO_VAR, MYF(0));
+    DBUG_RETURN(TRUE);
+  }
+
+  READ_INFO read_info(file,tot_length,
+                      ex->cs ? ex->cs : thd->variables.collation_database,
+		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
+		      escape_char, read_file_from_client, is_fifo, &buffers);
+
+  if (read_info.error)
+  {
+    if (file >= 0)
+      mysql_file_close(file, MYF(0));           // no files in net reading
+    DBUG_RETURN(TRUE);				// Can't allocate buffers
+  }
+
+#ifndef EMBEDDED_LIBRARY
+  if (mysql_bin_log.is_open())
+  {
+    lf_info.thd = thd;
+    lf_info.wrote_create_file = 0;
+    lf_info.last_pos_in_file = HA_POS_ERROR;
+    lf_info.log_delayed= transactional_table;
+    read_info.set_io_cache_arg((void*) &lf_info);
+  }
+#endif /*!EMBEDDED_LIBRARY*/
+
+continue_inserting:
   if (open_and_lock_tables(thd, table_list, TRUE, 0))
     DBUG_RETURN(TRUE);
   if (setup_tables_and_check_access(thd, &thd->lex->select_lex.context,
@@ -443,40 +502,6 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
 
   prepare_triggers_for_insert_stmt(table);
 
-  uint tot_length=0;
-  bool use_blobs= 0, use_vars= 0;
-  List_iterator_fast<Item> it(fields_vars);
-  Item *item;
-
-  while ((item= it++))
-  {
-    Item *real_item= item->real_item();
-
-    if (real_item->type() == Item::FIELD_ITEM)
-    {
-      Field *field= ((Item_field*)real_item)->field;
-      if (field->flags & BLOB_FLAG)
-      {
-        use_blobs= 1;
-        tot_length+= 256;			// Will be extended if needed
-      }
-      else
-        tot_length+= field->field_length;
-    }
-    else if (item->type() == Item::STRING_ITEM)
-      use_vars= 1;
-  }
-  if (use_blobs && !ex->line_term->length() && !field_term->length())
-  {
-    my_message(ER_BLOBS_AND_NO_TERMINATED,ER(ER_BLOBS_AND_NO_TERMINATED),
-	       MYF(0));
-    DBUG_RETURN(TRUE);
-  }
-  if (use_vars && !field_term->length() && !enclosed->length())
-  {
-    my_error(ER_LOAD_FROM_FIXED_SIZE_ROWS_TO_VAR, MYF(0));
-    DBUG_RETURN(TRUE);
-  }
 /*
       std::ofstream outfile;
       outfile.open("/tmp/update_schema_artifact");
@@ -484,29 +509,6 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
       outfile << file << "\n";
       outfile.close();
 */
-  READ_INFO read_info(file,tot_length,
-                      ex->cs ? ex->cs : thd->variables.collation_database,
-		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
-		      info.escape_char, read_file_from_client, is_fifo, &buffers);
-
-  if (read_info.error)
-  {
-    if (file >= 0)
-      mysql_file_close(file, MYF(0));           // no files in net reading
-    DBUG_RETURN(TRUE);				// Can't allocate buffers
-  }
-
-#ifndef EMBEDDED_LIBRARY
-  if (mysql_bin_log.is_open())
-  {
-    lf_info.thd = thd;
-    lf_info.wrote_create_file = 0;
-    lf_info.last_pos_in_file = HA_POS_ERROR;
-    lf_info.log_delayed= transactional_table;
-    read_info.set_io_cache_arg((void*) &lf_info);
-  }
-#endif /*!EMBEDDED_LIBRARY*/
-
   thd->count_cuted_fields= CHECK_FIELD_WARN;		/* calc cuted fields */
   thd->cuted_fields=0L;
   /* Skip lines if there is a line terminator */
@@ -556,7 +558,31 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
 
       // If there was warning on the last row, check to see if we can update the schema
       if(checkSchema) { 
+        // Stop import and commit everything so far
         table->file->ha_end_bulk_insert();
+
+        table->file->extra(HA_EXTRA_NO_IGNORE_DUP_KEY);
+        table->file->extra(HA_EXTRA_WRITE_CANNOT_REPLACE);
+        table->next_number_field=0;
+
+        free_blobs(table);				/* if pack_blob was used */
+        table->copy_blobs=0;
+
+        table->file->ha_release_auto_increment();
+        table->auto_increment_field_not_null= FALSE;
+
+        query_cache_invalidate3(thd, table_list, 0);
+
+        thd->get_stmt_da()->set_overwrite_status(true);
+        trans_commit_stmt(thd);
+        thd->get_stmt_da()->set_overwrite_status(false);
+
+        close_thread_tables(thd);
+        thd->mdl_context.release_transactional_locks();
+
+        thd->reset_for_next_command();
+
+        // Now, fix up the schema
         cout << "Fixing schema: " << newSchema << "\n";
         read_info.reset_line();
         lastRow.clear();
@@ -567,16 +593,8 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
         read_info.reset_line();
         newSchema = schema_from_row(db_s, table_name_s, header, lastRow);  
         cout << newSchema << "\n";
-/*
-        THD_STAGE_INFO(thd, stage_query_end);
-        if (thd->one_shot_set && lex->sql_command != SQLCOM_SET_OPTION)
-          reset_one_shot_variables(thd);
-*/
-        thd->get_stmt_da()->set_overwrite_status(true);
-        trans_commit_stmt(thd);
-        thd->get_stmt_da()->set_overwrite_status(false);
 
-        thd->reset_for_next_command();
+        fields_vars.delete_elements();
         if (update_schema_to_accomodate_data(file, 0,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		        *field_term,*ex->line_start, *ex->line_term, *enclosed,
@@ -584,7 +602,12 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
                 fields_vars, header, &buffers, merge_method, newSchema))
           DBUG_RETURN(TRUE);
 
-        break;
+        table_list->reinit_before_use(thd);
+
+        open_temporary_tables(thd, table_list);
+
+        checkSchema = false;
+        goto continue_inserting;
       } else {
         break;
       }
