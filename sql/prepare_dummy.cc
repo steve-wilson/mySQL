@@ -7,11 +7,13 @@
 #include <set>
 
 static const string column_delimiter = "___";
+static const string modified_delimiter = "xxx";
 
 #define DUMMY_STRING "DUMMY"
-#define INT_STRING "INTEGER"
+#define MODIFIED_STRING "MODIFY"
+#define INTEGER_STRING "INTEGER"
 #define DECIMAL_STRING "DECIMAL"
-#define TEXT_STRING "TEXT"
+#define VARCHAR_STRING "VARCHAR(255)"
 
 static string intTypesArray[] = { "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER"};
 static string decimalTypesArray[] = { "REAL", "DOUBLE", "FLOAT", "DEC", "DECIMAL", "NUMERIC" };
@@ -28,9 +30,9 @@ struct dummyCol
 };
 
 // Used for initial create of table for adding dummy cols
-string addDummyColsString(string newSchema, int numInts, int numDecimals, int numVarchars, float addColFraction, int numDummyColsMin)
+string addDummyColsString(string newSchema, int numInts, int numDecimals, int numTexts, float addColFraction, int numDummyColsMin)
 {
-	int totalCols = numInts + numDecimals + numVarchars;
+	int totalCols = numInts + numDecimals + numTexts;
 	int addColsUsingFraction = addColFraction * totalCols;		// Rounds off fractional part
 	float intFraction = (float) numInts / totalCols;
 	float decimalFraction = (float) numDecimals / totalCols;
@@ -43,7 +45,7 @@ string addDummyColsString(string newSchema, int numInts, int numDecimals, int nu
 	
 	fractionPerColumn = (float) 1 / numColsToAdd;
 
-	// Find correct number of each column to add. Add remainder of new cols as varchars.
+	// Find correct number of each column to add. Add remainder of new cols as text.
 	int intColsToAdd = (int)(intFraction / fractionPerColumn);
 	int decimalColsToAdd = (int)(decimalFraction / fractionPerColumn);
 
@@ -62,7 +64,7 @@ string addDummyColsString(string newSchema, int numInts, int numDecimals, int nu
 		if(intColsToAdd > 0)
 		{
 			--intColsToAdd;
-			newSchema += INT_STRING;
+			newSchema += INTEGER_STRING;
 		}
 		else if(decimalColsToAdd > 0)
 		{
@@ -71,7 +73,7 @@ string addDummyColsString(string newSchema, int numInts, int numDecimals, int nu
 		}
 		else
 		{
-			newSchema += TEXT_STRING;			
+			newSchema += VARCHAR_STRING;
 		}
 		os.str("");
 	}
@@ -82,18 +84,18 @@ string addDummyColsString(string newSchema, int numInts, int numDecimals, int nu
 }
 
 // Alter statement for adding dummy cols to exisiting table
-string alterDummyColsStatement(map<string, vector<dummyCol> > &typeToDummyCol, set<int> &alreadyUsed, int numInts, int numDecimals, int numVarchars, float addColFraction, int numDummyColsMin)
+string alterDummyColsStatement(map<string, vector<dummyCol> > &typeToDummyCol, set<int> &alreadyUsed, int numInts, int numDecimals, int numTexts, float addColFraction, int numDummyColsMin)
 {
-	int totalCols = numInts + numDecimals + numVarchars;
+	int totalCols = numInts + numDecimals + numTexts;
 	int addColsUsingFraction = addColFraction * totalCols;		// Rounds off fractional part
 	float intFraction = (float) numInts / totalCols;
 	float decimalFraction = (float) numDecimals / totalCols;
 	float fractionPerColumn;
-	int intDummyColsExisting = (int)typeToDummyCol[INT_STRING].size();
+	int intDummyColsExisting = (int)typeToDummyCol[INTEGER_STRING].size();
 	int decimalDummyColsExisting = (int)typeToDummyCol[DECIMAL_STRING].size();
-	int varcharDummyColsExisting = (int)typeToDummyCol[TEXT_STRING].size();
+	int textDummyColsExisting = (int)typeToDummyCol[VARCHAR_STRING].size();
 	int numColsToAdd = addColsUsingFraction;
-	int totalDummyColsExisting = intDummyColsExisting + decimalDummyColsExisting + varcharDummyColsExisting;
+	int totalDummyColsExisting = intDummyColsExisting + decimalDummyColsExisting + textDummyColsExisting;
 	string alterDummyString = "";
 	
 	// Set numColsToAdd to max of numDummyColsMin and addColsUsingFraction
@@ -102,7 +104,7 @@ string alterDummyColsStatement(map<string, vector<dummyCol> > &typeToDummyCol, s
 	
 	fractionPerColumn = (float) 1 / numColsToAdd;
 
-	// Find correct number of each column to add. Add remainder of new cols as varchars.
+	// Find correct number of each column to add. Add remainder of new cols as text.
 	int intColsToAdd = (int)(intFraction / fractionPerColumn);
 	int decimalColsToAdd = (int)(decimalFraction / fractionPerColumn);
 
@@ -126,7 +128,7 @@ string alterDummyColsStatement(map<string, vector<dummyCol> > &typeToDummyCol, s
 		if(intColsToAdd > 0)
 		{
 			--intColsToAdd;
-			alterDummyString += INT_STRING;
+			alterDummyString += INTEGER_STRING;
 		}
 		else if(decimalColsToAdd > 0)
 		{
@@ -135,8 +137,9 @@ string alterDummyColsStatement(map<string, vector<dummyCol> > &typeToDummyCol, s
 		}
 		else
 		{
-			alterDummyString += TEXT_STRING;			
+			alterDummyString += VARCHAR_STRING;			
 		}
+
 		os.str("");	
 	}
 
@@ -150,7 +153,7 @@ void createTableAndView(string db, string dummy_table_name, string table_name, s
 	string viewCols = "";
 	int numInts = 0;
 	int numDecimals = 0;
-	int numVarchars = 0;
+	int numTexts = 0;
 
 	// Create view with actual cols
 	vector<column>::iterator it;
@@ -164,13 +167,13 @@ void createTableAndView(string db, string dummy_table_name, string table_name, s
 		else if(decimalTypes.find(it->typeMD.type) != decimalTypes.end())
 			++numDecimals;
 		else
-			++numVarchars; 
+			++numTexts; 
 		
 		viewCols += it->newName;			
 	}		
 
 	// Create table with dummy cols
-	createStatement += addDummyColsString(newSchema, numInts, numDecimals, numVarchars, .25, 5);
+	createStatement += addDummyColsString(newSchema, numInts, numDecimals, numTexts, .25, 10);
 	executeQuery(c, createStatement);
 
 	viewStatement += viewCols + " FROM " + db + "." + dummy_table_name;
@@ -200,56 +203,28 @@ string getCastString(typeAndMD type)
 	else if(type.type == "DATETIME" || type.type == "YEAR")
 		return "DATETIME";
 	else if(type.type == "CHAR" || type.type == "VARCHAR")
-		return "CHAR";
+		return "CHAR(255)";
 
 	return "";
 }
-        
+       
+static void stringToUpper(string &s)
+{
+        for(unsigned int i = 0; i < s.length(); ++i)
+                s[i] = toupper(s[i]);
+}
+
 string findDummyColType(string type)
 {
+	stringToUpper(type);
+
 	if(intTypes.find(type) != intTypes.end())
-		return INT_STRING;
+		return INTEGER_STRING;
 	else if(decimalTypes.find(type) != decimalTypes.end()) 
 		return DECIMAL_STRING;
 	
-	return TEXT_STRING;
+	return VARCHAR_STRING;
 }
-
-/*
-string updateDummyCol(dummyCol &dc)
-{
-	string typeOfDummyCol;
-	if(dc.type.find("(") != string::npos)
-	{
-		typeOfDummyCol = typeString.substr(0, typeString.find("("));
-		
-		// m and d exist
-		if(typeString.find(",") != string::npos)
-		{
-			dc.m = atoi(typeString.substr(typeString.find("(") + 1, typeString.find(",") - typeString.find("(") - 1).c_str());
-			dc.d = atoi(typeString.substr(typeString.find(",") + 1, typeString.find(")") - typeString.find(",") - 1).c_str());
-		}
-		else
-		{
-			dc.m = atoi(typeString.substr(typeString.find("(") + 1, typeString.find(")") - typeString.find("(") - 1).c_str());
-			dc.d = -1;
-		}
-	}	
-	else
-	{
-		typeOfDummyCol = typeString(0, typeString.find(" "));
-		dc.m = -1;
-		dc.d = -1;
-	}
-
-	if(typeString.find(" ") != string::npos)
-		dc.unsignedVal = true;
-	else
-		dc.unsignedVal = false;
-	
-	return findDummyColType(typeOfDummyCol);
-}
-*/
 
 string getType(string typeString)
 {
@@ -279,16 +254,19 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 	// Add columns to dummy table and cast them to the view 
 	else
     {
-		// Maps type to dummyCol. Right now types of dummyCols can only be INTEGER, DECIMAL or VARCHAR.
+		// Maps type to dummyCol. Right now types of dummyCols can only be INTEGER, DECIMAL or TEXT.
 		map<string, dummyCol> dummyFieldStrings;
 		List<Ed_row> dummyFields = executeQuery(c, "describe " + db  + "." + dummy_table_name);
 		List_iterator<Ed_row> dummyFieldsIT(dummyFields);
 		Ed_row *row;
 		string viewCols = "";
 		map<string, vector<dummyCol> > typeToUnusedDummyCols;
+		map<string, set<int> > colNameToModifiedIndexes;
+		map<string, string> currentType;
 		set<int> alreadyUsedDummyIndexes;
+		vector<string> viewColumns;
 
-		// Store all available dummy cols in dummyFieldString vector
+		// Store all available dummy cols in dummyFieldString vector also store modified indexes 
 		while((row = dummyFieldsIT++) != NULL)
 		{
 			if(((string)row->get_column(0)->str).find(column_delimiter + DUMMY_STRING) != string::npos)
@@ -316,12 +294,28 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 
 				typeToUnusedDummyCols[typeToAdd].push_back(dc);
 			}
+			else if(((string)row->get_column(0)->str).find(modified_delimiter + MODIFIED_STRING) != string::npos)
+			{
+				string modifiedName = (string)row->get_column(0)->str;
+				size_t startOfColName = modifiedName.find('Y') + 1;
+				size_t lengthOfColName = modifiedName.find(modified_delimiter, 5) - startOfColName;
+
+				string colName = modifiedName.substr(startOfColName, lengthOfColName);
+				
+				int modifiedIndex = atoi(modifiedName.substr(modifiedName.find(modified_delimiter, 5) + 3, string::npos).c_str());
+
+				if(colNameToModifiedIndexes.find(colName) == colNameToModifiedIndexes.end())
+				{
+					set<int> modifiedIndexes;
+					colNameToModifiedIndexes.insert(make_pair<string, set<int> >(colName, modifiedIndexes));
+				}
+
+				colNameToModifiedIndexes[colName].insert(modifiedIndex);
+			}
 			else
 			{
-				if(viewCols.length() > 0)
-					viewCols += ",";
-				
-				viewCols += (string)row->get_column(0)->str; 
+				currentType[(string)row->get_column(0)->str] = (string) row->get_column(1)->str;
+				viewColumns.push_back((string)row->get_column(0)->str);
 			}
 		}
 
@@ -329,101 +323,248 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 		vector<column> fieldsAdded;
 		vector<column> fieldsModified;
 		vector<column>::iterator it;
-		bool alreadyGoingToAddCols = false;
 		int numInts = 0;
 		int numDecimals = 0;
-		int numVarchars = 0;
+		int numTexts = 0;
+		int numNewInts = 0;
+		int numNewDecimals = 0;
+		int numNewTexts = 0;
+		string finalViewCols = "";
 	
 		// Find added and modifed cols and store in vectors. Also compute counts of existing cols for computing dummyCols to add next
 		for(it = matches.begin(); it != matches.end(); ++it)
 		{
-			if(intTypes.find(it->typeMD.type) != intTypes.end())
-           		++numInts;
-         	else if(decimalTypes.find(it->typeMD.type) != decimalTypes.end())
-             	++numDecimals;
-         	else
-             	++numVarchars;
-	
+			if(finalViewCols.length() > 0)
+				finalViewCols += ",";
+
 			if(it->addedFromExisting)
-				fieldsAdded.push_back(*it);
-			else if(it->changedFromExisting)
-				fieldsModified.push_back(*it);
-		}
-	
-		string alterAddColString = "";
-		string alterModifyColString = "";
-		string alterDummyColString = "";
-		string castString = "";
-
-		// Handle added columns
-		if(fieldsAdded.size() > 0)
-		{
-			// For each added column see if you can add it using existing dummy cols or need to extend the table
-			for(it = fieldsAdded.begin(); it != fieldsAdded.end(); ++it)
-			{
-				string type = findDummyColType(it->typeMD.type);
+				finalViewCols += it->newName;
+			else 
+				finalViewCols += it->existingName;
 			
-				if(alterAddColString.length() > 0)
-					alterAddColString += ", ";
+			if(intTypes.find(it->typeMD.type) != intTypes.end())
+			{
+				++numInts;
+				
+				if(it->addedFromExisting || it->changedFromExisting)
+					++numNewInts;
+			}
+			else if(decimalTypes.find(it->typeMD.type) != decimalTypes.end())
+			{
+				++numDecimals;
+				
+				if(it->addedFromExisting || it->changedFromExisting)
+					++numNewDecimals;
+			}
+			else
+			{
+             	++numTexts;
+				
+				if(it->addedFromExisting || it->changedFromExisting)
+					++numNewTexts;
+			}
 
-				if(type == INT_STRING)
-					++numInts;
-				else if(type == DECIMAL_STRING)
-					++numDecimals;
-				else
-					++numVarchars;
+			if(it->addedFromExisting)
+			{
+				viewColumns.push_back(it->newName);
+				fieldsAdded.push_back(*it);
+			}
+			else if(it->changedFromExisting)
+			{
+				viewColumns.push_back(it->newName);
+				fieldsModified.push_back(*it);
+			}
+			else 
+				viewColumns.push_back(it->existingName);
 
-				// Have an available matching type dummy col
-				if(typeToUnusedDummyCols.find(type) != typeToUnusedDummyCols.end() && typeToUnusedDummyCols[type].size() > 0)
-			 	{
-					dummyCol dc = typeToUnusedDummyCols[type].back();
-					typeToUnusedDummyCols[type].pop_back();
-					
-					alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + type;
-					
-					// Need to cast if type is varchar and type of what we are storing is not varchar				
-					if(type == TEXT_STRING && it->typeMD.type != TEXT_STRING)
-					{
-						string castString = getCastString(it->typeMD);
-						
-						if(viewCols.length() > 0)
-							viewCols += ",";
+		}
 
-						viewCols += "CAST(" + it->newName + " AS " + castString + ") AS " + it->newName;
-					}
-				}
-				// Need to extend table. Don't remove from fieldsAdded
-				else 
-				{	
-					alreadyGoingToAddCols = true;
-					
+		string alterAddColString = "";
+		string alterDummyColString = "";
+		
+		// Need to add columns so add the exact type instead of storing in dummy cols
+		if(numNewInts > typeToUnusedDummyCols[INTEGER_STRING].size() ||
+		   numNewDecimals > typeToUnusedDummyCols[DECIMAL_STRING].size() ||
+		   numNewTexts > typeToUnusedDummyCols[VARCHAR_STRING].size())
+		{
+			// Handle added columns
+			if(fieldsAdded.size() > 0 || fieldsModified.size() > 0)
+			{
+				// For each added column add it to the alter column string
+				for(it = fieldsAdded.begin(); it != fieldsAdded.end(); ++it)
+				{
+					if(alterAddColString.length() > 0)
+						alterAddColString += ", ";
+
 					alterAddColString += "ADD " + it->newName + " " + toString(it->typeMD);
 				}
-			}
 
-			// Add dummy cols if we are going to add cols
-			if(alreadyGoingToAddCols)
-			{
-				alterDummyColString = alterDummyColsStatement(typeToUnusedDummyCols, alreadyUsedDummyIndexes, numInts, numDecimals, numVarchars, .25, 5);
-			}
+				// For each modified column modify it to the correct type
+				for(it = fieldsModified.begin(); it != fieldsModified.end(); ++it)
+				{
+					if(alterAddColString.length() > 0)
+						alterAddColString += ", ";
 
-			if(alterAddColString.length() > 0)
-			{
-				// Alter the table adding columns and renaming old columns
-				string executeString = "ALTER TABLE " + db + "." + dummy_table_name + " " + alterAddColString + alterDummyColString;
-				executeQuery(c, "ALTER TABLE " + db + "." + dummy_table_name + " " + alterAddColString + alterDummyColString);
- 
-                // Now drop old view and make a new view that casts the datatypes when appropriate  
-                executeQuery(c, "DROP VIEW " + db + "." + table_name);
-                executeQuery(c, "CREATE VIEW " + db + "." + table_name + " AS SELECT " + viewCols + " FROM " + db + "." + dummy_table_name);
+					alterAddColString += "MODIFY " + it->newName + " " + toString(it->typeMD);
+				}
+				
+				List<Ed_row> viewFields = executeQuery(c, "describe " + db  +	"." + table_name);
+		        List_iterator<Ed_row> viewFieldsIT(viewFields);
+
+				// Find all columns in the view
+				while((row = viewFieldsIT++) != NULL)
+ 	        	{
+					if(viewCols.length() != 0)
+						viewCols += ",";
+
+					viewCols += (string)row->get_column(0)->str;
+				}
+
+				// Create table like old underyling table
+				string dummy_table_copy_name = dummy_table_name + "copy";
+				string createTableString = "CREATE TABLE " + db + "." + dummy_table_copy_name + " LIKE " + db + "." + dummy_table_name;
+				executeQuery(c, createTableString);
+
+				// Alter the new table adding columns and renaming old columns
+				string alterTableString = "ALTER TABLE " + db + "." + dummy_table_copy_name + " " + alterAddColString + alterDummyColString;
+				executeQuery(c, alterTableString);
+ 							
+				// Insert into new table from what is in the view
+				string insertString = "INSERT INTO " + db + "." + dummy_table_copy_name + " (" +  viewCols + ") SELECT * FROM " + db + "." + table_name;
+				executeQuery(c, insertString);
+
+				// Drop old table
+				string dropTableString = "DROP TABLE " + db + "." + dummy_table_name;
+				executeQuery(c, dropTableString);
+
+				// Rename new table to old table name
+				string renameTableString = "RENAME TABLE " + db + "." + dummy_table_copy_name + " TO " + db + "." + dummy_table_name;
+				executeQuery(c, renameTableString);
+
+				// Now drop old view and make a new view that casts the datatypes when appropriate  
+				executeQuery(c, "DROP VIEW " + db + "." + table_name);
+				executeQuery(c, "CREATE VIEW " + db + "." + table_name + " AS SELECT " + finalViewCols + " FROM " + db + "." + dummy_table_name);
 			}
-	
 		}
-		
-		// Handle modifying types of cols
-		if(fieldsModified.size() > 0)
+		// We can just rename the exisitng dummy cols
+		else
 		{
+			if(fieldsAdded.size() > 0 || fieldsModified.size() > 0)
+			{
+				map<string, string> colNameToViewColString;
 
+				// For each added column add it using existing dummy cols 
+				for(it = fieldsAdded.begin(); it != fieldsAdded.end(); ++it)
+				{
+					string type = findDummyColType(it->typeMD.type);
+				
+					if(alterAddColString.length() > 0)
+						alterAddColString += ", ";
+
+					// Have an available matching type dummy col
+					if(typeToUnusedDummyCols.find(type) != typeToUnusedDummyCols.end() && typeToUnusedDummyCols[type].size() > 0)
+					{
+						dummyCol dc = typeToUnusedDummyCols[type].back();
+						typeToUnusedDummyCols[type].pop_back();
+						
+						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + type;
+						
+						// Need to cast if type is text and type of what we are storing is not text				
+						if(type == VARCHAR_STRING && it->typeMD.type != VARCHAR_STRING)
+						{
+							string castString = getCastString(it->typeMD);
+							
+							string viewCol = "CAST(" + it->newName + " AS " + castString + ") AS " + it->newName;
+							colNameToViewColString.insert(make_pair<string, string>(it->newName, viewCol));	
+						}
+					}
+				}
+
+				// For each modfied column add a modified type to a dummy col
+				for(it = fieldsModified.begin(); it != fieldsModified.end(); ++it)
+				{
+					string type = findDummyColType(it->typeMD.type);
+				
+					if(alterAddColString.length() > 0)
+						alterAddColString += ", ";
+
+					// Have an available matching type dummy col
+					if(typeToUnusedDummyCols.find(type) != typeToUnusedDummyCols.end() && typeToUnusedDummyCols[type].size() > 0)
+					{
+						dummyCol dc = typeToUnusedDummyCols[type].back();
+						typeToUnusedDummyCols[type].pop_back();
+							
+						int currentMaxIndex = 0;
+
+						if(colNameToModifiedIndexes.find(it->newName) != colNameToModifiedIndexes.end())
+							currentMaxIndex = *colNameToModifiedIndexes[it->newName].rbegin();
+
+						ostringstream os;
+						os << currentMaxIndex + 1;
+						
+						colNameToModifiedIndexes[it->newName].insert(currentMaxIndex + 1);
+
+						alterAddColString += "CHANGE " + it->newName + " " + modified_delimiter + MODIFIED_STRING + it->newName + modified_delimiter + os.str() + " " + currentType[it->newName] + ", ";
+						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + type;
+						
+						os.str("");
+
+						// Need to cast if type is text and type of what we are storing is not text				
+						if(type == VARCHAR_STRING && it->typeMD.type != VARCHAR_STRING)
+						{
+							string castString = getCastString(it->typeMD);
+							
+							string viewCol = "CAST(" + it->newName + " AS " + castString + ") AS " + it->newName;
+							colNameToViewColString.insert(make_pair<string, string>(it->newName, viewCol));	
+						}
+					}
+				}
+
+				set<int>::reverse_iterator sit;
+				map<string, set<int> >::iterator cit;
+				for(cit = colNameToModifiedIndexes.begin(); cit != colNameToModifiedIndexes.end(); ++cit)
+				{
+					string viewCol = "COALESCE(" + cit->first;
+					for(sit = cit->second.rbegin(); sit != cit->second.rend(); ++sit)
+					{
+						ostringstream os; 
+						os << *sit;
+
+						viewCol += "," + modified_delimiter + MODIFIED_STRING + cit->first + modified_delimiter + os.str();
+						os.str("");
+					}
+
+					viewCol += ")";
+					colNameToViewColString.insert(make_pair<string, string>(cit->first, viewCol)); 
+				}
+
+				for(it = matches.begin(); it != matches.end(); ++it)
+				{
+					string colName = it->existingName;
+
+					if(it->addedFromExisting)
+						colName = it->newName;
+
+					if(colNameToViewColString.find(colName) != colNameToViewColString.end())
+						viewCols += colNameToViewColString[colName];
+					else
+						viewCols += colName;
+
+					if(it + 1 != matches.end())
+						viewCols += ",";
+				}
+
+				if(alterAddColString.length() > 0)
+				{
+					// Alter the table adding columns and renaming old columns
+					string executeString = "ALTER TABLE " + db + "." + dummy_table_name + " " + alterAddColString + alterDummyColString;
+					executeQuery(c, executeString);
+	 
+					// Now drop old view and make a new view that casts the datatypes when appropriate  
+					executeQuery(c, "DROP VIEW " + db + "." + table_name);
+					executeQuery(c, "CREATE VIEW " + db + "." + table_name + " AS SELECT " + viewCols + " FROM " + db + "." + dummy_table_name);
+				}
+			}
 		}
 	}
 }
