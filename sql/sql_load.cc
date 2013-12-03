@@ -352,39 +352,6 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
 
   uint tot_length=0;
   bool use_blobs= 0, use_vars= 0;
-  List_iterator_fast<Item> it(fields_vars);
-  Item *item;
-
-  while ((item= it++))
-  {
-    Item *real_item= item->real_item();
-
-    if (real_item->type() == Item::FIELD_ITEM)
-    {
-      Field *field= ((Item_field*)real_item)->field;
-      if (field->flags & BLOB_FLAG)
-      {
-        use_blobs= 1;
-        tot_length+= 256;			// Will be extended if needed
-      }
-      else
-        tot_length+= field->field_length;
-    }
-    else if (item->type() == Item::STRING_ITEM)
-      use_vars= 1;
-  }
-  if (use_blobs && !ex->line_term->length() && !field_term->length())
-  {
-    my_message(ER_BLOBS_AND_NO_TERMINATED,ER(ER_BLOBS_AND_NO_TERMINATED),
-	       MYF(0));
-    DBUG_RETURN(TRUE);
-  }
-  if (use_vars && !field_term->length() && !enclosed->length())
-  {
-    my_error(ER_LOAD_FROM_FIXED_SIZE_ROWS_TO_VAR, MYF(0));
-    DBUG_RETURN(TRUE);
-  }
-
   READ_INFO read_info(file,tot_length,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
@@ -479,6 +446,39 @@ continue_inserting:
       DBUG_RETURN(TRUE);
   }
 
+  List_iterator_fast<Item> it(fields_vars);
+  Item *item;
+
+  while ((item= it++))
+  {
+    Item *real_item= item->real_item();
+
+    if (real_item->type() == Item::FIELD_ITEM)
+    {
+      Field *field= ((Item_field*)real_item)->field;
+      if (field->flags & BLOB_FLAG)
+      {
+        use_blobs= 1;
+        tot_length+= 256;			// Will be extended if needed
+      }
+      else
+        tot_length+= field->field_length;
+    }
+    else if (item->type() == Item::STRING_ITEM)
+      use_vars= 1;
+  }
+  if (use_blobs && !ex->line_term->length() && !field_term->length())
+  {
+    my_message(ER_BLOBS_AND_NO_TERMINATED,ER(ER_BLOBS_AND_NO_TERMINATED),
+	       MYF(0));
+    DBUG_RETURN(TRUE);
+  }
+  if (use_vars && !field_term->length() && !enclosed->length())
+  {
+    my_error(ER_LOAD_FROM_FIXED_SIZE_ROWS_TO_VAR, MYF(0));
+    DBUG_RETURN(TRUE);
+  }
+
   /* We can't give an error in the middle when using LOCAL files */
   if (read_file_from_client && handle_duplicates == DUP_ERROR)
     ignore= 1;
@@ -525,7 +525,6 @@ continue_inserting:
 
   if (!(error=test(read_info.error)))
   {
-
     table->next_number_field=table->found_next_number_field;
     if (ignore ||
 	handle_duplicates == DUP_REPLACE)
@@ -557,7 +556,7 @@ continue_inserting:
 	  		    *enclosed, skip_lines, ignore, checkSchema, lastRow);
 
       // If there was warning on the last row, check to see if we can update the schema
-      if(checkSchema) { 
+      if(checkSchema && merge_method != SCHEMA_UPDATE_NONE) { 
         // Stop import and commit everything so far
         table->file->ha_end_bulk_insert();
 
@@ -606,7 +605,6 @@ continue_inserting:
 
         open_temporary_tables(thd, table_list);
 
-        checkSchema = false;
         goto continue_inserting;
       } else {
         break;
@@ -1060,8 +1058,6 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
   for (;;it.rewind())
   {
     rownum++;
-    if(rownum==1001)
-      cout << "Error\n";
 
     if (thd->killed)
     {
@@ -1586,6 +1582,8 @@ int READ_INFO::reset_line() {
   read_pos = last_start_pos;
   cache.request_pos = buffers->at(last_start_pos);
   found_end_of_line = false;
+
+  return 0;
 }
 
 #define my_b_get3(info, cache, read_pos) \
@@ -1593,7 +1591,7 @@ int READ_INFO::reset_line() {
           ((info)->read_pos++, (int) (uchar) (info)->read_pos[-1]) :\
           do_read(info, cache, read_pos, freeBuffers))
 
-int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, uint& read_pos, vector<uchar*>& freeBuffers) {
+inline int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, uint& read_pos, vector<uchar*>& freeBuffers) {
   read_pos++;
   if(buffers->find(read_pos)!=buffers->end()) {
     uchar* bu = (*buffers)[read_pos];
@@ -1601,10 +1599,15 @@ int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, uint& read_pos, vector<uc
     cache->read_pos = cache->request_pos+1;
     int read_end = *(int*)(bu + cache->buffer_length);
     cache->read_end = bu + read_end;
+    cache->buffer = bu;
 
     return (int)*cache->request_pos;
+  } else if(cache->request_pos==NULL) {
+    // If the request_pos is null then there is not data, so we return eof
+    // This ensures we terminate and the client returns correct error
+    return my_b_EOF;
   }
- 
+
   uchar* buf;
   if(freeBuffers.empty()) {
     buf = new uchar[cache->buffer_length+sizeof(int)];
@@ -1615,6 +1618,7 @@ int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, uint& read_pos, vector<uc
   *((int*)(buf+cache->buffer_length)) = (int)(cache->read_end-cache->request_pos);
   (*buffers)[read_pos] = buf;
   cache->request_pos = buf;
+  cache->buffer = buf;
 
   int r = _my_b_get(cache);
   return r;

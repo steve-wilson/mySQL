@@ -94,6 +94,11 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
     READER reader(file, tot_length,
                         cs, field_term, line_start, line_term, enclosed,
                         escape, get_it_from_net, is_fifo, buffers);
+
+    // If we cannot read the file, return an error
+    if(reader.error)
+      return 1;
+
     LoadCSV csv(table_list->db, table_list->table_name, &reader);
 
     if(newSchema.length()==0) {

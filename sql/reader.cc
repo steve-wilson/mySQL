@@ -12,11 +12,14 @@ using std::vector;
           ((info)->read_pos++, (int) (uchar) (info)->read_pos[-1]) :\
           do_read(info, cache, read_pos))
 
-int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, int& read_pos) {
+inline int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, int& read_pos) {
   read_pos++;
   int r = _my_b_get(cache);
 
   uchar* b = new uchar[cache->buffer_length+sizeof(int)];
+  if(cache->request_pos==NULL)
+      return my_b_EOF;
+
   strncpy((char*)b, (char*)cache->request_pos, cache->buffer_length);
   *((int*)(b+cache->buffer_length)) = (int)(cache->read_end-cache->request_pos);
   (*buffers)[read_pos] = b;
