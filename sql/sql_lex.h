@@ -2394,6 +2394,10 @@ struct LEX: public Query_tables_list
     Use schema merging when loading data from CSV file
   */
   schema_update_method schema_merge;
+  /*
+    If true, will provide extra padding in data size when inferring data types
+  */
+  bool relaxed_schema_inference;
 
   bool drop_if_exists, drop_temporary, local_file, one_shot_set;
   bool autocommit;

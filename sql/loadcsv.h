@@ -27,7 +27,7 @@ class LoadCSV {
   }
 
   vector<typeAndMD> calculateColumnTypes();
-  string calculateSchema();
+  string calculateSchema(bool relaxed);
   vector<column> match(string schema1, string schema2);
 };
 

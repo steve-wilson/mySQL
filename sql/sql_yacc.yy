@@ -1475,6 +1475,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  REDUNDANT_SYM
 %token  REFERENCES                    /* SQL-2003-R */
 %token  REGEXP
+%token  RELAXED_SYM
 %token  RELAY
 %token  RELAYLOG_SYM
 %token  RELAY_LOG_FILE_SYM
@@ -1573,6 +1574,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  STOP_SYM
 %token  STORAGE_SYM
 %token  STRAIGHT_JOIN
+%token  STRICT_SYM
 %token  STRING_SYM
 %token  SUBCLASS_ORIGIN_SYM           /* SQL-2003-N */
 %token  SUBDATE_SYM
@@ -1723,7 +1725,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
         opt_natural_language_mode opt_query_expansion
         opt_ev_status opt_ev_on_completion ev_on_completion opt_ev_comment
         ev_alter_on_schedule_completion opt_ev_rename_to opt_ev_sql_stmt
-        trg_action_time trg_event opt_schema_merge_method
+        trg_action_time trg_event opt_schema_merge_method opt_inference_type
 
 /*
   Bit field of MYSQL_START_TRANS_OPT_* flags.
@@ -13111,7 +13113,13 @@ load:
 
 opt_schema_merge:
             /* empty */ { Lex->schema_merge = SCHEMA_UPDATE_NONE; }
-        | SCHEMA_MERGE_SYM opt_schema_merge_method
+        | SCHEMA_MERGE_SYM opt_inference_type opt_schema_merge_method
+        ;
+
+opt_inference_type:
+        /* empty */ { Lex->relaxed_schema_inference = 0;}
+        | RELAXED_SYM { Lex->relaxed_schema_inference = 1;}
+        | STRICT_SYM { Lex->relaxed_schema_inference = 0;}
         ;
 
 opt_schema_merge_method:
@@ -14385,6 +14393,7 @@ keyword_sp:
         | REDO_BUFFER_SIZE_SYM     {}
         | REDOFILE_SYM             {}
         | REDUNDANT_SYM            {}
+        | RELAXED_SYM              {}
         | RELAY                    {}
         | RELAYLOG_SYM             {}
         | RELAY_LOG_FILE_SYM       {}
@@ -14433,6 +14442,7 @@ keyword_sp:
         | STATS_SAMPLE_PAGES_SYM   {}
         | STATUS_SYM               {}
         | STORAGE_SYM              {}
+        | STRICT_SYM               {}
         | STRING_SYM               {}
         | SUBCLASS_ORIGIN_SYM      {}
         | SUBDATE_SYM              {}

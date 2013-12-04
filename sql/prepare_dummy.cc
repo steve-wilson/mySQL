@@ -326,9 +326,9 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 		int numInts = 0;
 		int numDecimals = 0;
 		int numTexts = 0;
-		int numNewInts = 0;
-		int numNewDecimals = 0;
-		int numNewTexts = 0;
+		unsigned int numNewInts = 0;
+		unsigned int numNewDecimals = 0;
+		unsigned int numNewTexts = 0;
 		string finalViewCols = "";
 	
 		// Find added and modifed cols and store in vectors. Also compute counts of existing cols for computing dummyCols to add next
