@@ -29,7 +29,7 @@ int mysql_load(THD *thd, sql_exchange *ex, TABLE_LIST *table_list,
 	        List<Item> &fields_vars, List<Item> &set_fields,
                 List<Item> &set_values_list,
                 enum enum_duplicates handle_duplicates, bool ignore,
-                bool local_file, schema_update_method method, bool relaxed_schema_inference);
+                bool local_file, schema_update_method method, bool relaxed_schema_inference, unsigned int infer_sample_size);
 
 
 #endif /* SQL_LOAD_INCLUDED */

@@ -179,7 +179,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
                 List<Item> &set_values,
                 enum enum_duplicates handle_duplicates, bool ignore,
                 bool read_file_from_client, schema_update_method  merge_method,
-                bool relaxed_schema_inference)
+                bool relaxed_schema_inference, unsigned int infer_sample_size)
 {
   vector<string> header;
   // reaches this line, (verified via gdb) but cerr doesn't go to terminal
@@ -297,7 +297,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
 		      escape_char, read_file_from_client, is_fifo, thd, ex, &table_list, 
-              fields_vars, header, merge_method, relaxed_schema_inference))
+              fields_vars, header, merge_method, relaxed_schema_inference, infer_sample_size))
           DBUG_RETURN(TRUE);
     skip_lines++;
   }

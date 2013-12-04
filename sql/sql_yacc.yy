@@ -1275,6 +1275,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  IMPORT
 %token  INDEXES
 %token  INDEX_SYM
+%token  INFERENCE_SAMPLE_SIZE_SYM
 %token  INFILE
 %token  INITIAL_SIZE_SYM
 %token  INNER_SYM                     /* SQL-2003-R */
@@ -1726,6 +1727,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
         opt_ev_status opt_ev_on_completion ev_on_completion opt_ev_comment
         ev_alter_on_schedule_completion opt_ev_rename_to opt_ev_sql_stmt
         trg_action_time trg_event opt_schema_merge_method opt_inference_type
+        opt_inference_sample_size
 
 /*
   Bit field of MYSQL_START_TRANS_OPT_* flags.
@@ -13113,7 +13115,7 @@ load:
 
 opt_schema_merge:
             /* empty */ { Lex->schema_merge = SCHEMA_UPDATE_NONE; }
-        | SCHEMA_MERGE_SYM opt_inference_type opt_schema_merge_method
+        | SCHEMA_MERGE_SYM opt_inference_type opt_schema_merge_method opt_inference_sample_size
         ;
 
 opt_inference_type:
@@ -13129,6 +13131,11 @@ opt_schema_merge_method:
 			| DUMMY_SYM { Lex->schema_merge = SCHEMA_UPDATE_DUMMY;}
 			| AUTO_SYM { Lex->schema_merge = SCHEMA_UPDATE_AUTO;}
             ;
+
+opt_inference_sample_size:
+        /* empty */ { Lex->inference_sample_size = 0;}
+        | INFERENCE_SAMPLE_SIZE_SYM size_number { Lex->inference_sample_size = $2;}
+        ;
 
 data_or_xml:
         DATA_SYM  { $$= FILETYPE_CSV; }
@@ -14285,6 +14292,7 @@ keyword_sp:
         | HOUR_SYM                 {}
         | IDENTIFIED_SYM           {}
         | IGNORE_SERVER_IDS_SYM    {}
+        | INFERENCE_SAMPLE_SIZE_SYM{}
         | INVOKER_SYM              {}
         | IMPORT                   {}
         | INDEXES                  {}

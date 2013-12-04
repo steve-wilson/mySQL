@@ -2398,6 +2398,10 @@ struct LEX: public Query_tables_list
     If true, will provide extra padding in data size when inferring data types
   */
   bool relaxed_schema_inference;
+  /*
+    Maximum number of lines to read when determining schema
+  */
+  unsigned int inference_sample_size;
 
   bool drop_if_exists, drop_temporary, local_file, one_shot_set;
   bool autocommit;
