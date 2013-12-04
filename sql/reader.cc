@@ -60,7 +60,7 @@ READER::READER(File file_par, uint tot_length, const CHARSET_INFO *cs,
                      const String &line_start,
                      const String &line_term,
                      const String &enclosed_par,
-                     int escape, bool get_it_from_net, bool is_fifo, map<int,uchar*>* buffs)
+                     int escape, bool get_it_from_net, bool is_fifo, map<int,uchar*>* buffs, bool initiocache)
   :file(file_par), buff_length(tot_length), escape_char(escape),
    found_end_of_line(false), eof(false), need_end_io_cache(false),
    error(false), line_cuted(false), found_null(false), read_charset(cs), buffers(buffs), read_pos(0)
@@ -104,6 +104,7 @@ READER::READER(File file_par, uint tot_length, const CHARSET_INFO *cs,
   else
   {
     end_of_buff=buffer+buff_length;
+    if(initiocache) {
     if (init_io_cache(&cache,(get_it_from_net) ? -1 : file, 0,
 		      (get_it_from_net) ? READ_NET :
 		      (is_fifo ? READ_FIFO : READ_CACHE),0L,1,
@@ -132,6 +133,7 @@ READER::READER(File file_par, uint tot_length, const CHARSET_INFO *cs,
 #endif
     }
   }
+  }
 }
 
 READER::~READER()
@@ -140,8 +142,8 @@ READER::~READER()
 
 //  cache.request_pos = first_request_pos;
 
-  if (need_end_io_cache)
-    end_io_cache();
+//  if (need_end_io_cache)
+//    end_io_cache();
 
   if (buffer != NULL)
     my_free(buffer);

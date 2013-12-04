@@ -144,7 +144,7 @@ static int read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                           List<Item> &fields_vars, List<Item> &set_fields,
                           List<Item> &set_values, READ_INFO &read_info,
 			  const String &enclosed, ulong skip_lines,
-			  bool ignore_check_option_errors, bool& checkSchema, vector<string>& lastRow);
+			  bool ignore_check_option_errors, bool& checkSchema, vector<string>& lastRow, bool halt_on_warning, int ignore_warning_before);
 
 static int read_xml_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                           List<Item> &fields_vars, List<Item> &set_fields,
@@ -219,6 +219,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
   bool checkSchema = false;
   vector<string> lastRow;
 
+  bool is_partial_read = true;
   string newSchema = "";
 
   string db_s = string(db);
@@ -553,7 +554,8 @@ continue_inserting:
       else
         error= read_sep_field(thd, info, table_list, fields_vars,
                              set_fields, set_values, read_info,
-	  		    *enclosed, skip_lines, ignore, checkSchema, lastRow);
+	  		    *enclosed, skip_lines, ignore, checkSchema, 
+                lastRow, is_partial_read, 1);
 
       // If there was warning on the last row, check to see if we can update the schema
       if(checkSchema && merge_method != SCHEMA_UPDATE_NONE) { 
@@ -598,7 +600,7 @@ continue_inserting:
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		        *field_term,*ex->line_start, *ex->line_term, *enclosed,
 		        escape_char, read_file_from_client, is_fifo, thd, ex, &table_list, 
-                fields_vars, header, &buffers, merge_method, newSchema))
+                fields_vars, header, &buffers, merge_method, newSchema, false))
           DBUG_RETURN(TRUE);
 
         table_list->reinit_before_use(thd);
@@ -621,6 +623,7 @@ continue_inserting:
     table->file->extra(HA_EXTRA_WRITE_CANNOT_REPLACE);
     table->next_number_field=0;
   }
+ 
   if (file >= 0)
     mysql_file_close(file, MYF(0));
   free_blobs(table);				/* if pack_blob was used */
@@ -1043,7 +1046,7 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                List<Item> &set_values, READ_INFO &read_info,
 	       const String &enclosed, ulong skip_lines,
 	       bool ignore_check_option_errors, bool& checkSchema,
-           vector<string>& lastRow)
+           vector<string>& lastRow, bool halt_on_warning, int ignore_warning_before)
 {
   List_iterator_fast<Item> it(fields_vars);
   Item *item;
@@ -1235,8 +1238,10 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
       DBUG_RETURN(-1);
     }
 
+    // If we are supposed to halt on warnings AND this is not a row we should ignore
+    // AND there has been a warning, halt and check the schema
     wc = thd->get_stmt_da()->current_statement_warn_count();
-    if(wc>warning_count) {
+    if(halt_on_warning && rownum>ignore_warning_before && wc>warning_count) {
       warning_count = wc;
       cout << "warning for line " << rownum << "\n";
       checkSchema = true;
@@ -1520,13 +1525,14 @@ READ_INFO::READ_INFO(File file_par, uint tot_length, const CHARSET_INFO *cs,
   else
   {
     end_of_buff=buffer+buff_length;
+
     if (init_io_cache(&cache,(get_it_from_net) ? -1 : file, 0,
 		      (get_it_from_net) ? READ_NET :
 		      (is_fifo ? READ_FIFO : READ_CACHE),0L,1,
 		      MYF(MY_WME)))
     {
       my_free(buffer); /* purecov: inspected */
-      buffer= NULL;
+     buffer= NULL;
       error=1;
     }
     else
@@ -1556,7 +1562,9 @@ READ_INFO::~READ_INFO()
   map<int,uchar*>::iterator it;
   for(it=buffers->begin(); it!=buffers->end(); it++) {
     uchar* add = it->second;
-    delete[] add;
+    // Don't want to free this buffer twice!!
+    if(add!=cache.buffer)
+      delete[] add;
   }
 
   while(!freeBuffers.empty()) {
@@ -1581,6 +1589,8 @@ int READ_INFO::reset_line() {
   cache.read_end = line_end;
   read_pos = last_start_pos;
   cache.request_pos = buffers->at(last_start_pos);
+  cache.buffer = buffers->at(last_start_pos);
+  //cache.pos_in_file = last_pos_in_file;
   found_end_of_line = false;
 
   return 0;
@@ -1592,12 +1602,20 @@ int READ_INFO::reset_line() {
           do_read(info, cache, read_pos, freeBuffers))
 
 inline int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, uint& read_pos, vector<uchar*>& freeBuffers) {
+  if(read_pos==26)
+      cout << "here\n";
+
   read_pos++;
   if(buffers->find(read_pos)!=buffers->end()) {
     uchar* bu = (*buffers)[read_pos];
     cache->request_pos = bu;
     cache->read_pos = cache->request_pos+1;
-    int read_end = *(int*)(bu + cache->buffer_length);
+
+    // We need these two pieces of info so we just tag them to the end of the buffer
+    int read_end = *(int*)(bu + cache->buffer_length);  
+    //int pos_in_file = *((int*)(bu + cache->buffer_length+sizeof(int)));
+
+   // cache->pos_in_file = pos_in_file;
     cache->read_end = bu + read_end;
     cache->buffer = bu;
 
@@ -1608,6 +1626,7 @@ inline int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, uint& read_pos, ve
     return my_b_EOF;
   }
 
+  // If the free buffer last has a free buffer, use it, otherwise allocate a new one
   uchar* buf;
   if(freeBuffers.empty()) {
     buf = new uchar[cache->buffer_length+sizeof(int)];
@@ -1615,12 +1634,24 @@ inline int do_read(IO_CACHE* cache, map<int,uchar*>* buffers, uint& read_pos, ve
     buf = freeBuffers.back();
     freeBuffers.pop_back();
   }
-  *((int*)(buf+cache->buffer_length)) = (int)(cache->read_end-cache->request_pos);
+
+  // But the new buffer in the IO_CACHE so the read will fill it appropriately
   (*buffers)[read_pos] = buf;
+  int readend = cache->read_end-cache->request_pos;
   cache->request_pos = buf;
   cache->buffer = buf;
+  cache->read_end = buf + readend;
+  cache->read_pos = cache->read_end;
+
+  //cache->pos_in_file = *((int*)(buf+cache->buffer_length+sizeof(int)));
+  //readend = cache->read_end-cache->request_pos;
+  //*((int*)(buf+cache->buffer_length)) = readend;
 
   int r = _my_b_get(cache);
+
+  //*((int*)(buf+cache->buffer_length+sizeof(int))) = cache->pos_in_file;
+  readend = cache->read_end-cache->request_pos;
+  *((int*)(buf+cache->buffer_length)) = readend;
   return r;
 }
 
@@ -1957,7 +1988,7 @@ end:
 
   if(last_start_pos<read_pos) {
     last_start_pos = read_pos;
-
+        
     int d = read_pos - 1;
     while(true) {
       if(buffers->find(d)==buffers->end())

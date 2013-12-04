@@ -66,7 +66,7 @@ public:
             const String &line_start,
             const String &line_term,
             const String &enclosed,
-            int escape,bool get_it_from_net, bool is_fifo, map<int,uchar*>* buffers);
+            int escape,bool get_it_from_net, bool is_fifo, map<int,uchar*>* buffers, bool init_io_cache);
   ~READER();
   int read_field();
   int read_fixed_length(void);
