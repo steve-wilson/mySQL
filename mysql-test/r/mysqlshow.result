@@ -89,6 +89,7 @@ Database: information_schema
 | FILES                                 |
 | GLOBAL_STATUS                         |
 | GLOBAL_VARIABLES                      |
+| INDEX_STATISTICS                      |
 | KEY_COLUMN_USAGE                      |
 | OPTIMIZER_TRACE                       |
 | PARAMETERS                            |
@@ -107,13 +108,16 @@ Database: information_schema
 | TABLESPACES                           |
 | TABLE_CONSTRAINTS                     |
 | TABLE_PRIVILEGES                      |
+| TABLE_STATISTICS                      |
+| DB_STATISTICS                         |
 | TRIGGERS                              |
 | USER_PRIVILEGES                       |
+| USER_STATISTICS                       |
 | VIEWS                                 |
 | INNODB_LOCKS                          |
 | INNODB_TRX                            |
 | INNODB_SYS_DATAFILES                  |
-| INNODB_LOCK_WAITS                     |
+| INNODB_SYS_INDEXES                    |
 | INNODB_SYS_TABLESTATS                 |
 | INNODB_CMP                            |
 | INNODB_METRICS                        |
@@ -122,9 +126,9 @@ Database: information_schema
 | INNODB_CMPMEM_RESET                   |
 | INNODB_FT_DELETED                     |
 | INNODB_BUFFER_PAGE_LRU                |
-| INNODB_SYS_FOREIGN                    |
+| INNODB_LOCK_WAITS                     |
 | INNODB_SYS_COLUMNS                    |
-| INNODB_SYS_INDEXES                    |
+| INNODB_FILE_STATUS                    |
 | INNODB_FT_DEFAULT_STOPWORD            |
 | INNODB_SYS_FIELDS                     |
 | INNODB_CMP_PER_INDEX_RESET            |
@@ -138,6 +142,7 @@ Database: information_schema
 | INNODB_SYS_TABLES                     |
 | INNODB_BUFFER_POOL_STATS              |
 | INNODB_FT_CONFIG                      |
+| INNODB_SYS_FOREIGN                    |
 +---------------------------------------+
 Database: INFORMATION_SCHEMA
 +---------------------------------------+
@@ -153,6 +158,7 @@ Database: INFORMATION_SCHEMA
 | FILES                                 |
 | GLOBAL_STATUS                         |
 | GLOBAL_VARIABLES                      |
+| INDEX_STATISTICS                      |
 | KEY_COLUMN_USAGE                      |
 | OPTIMIZER_TRACE                       |
 | PARAMETERS                            |
@@ -171,13 +177,16 @@ Database: INFORMATION_SCHEMA
 | TABLESPACES                           |
 | TABLE_CONSTRAINTS                     |
 | TABLE_PRIVILEGES                      |
+| TABLE_STATISTICS                      |
+| DB_STATISTICS                         |
 | TRIGGERS                              |
 | USER_PRIVILEGES                       |
+| USER_STATISTICS                       |
 | VIEWS                                 |
 | INNODB_LOCKS                          |
 | INNODB_TRX                            |
 | INNODB_SYS_DATAFILES                  |
-| INNODB_LOCK_WAITS                     |
+| INNODB_SYS_INDEXES                    |
 | INNODB_SYS_TABLESTATS                 |
 | INNODB_CMP                            |
 | INNODB_METRICS                        |
@@ -186,9 +195,9 @@ Database: INFORMATION_SCHEMA
 | INNODB_CMPMEM_RESET                   |
 | INNODB_FT_DELETED                     |
 | INNODB_BUFFER_PAGE_LRU                |
-| INNODB_SYS_FOREIGN                    |
+| INNODB_LOCK_WAITS                     |
 | INNODB_SYS_COLUMNS                    |
-| INNODB_SYS_INDEXES                    |
+| INNODB_FILE_STATUS                    |
 | INNODB_FT_DEFAULT_STOPWORD            |
 | INNODB_SYS_FIELDS                     |
 | INNODB_CMP_PER_INDEX_RESET            |
@@ -202,6 +211,7 @@ Database: INFORMATION_SCHEMA
 | INNODB_SYS_TABLES                     |
 | INNODB_BUFFER_POOL_STATS              |
 | INNODB_FT_CONFIG                      |
+| INNODB_SYS_FOREIGN                    |
 +---------------------------------------+
 Wildcard: inf_rmation_schema
 +--------------------+
@@ -220,7 +230,6 @@ Database: test
 DROP DATABASE IF EXISTS b12688860_db;
 CREATE DATABASE b12688860_db;
 CREATE TABLE b12688860_db.b12688860_tab (c1 INT);
-Warning: Using a password on the command line interface can be insecure.
 Database: b12688860_db
 +---------------+
 |    Tables     |

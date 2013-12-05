@@ -117,6 +117,7 @@ enum enum_mysql_show_type
   SHOW_LONGLONG,
   SHOW_CHAR, SHOW_CHAR_PTR,
   SHOW_ARRAY, SHOW_FUNC, SHOW_DOUBLE,
+  SHOW_TIMER,
   SHOW_always_last
 };
 struct st_mysql_show_var {
@@ -221,6 +222,7 @@ struct st_mysql_value
   int (*val_int)(struct st_mysql_value *, long long *intbuf);
   int (*is_unsigned)(struct st_mysql_value *);
 };
+void thd_reset_diagnostics(void* thd);
 int thd_in_lock_tables(const void* thd);
 int thd_tablespace_op(const void* thd);
 long long thd_test_options(const void* thd, long long test_options);
@@ -238,7 +240,8 @@ int mysql_tmpfile(const char *prefix);
 int thd_killed(const void* thd);
 void thd_binlog_pos(const void* thd,
                     const char **file_var,
-                    unsigned long long *pos_var);
+                    unsigned long long *pos_var,
+                    const char **gtid_var);
 unsigned long thd_get_thread_id(const void* thd);
 void thd_get_xid(const void* thd, MYSQL_XID *xid);
 void mysql_query_cache_invalidate4(void* thd,
@@ -247,6 +250,12 @@ void mysql_query_cache_invalidate4(void* thd,
 void *thd_get_ha_data(const void* thd, const struct handlerton *hton);
 void thd_set_ha_data(void* thd, const struct handlerton *hton,
                      const void *ha_data);
+char mysql_bin_log_is_open(void);
+void mysql_bin_log_lock_commits(void);
+void mysql_bin_log_unlock_commits(char* binlog_file,
+                                  unsigned long long* binlog_pos,
+                                  char** gtid_executed,
+                                  int* gtid_executed_length);
 struct mysql_event_general
 {
   unsigned int event_subclass;
@@ -261,10 +270,6 @@ struct mysql_event_general
   struct charset_info_st *general_charset;
   unsigned long long general_time;
   unsigned long long general_rows;
-  MYSQL_LEX_STRING general_host;
-  MYSQL_LEX_STRING general_sql_command;
-  MYSQL_LEX_STRING general_external_user;
-  MYSQL_LEX_STRING general_ip;
 };
 struct mysql_event_connection
 {

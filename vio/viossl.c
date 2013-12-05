@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -106,24 +106,18 @@ static void ssl_set_sys_error(int ssl_error)
 
 
 /**
-  This function does two things:
-    - it indicates whether a SSL I/O operation must be retried later;
-    - it clears the OpenSSL error queue, thus the next OpenSSL-operation can be
-      performed even after failed OpenSSL-call.
+  Indicate whether a SSL I/O operation must be retried later.
 
   @param vio  VIO object representing a SSL connection.
   @param ret  Value returned by a SSL I/O function.
-  @param event[out]             The type of I/O event to wait/retry.
-  @param ssl_errno_holder[out]  The SSL error code.
+  @param event[out] The type of I/O event to wait/retry.
 
   @return Whether a SSL I/O operation should be deferred.
   @retval TRUE    Temporary failure, retry operation.
   @retval FALSE   Indeterminate failure.
 */
 
-static my_bool ssl_should_retry(Vio *vio, int ret,
-                                enum enum_vio_io_event *event,
-                                unsigned long *ssl_errno_holder)
+static my_bool ssl_should_retry(Vio *vio, int ret, enum enum_vio_io_event *event)
 {
   int ssl_error;
   SSL *ssl= vio->ssl_arg;
@@ -142,21 +136,13 @@ static my_bool ssl_should_retry(Vio *vio, int ret,
     *event= VIO_IO_EVENT_WRITE;
     break;
   default:
-#ifndef DBUG_OFF  /* Debug build */
-    /* Note: the OpenSSL error queue gets cleared in report_errors(). */
+#ifndef DBUG_OFF
     report_errors(ssl);
-#else             /* Release build */
-# ifndef HAVE_YASSL
-    /* OpenSSL: clear the error queue. */
-    ERR_clear_error();
-# endif
 #endif
     should_retry= FALSE;
     ssl_set_sys_error(ssl_error);
     break;
   }
-
-  *ssl_errno_holder= ssl_error;
 
   return should_retry;
 }
@@ -166,30 +152,14 @@ size_t vio_ssl_read(Vio *vio, uchar *buf, size_t size)
 {
   int ret;
   SSL *ssl= vio->ssl_arg;
-  unsigned long ssl_errno_not_used;
-
   DBUG_ENTER("vio_ssl_read");
 
-  while (1)
+  while ((ret= SSL_read(ssl, buf, size)) < 0)
   {
     enum enum_vio_io_event event;
 
-#ifndef HAVE_YASSL
-    /*
-      OpenSSL: check that the SSL thread's error queue is cleared. Otherwise
-      SSL_read() returns an error from the error queue, when SSL_read() failed
-      because it would block.
-    */
-    DBUG_ASSERT(ERR_peek_error() == 0);
-#endif
-
-    ret= SSL_read(ssl, buf, size);
-
-    if (ret >= 0)
-      break;
-
     /* Process the SSL I/O error. */
-    if (!ssl_should_retry(vio, ret, &event, &ssl_errno_not_used))
+    if (!ssl_should_retry(vio, ret, &event))
       break;
 
     /* Attempt to wait for an I/O event. */
@@ -205,30 +175,14 @@ size_t vio_ssl_write(Vio *vio, const uchar *buf, size_t size)
 {
   int ret;
   SSL *ssl= vio->ssl_arg;
-  unsigned long ssl_errno_not_used;
-
   DBUG_ENTER("vio_ssl_write");
 
-  while (1)
+  while ((ret= SSL_write(ssl, buf, size)) < 0)
   {
     enum enum_vio_io_event event;
 
-#ifndef HAVE_YASSL
-    /*
-      OpenSSL: check that the SSL thread's error queue is cleared. Otherwise
-      SSL_write() returns an error from the error queue, when SSL_write() failed
-      because it would block.
-    */
-    DBUG_ASSERT(ERR_peek_error() == 0);
-#endif
-
-    ret= SSL_write(ssl, buf, size);
-
-    if (ret >= 0)
-      break;
-
     /* Process the SSL I/O error. */
-    if (!ssl_should_retry(vio, ret, &event, &ssl_errno_not_used))
+    if (!ssl_should_retry(vio, ret, &event))
       break;
 
     /* Attempt to wait for an I/O event. */
@@ -323,40 +277,23 @@ typedef int (*ssl_handshake_func_t)(SSL*);
   @param vio    VIO object representing a SSL connection.
   @param ssl    SSL structure for the connection.
   @param func   SSL handshake handler.
-  @param ssl_errno_holder[out]  The SSL error code.
 
   @return Return value is 1 on success.
 */
 
-static int ssl_handshake_loop(Vio *vio, SSL *ssl,
-                              ssl_handshake_func_t func,
-                              unsigned long *ssl_errno_holder)
+static int ssl_handshake_loop(Vio *vio, SSL *ssl, ssl_handshake_func_t func)
 {
   int ret;
 
   vio->ssl_arg= ssl;
 
   /* Initiate the SSL handshake. */
-  while (1)
+  while ((ret= func(ssl)) < 1)
   {
     enum enum_vio_io_event event;
 
-#ifndef HAVE_YASSL
-    /*
-      OpenSSL: check that the SSL thread's error queue is cleared. Otherwise
-      SSL-handshake-function returns an error from the error queue, when the
-      function failed because it would block.
-    */
-    DBUG_ASSERT(ERR_peek_error() == 0);
-#endif
-
-    ret= func(ssl);
-
-    if (ret >= 1)
-      break;
-
     /* Process the SSL I/O error. */
-    if (!ssl_should_retry(vio, ret, &event, ssl_errno_holder))
+    if (!ssl_should_retry(vio, ret, &event))
       break;
 
     /* Wait for I/O so that the handshake can proceed. */
@@ -371,8 +308,7 @@ static int ssl_handshake_loop(Vio *vio, SSL *ssl,
 
 
 static int ssl_do(struct st_VioSSLFd *ptr, Vio *vio, long timeout,
-                  ssl_handshake_func_t func,
-                  unsigned long *ssl_errno_holder)
+                  ssl_handshake_func_t func, unsigned long *errptr)
 {
   int r;
   SSL *ssl;
@@ -384,7 +320,7 @@ static int ssl_do(struct st_VioSSLFd *ptr, Vio *vio, long timeout,
   if (!(ssl= SSL_new(ptr->ssl_context)))
   {
     DBUG_PRINT("error", ("SSL_new failure"));
-    *ssl_errno_holder= ERR_get_error();
+    *errptr= ERR_get_error();
     DBUG_RETURN(1);
   }
   DBUG_PRINT("info", ("ssl: 0x%lx timeout: %ld", (long) ssl, timeout));
@@ -409,9 +345,10 @@ static int ssl_do(struct st_VioSSLFd *ptr, Vio *vio, long timeout,
   yaSSL_transport_set_send_function(ssl, yassl_send);
 #endif
 
-  if ((r= ssl_handshake_loop(vio, ssl, func, ssl_errno_holder)) < 1)
+  if ((r= ssl_handshake_loop(vio, ssl, func)) < 1)
   {
     DBUG_PRINT("error", ("SSL_connect/accept failure"));
+    *errptr= SSL_get_error(ssl, r);
     SSL_free(ssl);
     DBUG_RETURN(1);
   }
@@ -458,19 +395,17 @@ static int ssl_do(struct st_VioSSLFd *ptr, Vio *vio, long timeout,
 }
 
 
-int sslaccept(struct st_VioSSLFd *ptr, Vio *vio, long timeout,
-              unsigned long *ssl_errno_holder)
+int sslaccept(struct st_VioSSLFd *ptr, Vio *vio, long timeout, unsigned long *errptr)
 {
   DBUG_ENTER("sslaccept");
-  DBUG_RETURN(ssl_do(ptr, vio, timeout, SSL_accept, ssl_errno_holder));
+  DBUG_RETURN(ssl_do(ptr, vio, timeout, SSL_accept, errptr));
 }
 
 
-int sslconnect(struct st_VioSSLFd *ptr, Vio *vio, long timeout,
-               unsigned long *ssl_errno_holder)
+int sslconnect(struct st_VioSSLFd *ptr, Vio *vio, long timeout, unsigned long *errptr)
 {
   DBUG_ENTER("sslconnect");
-  DBUG_RETURN(ssl_do(ptr, vio, timeout, SSL_connect, ssl_errno_holder));
+  DBUG_RETURN(ssl_do(ptr, vio, timeout, SSL_connect, errptr));
 }
 
 

@@ -24,6 +24,9 @@ extern bool server_id_supplied;
 extern int max_binlog_dump_events;
 extern my_bool opt_sporadic_binlog_dump_fail;
 extern my_bool opt_show_slave_auth_info;
+/* Size for preallocated replication buffer size */
+extern ulong rpl_event_buffer_size;
+extern uint rpl_send_buffer_size;
 
 typedef struct st_slave_info
 {
@@ -42,9 +45,16 @@ int register_slave(THD* thd, uchar* packet, uint packet_length);
 void unregister_slave(THD* thd, bool only_mine, bool need_lock_slave_list);
 bool show_slave_hosts(THD* thd);
 String *get_slave_uuid(THD *thd, String *value);
+bool show_master_offset(THD* thd, const char* file, ulonglong pos,
+                        const char* gtid_executed, int gtid_executed_length,
+                        bool* need_ok);
 bool show_master_status(THD* thd);
 bool show_binlogs(THD* thd);
 void kill_zombie_dump_threads(String *slave_uuid);
+void kill_all_dump_threads();
+uint find_gtid_position_helper(const char* gtid_string,
+                               char *log_name, my_off_t &gtid_pos);
+bool find_gtid_position(THD *thd);
 
 /**
   Process a COM_BINLOG_DUMP_GTID packet.

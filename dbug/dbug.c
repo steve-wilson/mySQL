@@ -79,6 +79,12 @@
  *
  */
 
+/*
+  We can't have SAFE_MUTEX defined here as this will cause recursion
+  in pthread_mutex_lock
+*/
+
+#undef SAFE_MUTEX
 #include <my_global.h>
 #include <m_string.h>
 #include <errno.h>
@@ -1498,6 +1504,9 @@ void _db_dump_(uint _line_, const char *keyword,
     return;
 
   read_lock_stack(cs);
+
+  /* Don't dump more than 32k of data */
+  length = MY_MIN(length, 32 * 1024);
 
   if (_db_keyword_(cs, keyword, 0))
   {

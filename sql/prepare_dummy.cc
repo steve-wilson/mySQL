@@ -289,7 +289,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 				if(typeToUnusedDummyCols.find(typeToAdd) == typeToUnusedDummyCols.end())
 				{
 					vector<dummyCol> dcv;
-					typeToUnusedDummyCols.insert(make_pair<string, vector<dummyCol> >(typeToAdd, dcv));
+					typeToUnusedDummyCols.insert(make_pair(typeToAdd, dcv));
 				}
 
 				typeToUnusedDummyCols[typeToAdd].push_back(dc);
@@ -307,7 +307,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 				if(colNameToModifiedIndexes.find(colName) == colNameToModifiedIndexes.end())
 				{
 					set<int> modifiedIndexes;
-					colNameToModifiedIndexes.insert(make_pair<string, set<int> >(colName, modifiedIndexes));
+					colNameToModifiedIndexes.insert(make_pair(colName, modifiedIndexes));
 				}
 
 				colNameToModifiedIndexes[colName].insert(modifiedIndex);
@@ -475,7 +475,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 							string castString = getCastString(it->typeMD);
 							
 							string viewCol = "CAST(" + it->newName + " AS " + castString + ") AS " + it->newName;
-							colNameToViewColString.insert(make_pair<string, string>(it->newName, viewCol));	
+							colNameToViewColString.insert(make_pair(it->newName, viewCol));	
 						}
 					}
 				}
@@ -515,7 +515,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 							string castString = getCastString(it->typeMD);
 							
 							string viewCol = "CAST(" + it->newName + " AS " + castString + ") AS " + it->newName;
-							colNameToViewColString.insert(make_pair<string, string>(it->newName, viewCol));	
+							colNameToViewColString.insert(make_pair(it->newName, viewCol));	
 						}
 					}
 				}
@@ -535,7 +535,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 					}
 
 					viewCol += ")";
-					colNameToViewColString.insert(make_pair<string, string>(cit->first, viewCol)); 
+					colNameToViewColString.insert(make_pair(cit->first, viewCol)); 
 				}
 
 				for(it = matches.begin(); it != matches.end(); ++it)

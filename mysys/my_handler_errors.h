@@ -90,8 +90,7 @@ static const char *handler_error_messages[]=
   "Tablespace already exists",
   "Too many columns",
   "Row in wrong partition",
-  "InnoDB is in read only mode",
-  "FTS query exceeds result cache memory limit"
+  "tmp_table_max_file_size exceeded"
 };
 
 extern void my_handler_error_register(void);

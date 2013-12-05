@@ -61,17 +61,9 @@ class ha_myisam: public handler
 
   ulong index_flags(uint inx, uint part, bool all_parts) const
   {
-    if (table_share->key_info[inx].algorithm == HA_KEY_ALG_FULLTEXT)
-      return 0;
-
-    ulong flags= HA_READ_NEXT | HA_READ_PREV | HA_READ_RANGE |
-                 HA_READ_ORDER | HA_KEYREAD_ONLY | HA_DO_INDEX_COND_PUSHDOWN;
-
-    // @todo: Check if spatial indexes really have all these properties
-    if (table_share->key_info[inx].flags & HA_SPATIAL)
-      flags|= HA_KEY_SCAN_NOT_ROR;
-
-    return flags;
+    return ((table_share->key_info[inx].algorithm == HA_KEY_ALG_FULLTEXT) ?
+            0 : HA_READ_NEXT | HA_READ_PREV | HA_READ_RANGE |
+            HA_READ_ORDER | HA_KEYREAD_ONLY | HA_DO_INDEX_COND_PUSHDOWN);
   }
   uint max_supported_keys()          const { return MI_MAX_KEY; }
   uint max_supported_key_length()    const { return MI_MAX_KEY_LENGTH; }
@@ -118,7 +110,7 @@ class ha_myisam: public handler
   int extra_opt(enum ha_extra_function operation, ulong cache_size);
   int reset(void);
   int external_lock(THD *thd, int lock_type);
-  int delete_all_rows(void);
+  int delete_all_rows(ha_rows* nrows = NULL);
   int truncate();
   int reset_auto_increment(ulonglong value);
   int disable_indexes(uint mode);

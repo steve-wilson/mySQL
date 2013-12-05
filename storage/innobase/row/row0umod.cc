@@ -147,10 +147,11 @@ row_undo_mod_clust_low(
 }
 
 /***********************************************************//**
-Purges a clustered index record after undo if possible.
+Removes a clustered index record after undo if possible.
 This is attempted when the record was inserted by updating a
 delete-marked record and there no longer exist transactions
-that would see the delete-marked record.
+that would see the delete-marked record.  In other words, we
+roll back the insert by purging the record.
 @return	DB_SUCCESS, DB_FAIL, or error code: we may run out of file space */
 static __attribute__((nonnull, warn_unused_result))
 dberr_t
@@ -158,12 +159,11 @@ row_undo_mod_remove_clust_low(
 /*==========================*/
 	undo_node_t*	node,	/*!< in: row undo node */
 	que_thr_t*	thr,	/*!< in: query thread */
-	mtr_t*		mtr,	/*!< in/out: mini-transaction */
+	mtr_t*		mtr,	/*!< in: mtr */
 	ulint		mode)	/*!< in: BTR_MODIFY_LEAF or BTR_MODIFY_TREE */
 {
 	btr_cur_t*	btr_cur;
 	dberr_t		err;
-	ulint		trx_id_offset;
 
 	ut_ad(node->rec_type == TRX_UNDO_UPD_DEL_REC);
 
@@ -177,36 +177,6 @@ row_undo_mod_remove_clust_low(
 	}
 
 	btr_cur = btr_pcur_get_btr_cur(&node->pcur);
-
-	trx_id_offset = btr_cur_get_index(btr_cur)->trx_id_offset;
-
-	if (!trx_id_offset) {
-		mem_heap_t*	heap	= NULL;
-		ulint		trx_id_col;
-		const ulint*	offsets;
-		ulint		len;
-
-		trx_id_col = dict_index_get_sys_col_pos(
-			btr_cur_get_index(btr_cur), DATA_TRX_ID);
-		ut_ad(trx_id_col > 0);
-		ut_ad(trx_id_col != ULINT_UNDEFINED);
-
-		offsets = rec_get_offsets(
-			btr_cur_get_rec(btr_cur), btr_cur_get_index(btr_cur),
-			NULL, trx_id_col + 1, &heap);
-
-		trx_id_offset = rec_get_nth_field_offs(
-			offsets, trx_id_col, &len);
-		ut_ad(len == DATA_TRX_ID_LEN);
-		mem_heap_free(heap);
-	}
-
-	if (trx_read_trx_id(btr_cur_get_rec(btr_cur) + trx_id_offset)
-	    != node->new_trx_id) {
-		/* The record must have been purged and then replaced
-		with a different one. */
-		return(DB_SUCCESS);
-	}
 
 	/* We are about to remove an old, delete-marked version of the
 	record that may have been delete-marked by a different transaction
@@ -265,7 +235,7 @@ row_undo_mod_clust(
 	pcur = &node->pcur;
 	index = btr_cur_get_index(btr_pcur_get_btr_cur(pcur));
 
-	mtr_start(&mtr);
+	mtr_start_trx(&mtr, thr_get_trx(thr));
 
 	online = dict_index_is_online_ddl(index);
 	if (online) {
@@ -293,7 +263,7 @@ row_undo_mod_clust(
 		/* We may have to modify tree structure: do a pessimistic
 		descent down the index tree */
 
-		mtr_start(&mtr);
+		mtr_start_trx(&mtr, thr_get_trx(thr));
 
 		err = row_undo_mod_clust_low(
 			node, &offsets, &offsets_heap, heap, &rebuilt_old_pk,
@@ -331,14 +301,11 @@ row_undo_mod_clust(
 		}
 	}
 
-	ut_ad(rec_get_trx_id(btr_pcur_get_rec(pcur), index)
-	      == node->new_trx_id);
-
 	btr_pcur_commit_specify_mtr(pcur, &mtr);
 
 	if (err == DB_SUCCESS && node->rec_type == TRX_UNDO_UPD_DEL_REC) {
 
-		mtr_start(&mtr);
+		mtr_start_trx(&mtr, thr_get_trx(thr));
 
 		/* It is not necessary to call row_log_table,
 		because the record is delete-marked and would thus
@@ -351,7 +318,7 @@ row_undo_mod_clust(
 			/* We may have to modify tree structure: do a
 			pessimistic descent down the index tree */
 
-			mtr_start(&mtr);
+			mtr_start_trx(&mtr, thr_get_trx(thr));
 
 			err = row_undo_mod_remove_clust_low(node, thr, &mtr,
 							    BTR_MODIFY_TREE);
@@ -398,7 +365,7 @@ row_undo_mod_del_mark_or_remove_sec_low(
 	enum row_search_result	search_result;
 
 	log_free_check();
-	mtr_start(&mtr);
+	mtr_start_trx(&mtr, thr_get_trx(thr));
 
 	if (*index->name == TEMP_INDEX_PREFIX) {
 		/* The index->online_status may change if the
@@ -454,7 +421,7 @@ row_undo_mod_del_mark_or_remove_sec_low(
 	which cannot be purged yet, requires its existence. If some requires,
 	we should delete mark the record. */
 
-	mtr_start(&mtr_vers);
+	mtr_start_trx(&mtr_vers, thr_get_trx(thr));
 
 	success = btr_pcur_restore_position(BTR_SEARCH_LEAF, &(node->pcur),
 					    &mtr_vers);
@@ -570,7 +537,7 @@ row_undo_mod_del_unmark_sec_and_undo_update(
 	ut_ad(trx->id);
 
 	log_free_check();
-	mtr_start(&mtr);
+	mtr_start_trx(&mtr, thr_get_trx(thr));
 
 	if (*index->name == TEMP_INDEX_PREFIX) {
 		/* The index->online_status may change if the

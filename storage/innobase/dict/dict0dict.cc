@@ -663,16 +663,23 @@ dict_index_get_nth_col_or_prefix_pos(
 /*=================================*/
 	const dict_index_t*	index,		/*!< in: index */
 	ulint			n,		/*!< in: column number */
-	ibool			inc_prefix)	/*!< in: TRUE=consider
+	ibool			inc_prefix,	/*!< in: TRUE=consider
 						column prefixes too */
+	ulint*			prefix_col_pos)	/*!< out: col num if prefix */
 {
 	const dict_field_t*	field;
 	const dict_col_t*	col;
 	ulint			pos;
 	ulint			n_fields;
+	ulint			prefixed_pos_dummy;
 
 	ut_ad(index);
 	ut_ad(index->magic_n == DICT_INDEX_MAGIC_N);
+
+	if (!prefix_col_pos) {
+		prefix_col_pos = &prefixed_pos_dummy;
+	}
+	*prefix_col_pos = ULINT_UNDEFINED;
 
 	col = dict_table_get_nth_col(index->table, n);
 
@@ -686,10 +693,11 @@ dict_index_get_nth_col_or_prefix_pos(
 	for (pos = 0; pos < n_fields; pos++) {
 		field = dict_index_get_nth_field(index, pos);
 
-		if (col == field->col
-		    && (inc_prefix || field->prefix_len == 0)) {
-
-			return(pos);
+		if (col == field->col) {
+			*prefix_col_pos = pos;
+			if (inc_prefix || field->prefix_len == 0) {
+				return(pos);
+			}
 		}
 	}
 
@@ -833,7 +841,7 @@ dict_table_get_nth_col_pos(
 	ulint			n)	/*!< in: column number */
 {
 	return(dict_index_get_nth_col_pos(dict_table_get_first_index(table),
-					  n));
+					  n, NULL));
 }
 
 /********************************************************************//**
@@ -2757,6 +2765,7 @@ dict_index_build_internal_clust(
 	ulint		trx_id_pos;
 	ulint		i;
 	ibool*		indexed;
+	fil_space_t*	fil_space;
 
 	ut_ad(table && index);
 	ut_ad(dict_index_is_clust(index));
@@ -2768,6 +2777,14 @@ dict_index_build_internal_clust(
 					  index->name, table->space,
 					  index->type,
 					  index->n_fields + table->n_cols);
+
+	/* Tell tablespace the index_id of primary key. */
+	if (index) {
+		mutex_enter(&fil_system->mutex);
+		fil_space = fil_space_get_by_id(table->space);
+		if (fil_space) fil_space->primary_index_id = index->id;
+		mutex_exit(&fil_system->mutex);
+	}
 
 	/* Copy other relevant data from the old index struct to the new
 	struct: it inherits the values */
@@ -3451,27 +3468,14 @@ dict_scan_to(
 	const char*	string)	/*!< in: look for this */
 {
 	char	quote	= '\0';
-	bool	escape	= false;
 
 	for (; *ptr; ptr++) {
 		if (*ptr == quote) {
 			/* Closing quote character: do not look for
 			starting quote or the keyword. */
-
-			/* If the quote character is escaped by a
-			backslash, ignore it. */
-			if (escape) {
-				escape = false;
-			} else {
-				quote = '\0';
-			}
+			quote = '\0';
 		} else if (quote) {
 			/* Within quotes: do nothing. */
-			if (escape) {
-				escape = false;
-			} else if (*ptr == '\\') {
-				escape = true;
-			}
 		} else if (*ptr == '`' || *ptr == '"' || *ptr == '\'') {
 			/* Starting quote: remember the quote character. */
 			quote = *ptr;
@@ -3886,11 +3890,6 @@ dict_strip_comments(
 	char*		ptr;
 	/* unclosed quote character (0 if none) */
 	char		quote	= 0;
-	bool		escape = false;
-
-	DBUG_ENTER("dict_strip_comments");
-
-	DBUG_PRINT("dict_strip_comments", ("%s", sql_string));
 
 	str = static_cast<char*>(mem_alloc(sql_length + 1));
 
@@ -3905,29 +3904,16 @@ end_of_string:
 
 			ut_a(ptr <= str + sql_length);
 
-			DBUG_PRINT("dict_strip_comments", ("%s", str));
-			DBUG_RETURN(str);
+			return(str);
 		}
 
 		if (*sptr == quote) {
 			/* Closing quote character: do not look for
 			starting quote or comments. */
-
-			/* If the quote character is escaped by a
-			backslash, ignore it. */
-			if (escape) {
-				escape = false;
-			} else {
-				quote = 0;
-			}
+			quote = 0;
 		} else if (quote) {
 			/* Within quotes: do not look for
 			starting quotes or comments. */
-			if (escape) {
-				escape = false;
-			} else if (*sptr == '\\') {
-				escape = true;
-			}
 		} else if (*sptr == '"' || *sptr == '`' || *sptr == '\'') {
 			/* Starting quote: remember the quote character. */
 			quote = *sptr;

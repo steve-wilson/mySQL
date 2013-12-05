@@ -33,6 +33,7 @@ Created 5/11/1994 Heikki Tuuri
 #ifdef UNIV_NONINL
 #include "ut0ut.ic"
 #endif
+#include "blind_fwrite.h"
 
 #include <stdarg.h>
 #include <string.h>
@@ -558,7 +559,7 @@ ut_print_namel(
 				       trx ? trx->mysql_thd : NULL,
 				       table_id);
 
-	fwrite(buf, 1, bufend - buf, f);
+	blind_fwrite(buf, 1, bufend - buf, f);
 }
 
 /**********************************************************************//**
@@ -623,7 +624,7 @@ ut_copy_file(
 			? (size_t) len
 			: sizeof buf;
 		size_t	size = fread(buf, 1, maxs, src);
-		fwrite(buf, 1, size, dest);
+		blind_fwrite(buf, 1, size, dest);
 		len -= (long) size;
 		if (size < maxs) {
 			break;
@@ -816,8 +817,6 @@ ut_strerr(
 		return("Table dictionary has changed");
 	case DB_IDENTIFIER_TOO_LONG:
 		return("Identifier name is too long");
-	case DB_FTS_EXCEED_RESULT_CACHE_LIMIT:
-		return("FTS query exceeds result cache limit");
 
 	/* do not add default: in order to produce a warning if new code
 	is added to the enum but not added here */

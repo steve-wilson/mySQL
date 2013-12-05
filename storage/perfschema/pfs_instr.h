@@ -371,13 +371,7 @@ struct PFS_ALIGNED PFS_thread : PFS_connection_slice
   PFS_events_waits *m_events_waits_current;
   /** Event ID counter */
   ulonglong m_event_id;
-  /**
-    Internal lock.
-    This lock is exclusively used to protect against races
-    when creating and destroying PFS_thread.
-    Do not use this lock to protect thread attributes,
-    use one of @c m_stmt_lock or @c m_session_lock instead.
-  */
+  /** Internal lock. */
   pfs_lock m_lock;
   /** Pins for filename_hash. */
   LF_PINS *m_filename_hash_pins;
@@ -466,63 +460,29 @@ struct PFS_ALIGNED PFS_thread : PFS_connection_slice
   */
   PFS_events_statements *m_statements_history;
 
-  /**
-    Internal lock, for session attributes.
-    Statement attributes are expected to be updated in frequently,
-    typically per session execution.
-  */
-  pfs_lock m_session_lock;
-  /**
-    User name.
-    Protected by @c m_session_lock.
-  */
+  /** User name. */
   char m_username[USERNAME_LENGTH];
-  /**
-    Length of @c m_username.
-    Protected by @c m_session_lock.
-  */
+  /** Length of @c m_username. */
   uint m_username_length;
-  /**
-    Host name.
-    Protected by @c m_session_lock.
-  */
+  /** Host name. */
   char m_hostname[HOSTNAME_LENGTH];
-  /**
-    Length of @c m_hostname.
-    Protected by @c m_session_lock.
-  */
+  /** Length of @c m_hostname. */
   uint m_hostname_length;
-  /**
-    Database name.
-    Protected by @c m_stmt_lock.
-  */
+  /** Database name. */
   char m_dbname[NAME_LEN];
-  /**
-    Length of @c m_dbname.
-    Protected by @c m_stmt_lock.
-  */
+  /** Length of @c m_dbname. */
   uint m_dbname_length;
   /** Current command. */
   int m_command;
   /** Start time. */
   time_t m_start_time;
-  /**
-    Internal lock, for statement attributes.
-    Statement attributes are expected to be updated frequently,
-    typically per statement execution.
-  */
-  pfs_lock m_stmt_lock;
+  /** Lock for Processlist info. */
+  pfs_lock m_processlist_info_lock;
   /** Processlist state (derived from stage). */
   PFS_stage_key m_stage;
-  /**
-    Processlist info.
-    Protected by @c m_stmt_lock.
-  */
+  /** Processlist info. */
   char m_processlist_info[COL_INFO_SIZE];
-  /**
-    Length of @c m_processlist_info_length.
-    Protected by @c m_stmt_lock.
-  */
+  /** Length of @c m_processlist_info_length. */
   uint m_processlist_info_length;
 
   PFS_events_stages m_stage_current;
@@ -538,20 +498,11 @@ struct PFS_ALIGNED PFS_thread : PFS_connection_slice
   /** Reset session connect attributes */
   void reset_session_connect_attrs();
 
-  /**
-    Buffer for the connection attributes.
-    Protected by @c m_session_lock.
-  */
+  /** a buffer for the connection attributes */
   char *m_session_connect_attrs;
-  /**
-    Length used by @c m_connect_attrs.
-    Protected by @c m_session_lock.
-  */
+  /** length used by @c m_connect_attrs */
   uint m_session_connect_attrs_length;
-  /**
-    Character set in which @c m_connect_attrs are encoded.
-    Protected by @c m_session_lock.
-  */
+  /** character set in which @c m_connect_attrs are encoded */
   const CHARSET_INFO *m_session_connect_attrs_cs;
 };
 
@@ -655,22 +606,10 @@ void aggregate_all_statements(PFS_statement_stat *from_array,
                               PFS_statement_stat *to_array_1,
                               PFS_statement_stat *to_array_2);
 
-void aggregate_thread(PFS_thread *thread,
-                      PFS_account *safe_account,
-                      PFS_user *safe_user,
-                      PFS_host *safe_host);
-void aggregate_thread_waits(PFS_thread *thread,
-                            PFS_account *safe_account,
-                            PFS_user *safe_user,
-                            PFS_host *safe_host);
-void aggregate_thread_stages(PFS_thread *thread,
-                             PFS_account *safe_account,
-                             PFS_user *safe_user,
-                             PFS_host *safe_host);
-void aggregate_thread_statements(PFS_thread *thread,
-                                 PFS_account *safe_account,
-                                 PFS_user *safe_user,
-                                 PFS_host *safe_host);
+void aggregate_thread(PFS_thread *thread);
+void aggregate_thread_waits(PFS_thread *thread);
+void aggregate_thread_stages(PFS_thread *thread);
+void aggregate_thread_statements(PFS_thread *thread);
 void clear_thread_account(PFS_thread *thread);
 void set_thread_account(PFS_thread *thread);
 

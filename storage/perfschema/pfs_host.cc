@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -333,14 +333,6 @@ void PFS_host::release()
   dec_refcount();
 }
 
-PFS_host *sanitize_host(PFS_host *unsafe)
-{
-  if ((&host_array[0] <= unsafe) &&
-      (unsafe < &host_array[host_max]))
-    return unsafe;
-  return NULL;
-}
-
 void purge_host(PFS_thread *thread, PFS_host *host)
 {
   LF_PINS *pins= get_host_hash_pins(thread);
@@ -353,9 +345,7 @@ void purge_host(PFS_thread *thread, PFS_host *host)
                     host->m_key.m_hash_key, host->m_key.m_key_length));
   if (entry && (entry != MY_ERRPTR))
   {
-    PFS_host *pfs;
-    pfs= *entry;
-    DBUG_ASSERT(pfs == host);
+    DBUG_ASSERT(((PFS_host *)(*entry)) == host);
     if (host->get_refcount() == 0)
     {
       lf_hash_delete(&host_hash, pins,

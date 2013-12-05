@@ -100,7 +100,6 @@ in buf_pool, or if the page is in the doublewrite buffer blocks in
 which case it is never read into the pool, or if the tablespace does
 not exist or is being dropped
 @return 1 if read request is issued. 0 if it is not */
-static
 ulint
 buf_read_page_low(
 /*==============*/
@@ -119,7 +118,13 @@ buf_read_page_low(
 			treat the tablespace as dropped; this is a timestamp we
 			use to stop dangling page reads from a tablespace
 			which we have DISCARDed + IMPORTed back */
-	ulint	offset)	/*!< in: page number */
+	ulint	offset,	/*!< in: page number */
+	trx_t*	trx,	/*!< in: transaction object */
+	ibool	should_buffer)	/*!< in: whether to buffer an aio request.
+				AIO read ahead uses this. If you plan to
+				use this parameter, make sure you remember
+				to call os_aio_linux_dispatch_read_array_submit
+				when you're ready to commit all your requests.*/
 {
 	buf_page_t*	bpage;
 	ulint		wake_later;
@@ -162,6 +167,49 @@ buf_read_page_low(
 	bpage = buf_page_init_for_read(err, mode, space, zip_size, unzip,
 				       tablespace_version, offset);
 	if (bpage == NULL) {
+#ifdef XTRABACKUP
+		if (recv_recovery_is_on() && *err == DB_TABLESPACE_DELETED) {
+			/* hashed log recs must be treated here */
+			recv_addr_t*    recv_addr;
+
+			mutex_enter(&(recv_sys->mutex));
+
+			if (recv_sys->apply_log_recs == FALSE) {
+				mutex_exit(&(recv_sys->mutex));
+				goto not_to_recover;
+			}
+
+			/* recv_get_fil_addr_struct() */
+			recv_addr = static_cast<recv_addr_t*>
+					(HASH_GET_FIRST(recv_sys->addr_hash,
+					hash_calc_hash(recv_fold(space, offset),
+					recv_sys->addr_hash)));
+			while (recv_addr) {
+				if ((recv_addr->space == space)
+					&& (recv_addr->page_no == offset)) {
+					break;
+				}
+				recv_addr = static_cast<recv_addr_t*>
+						(HASH_GET_NEXT(addr_hash, recv_addr));
+			}
+
+			if ((recv_addr == NULL)
+			    || (recv_addr->state == RECV_BEING_PROCESSED)
+			    || (recv_addr->state == RECV_PROCESSED)) {
+				mutex_exit(&(recv_sys->mutex));
+				goto not_to_recover;
+			}
+
+			fprintf(stderr, " (cannot find space: %lu)", space);
+			recv_addr->state = RECV_PROCESSED;
+
+			ut_a(recv_sys->n_addrs);
+			recv_sys->n_addrs--;
+
+			mutex_exit(&(recv_sys->mutex));
+		}
+not_to_recover:
+#endif /* XTRABACKUP */
 
 		return(0);
 	}
@@ -181,17 +229,21 @@ buf_read_page_low(
 	}
 
 	if (zip_size) {
-		*err = fil_io(OS_FILE_READ | wake_later
+		*err = _fil_io(OS_FILE_READ | wake_later
 			      | ignore_nonexistent_pages,
 			      sync, space, zip_size, offset, 0, zip_size,
-			      bpage->zip.data, bpage);
+			      bpage->zip.data, bpage,
+			      trx ? &trx->table_io_perf : NULL,
+			      should_buffer);
 	} else {
 		ut_a(buf_page_get_state(bpage) == BUF_BLOCK_FILE_PAGE);
 
-		*err = fil_io(OS_FILE_READ | wake_later
+		*err = _fil_io(OS_FILE_READ | wake_later
 			      | ignore_nonexistent_pages,
 			      sync, space, 0, offset, 0, UNIV_PAGE_SIZE,
-			      ((buf_block_t*) bpage)->frame, bpage);
+			      ((buf_block_t*) bpage)->frame, bpage,
+			      trx ? &trx->table_io_perf : NULL,
+			      should_buffer);
 	}
 
 	if (sync) {
@@ -241,8 +293,9 @@ buf_read_ahead_random(
 				or 0 */
 	ulint	offset,		/*!< in: page number of a page which
 				the current thread wants to access */
-	ibool	inside_ibuf)	/*!< in: TRUE if we are inside ibuf
+	ibool	inside_ibuf,	/*!< in: TRUE if we are inside ibuf
 				routine */
+	trx_t*	trx)
 {
 	buf_pool_t*	buf_pool = buf_pool_get(space, offset);
 	ib_int64_t	tablespace_version;
@@ -345,7 +398,7 @@ read_ahead:
 				&err, false,
 				ibuf_mode | OS_AIO_SIMULATED_WAKE_LATER,
 				space, zip_size, FALSE,
-				tablespace_version, i);
+				tablespace_version, i, trx, FALSE);
 			if (err == DB_TABLESPACE_DELETED) {
 				ut_print_timestamp(stderr);
 				fprintf(stderr,
@@ -395,7 +448,8 @@ buf_read_page(
 /*==========*/
 	ulint	space,	/*!< in: space id */
 	ulint	zip_size,/*!< in: compressed page size in bytes, or 0 */
-	ulint	offset)	/*!< in: page number */
+	ulint	offset,	/*!< in: page number */
+	trx_t*	trx)
 {
 	ib_int64_t	tablespace_version;
 	ulint		count;
@@ -408,7 +462,7 @@ buf_read_page(
 
 	count = buf_read_page_low(&err, true, BUF_READ_ANY_PAGE, space,
 				  zip_size, FALSE,
-				  tablespace_version, offset);
+				  tablespace_version, offset, trx, FALSE);
 	srv_stats.buf_pool_reads.add(count);
 	if (err == DB_TABLESPACE_DELETED) {
 		ut_print_timestamp(stderr);
@@ -456,7 +510,7 @@ buf_read_page_async(
 				  | OS_AIO_SIMULATED_WAKE_LATER
 				  | BUF_READ_IGNORE_NONEXISTENT_PAGES,
 				  space, zip_size, FALSE,
-				  tablespace_version, offset);
+				  tablespace_version, offset, NULL, FALSE);
 	srv_stats.buf_pool_reads.add(count);
 
 	/* We do not increment number of I/O operations used for LRU policy
@@ -500,7 +554,8 @@ buf_read_ahead_linear(
 	ulint	space,		/*!< in: space id */
 	ulint	zip_size,	/*!< in: compressed page size in bytes, or 0 */
 	ulint	offset,		/*!< in: page number; see NOTE 3 above */
-	ibool	inside_ibuf)	/*!< in: TRUE if we are inside ibuf routine */
+	ibool	inside_ibuf,	/*!< in: TRUE if we are inside ibuf routine */
+	trx_t*	trx)
 {
 	buf_pool_t*	buf_pool = buf_pool_get(space, offset);
 	ib_int64_t	tablespace_version;
@@ -528,6 +583,12 @@ buf_read_ahead_linear(
 
 	if (UNIV_UNLIKELY(srv_startup_is_before_trx_rollback_phase)) {
 		/* No read-ahead to avoid thread deadlocks */
+		return(0);
+	}
+
+	/* linear read ahead is disabled if user requested logical read ahead.
+	*/
+	if (trx && trx->lra_size) {
 		return(0);
 	}
 
@@ -710,12 +771,12 @@ buf_read_ahead_linear(
 	for (i = low; i < high; i++) {
 		/* It is only sensible to do read-ahead in the non-sync
 		aio mode: hence FALSE as the first parameter */
-
 		if (!ibuf_bitmap_page(zip_size, i)) {
 			count += buf_read_page_low(
 				&err, false,
 				ibuf_mode,
-				space, zip_size, FALSE, tablespace_version, i);
+				space, zip_size, FALSE, tablespace_version, i,
+				trx, TRUE);
 			if (err == DB_TABLESPACE_DELETED) {
 				ut_print_timestamp(stderr);
 				fprintf(stderr,
@@ -728,6 +789,10 @@ buf_read_ahead_linear(
 			}
 		}
 	}
+#if defined(LINUX_NATIVE_AIO)
+	/* Tell aio to submit all buffered requests. */
+	ut_a(os_aio_linux_dispatch_read_array_submit());
+#endif
 
 	/* In simulated aio we wake the aio handler threads only after
 	queuing all aio requests, in native aio the following call does
@@ -805,12 +870,13 @@ buf_read_ibuf_merge_pages(
 		buf_read_page_low(&err, sync && (i + 1 == n_stored),
 				  BUF_READ_ANY_PAGE, space_ids[i],
 				  zip_size, TRUE, space_versions[i],
-				  page_nos[i]);
+				  page_nos[i], NULL, FALSE);
 
 		if (UNIV_UNLIKELY(err == DB_TABLESPACE_DELETED)) {
 tablespace_deleted:
 			/* We have deleted or are deleting the single-table
 			tablespace: remove the entries for that page */
+			++srv_drop_ibuf_skip_row;
 
 			ibuf_merge_or_delete_for_page(NULL, space_ids[i],
 						      page_nos[i],
@@ -861,6 +927,54 @@ buf_read_recv_pages(
 		/* It is a single table tablespace and the .ibd file is
 		missing: do nothing */
 
+#ifdef XTRABACKUP
+		/* the log records should be treated here same reason
+		for http://bugs.mysql.com/bug.php?id=43948 */
+
+		if (recv_recovery_is_on()) {
+			recv_addr_t*    recv_addr;
+
+			mutex_enter(&(recv_sys->mutex));
+
+			if (recv_sys->apply_log_recs == FALSE) {
+				mutex_exit(&(recv_sys->mutex));
+				goto not_to_recover;
+			}
+
+			for (i = 0; i < n_stored; i++) {
+				/* recv_get_fil_addr_struct() */
+				recv_addr = static_cast<recv_addr_t*>
+						(HASH_GET_FIRST(recv_sys->addr_hash,
+						hash_calc_hash(recv_fold(space, page_nos[i]),
+						recv_sys->addr_hash)));
+				while (recv_addr) {
+					if ((recv_addr->space == space)
+						&& (recv_addr->page_no == page_nos[i])) {
+						break;
+					}
+					recv_addr = static_cast<recv_addr_t*>
+							(HASH_GET_NEXT(addr_hash, recv_addr));
+				}
+
+				if ((recv_addr == NULL)
+				    || (recv_addr->state == RECV_BEING_PROCESSED)
+				    || (recv_addr->state == RECV_PROCESSED)) {
+					continue;
+				}
+
+				recv_addr->state = RECV_PROCESSED;
+
+				ut_a(recv_sys->n_addrs);
+				recv_sys->n_addrs--;
+			}
+
+			mutex_exit(&(recv_sys->mutex));
+
+			fprintf(stderr, " (cannot find space: %lu)", space);
+		}
+not_to_recover:
+#endif /* XTRABACKUP */
+
 		return;
 	}
 
@@ -900,14 +1014,19 @@ buf_read_recv_pages(
 		if ((i + 1 == n_stored) && sync) {
 			buf_read_page_low(&err, true, BUF_READ_ANY_PAGE, space,
 					  zip_size, TRUE, tablespace_version,
-					  page_nos[i]);
+					  page_nos[i], NULL, FALSE);
 		} else {
 			buf_read_page_low(&err, false, BUF_READ_ANY_PAGE
 					  | OS_AIO_SIMULATED_WAKE_LATER,
 					  space, zip_size, TRUE,
-					  tablespace_version, page_nos[i]);
+					  tablespace_version, page_nos[i],
+					  NULL, TRUE);
 		}
 	}
+
+#ifdef LINUX_NATIVE_AIO
+	ut_a(os_aio_linux_dispatch_read_array_submit());
+#endif
 
 	os_aio_simulated_wake_handler_threads();
 

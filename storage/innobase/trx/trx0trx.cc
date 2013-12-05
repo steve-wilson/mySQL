@@ -47,6 +47,7 @@ Created 3/26/1996 Heikki Tuuri
 #include "ha_prototypes.h"
 #include "srv0mon.h"
 #include "ut0vec.h"
+#include "btr0pcur.h"
 
 #include<set>
 
@@ -89,6 +90,249 @@ trx_set_detailed_error_from_file(
 			    sizeof(trx->detailed_error));
 }
 
+/***************************************************************
+ It turns out to be very efficient for all of our trx_t structures to
+ be in contiguous memory; this forced locality results in significant
+ speedups when iterating over the open transactions.  We achieve this
+ with trx_t blocks of contiguous memory, each holding TRX_PER_BLOCK
+ trx_t's.  As we fill blocks, we allocate new ones.
+
+ TRX_PER_BLOCK is pretty arbitrary, but you want it to be large (so
+ that all transactions span only a handful of memory regions).
+ */
+#define TRX_PER_BLOCK (1024 * 1024 / sizeof(trx_t))
+struct trx_block_struct {
+	struct trx_block_struct* next_block;
+	trx_t transactions[TRX_PER_BLOCK];
+};
+
+/* A linked list of our transaction blocks. */
+static struct trx_block_struct* transaction_blocks = NULL;
+/* Track the next free transaction (for fast allocation) */
+static trx_t *next_free_transaction = NULL;
+
+
+#ifdef UNIV_DEBUG_VALGRIND
+/********************************************************************//**
+Frees trx_t pool */
+UNIV_INTERN
+void
+trx_free_trx_pool()
+/*==============*/
+{
+	trx_t*  next;
+
+	/* Confirm that the list looks OK */
+	next = next_free_transaction;
+	while (next) {
+		ut_ad(next->magic_n == TRX_FREE_MAGIC_N);
+		next = next->next_free_trx;
+	}
+
+	next_free_transaction = NULL;
+
+	while (transaction_blocks) {
+		struct trx_block_struct *next_block =
+			transaction_blocks->next_block;
+		mem_free(transaction_blocks);
+		transaction_blocks = next_block;
+	}
+}
+#endif
+
+
+trx_t*
+trx_allocate()
+{
+	uint i;
+	trx_t* ret = NULL;
+
+	mutex_enter(&trx_sys->trx_memory_mutex);
+	/* If we don't have a next_free_transaction -- either because
+	*  this is the first allocation or because we are using every
+	*  transaction in previous blocks -- allocate a new one, set
+	*  all of the trx_t's next_free_trx pointer to the next trx_t
+	*  in the block, and set next_free_transaction to be the first
+	*  trx_t in the block. */
+
+	if (!next_free_transaction) {
+		struct trx_block_struct* block_tmp =
+			static_cast<struct trx_block_struct*>(
+				mem_zalloc(sizeof(struct trx_block_struct)));
+		block_tmp->next_block = transaction_blocks;
+		transaction_blocks = block_tmp;
+
+		for (i = 0; i < TRX_PER_BLOCK; ++i) {
+			trx_t* next = NULL;
+			if (i < TRX_PER_BLOCK - 1) {
+				next = &(block_tmp->transactions[i + 1]);
+			}
+			block_tmp->transactions[i].next_free_trx = next;
+			block_tmp->transactions[i].magic_n = TRX_FREE_MAGIC_N;
+		}
+
+		next_free_transaction = &(transaction_blocks->transactions[0]);
+	}
+
+	ut_a(next_free_transaction->magic_n == TRX_FREE_MAGIC_N);
+
+	/* We return the next free transaction and remove it from the list. */
+	ret = next_free_transaction;
+	next_free_transaction = ret->next_free_trx;
+	ret->next_free_trx = NULL;
+	mutex_exit(&trx_sys->trx_memory_mutex);
+	return ret;
+}
+
+void trx_deallocate(trx_t* t) {
+	mutex_enter(&trx_sys->trx_memory_mutex);
+	ut_a(t->magic_n == TRX_MAGIC_N);
+	memset(t, 0, sizeof(trx_t));
+	/* Place this transaction at the head of our free list.   Note
+	* that if somehow this is the last used transaction in a
+	* transaction block, we do not free the block.  This is a
+	* wasteful optimization as there are at most a few megabytes of
+	* blocks in an extremely busy system. */
+
+	t->next_free_trx = next_free_transaction;
+	t->magic_n = TRX_FREE_MAGIC_N;
+	next_free_transaction = t;
+	mutex_exit(&trx_sys->trx_memory_mutex);
+}
+
+/*************************************************************//**
+Creates or frees data structures related to logical-read-ahead.
+based on the value of lra_size. */
+UNIV_INTERN
+void
+trx_lra_reset(
+	trx_t* trx, /*!< in: transaction */
+	ulint lra_size, /*!< in: lra_size in MB.
+				       If 0, the fields that are releated
+				       to logical-read-ahead will be free'd
+				       if they were initialized. */
+	ulint lra_n_node_recs_before_sleep,
+					/*!< in: lra_n_node_recs_before_sleep
+					is the number of node pointer records
+					traversed while holding the index lock
+					before releasing the index lock and
+					sleeping for a short period of time so
+					that the other threads get a chance to
+					x-latch the index lock. */
+	ulint lra_sleep)		/* lra_sleep is the sleep time in
+					milliseconds. */
+{
+#ifndef TARGET_OS_LINUX
+	if (lra_size) {
+		ib_logf(IB_LOG_LEVEL_WARN,
+			"Logical read ahead is supported only on linux.");
+		lra_size = 0;
+	}
+#else /* TARGET_OS_LINUX */
+	if (!srv_use_native_aio && lra_size) {
+		ib_logf(IB_LOG_LEVEL_WARN,
+			"In order to use logical read ahead please enable "
+			"native aio by setting innodb_use_native_aio=1 in "
+			"my.cnf and restarting the server.");
+		lra_size = 0;
+	}
+#endif /* TARGET_OS_LINUX */
+	trx->lra_size = lra_size;
+	trx->lra_space_id = 0;
+	trx->lra_n_pages = 0;
+	trx->lra_n_pages_since = 0;
+	trx->lra_page_no = 0;
+	trx->lra_n_node_recs_before_sleep = lra_n_node_recs_before_sleep;
+	trx->lra_sleep = lra_sleep;
+	trx->lra_tree_height = 0;
+	if (lra_size) {
+		ulint n_pages_max =
+			(lra_size << 20L) / UNIV_ZIP_SIZE_MIN;
+		ulint mem = n_pages_max * (2 * sizeof(ulint)
+			                   + 2 * sizeof(page_no_holder_t))
+			    + sizeof(btr_pcur_t);
+		if (trx->lra_ht) {
+			ut_a(trx->lra_ht1);
+			ut_a(trx->lra_ht2);
+			ut_a(trx->lra_sort_arr);
+			ut_a(trx->lra_cur);
+			hash_table_clear(trx->lra_ht1);
+			hash_table_clear(trx->lra_ht2);
+			btr_pcur_reset(trx->lra_cur);
+			trx->lra_ht = trx->lra_ht1;
+#ifdef UNIV_DEBUG
+			/* following resets lra_sort_arr,
+			 * lra_arr1, lra_arr2, and lra_cursor.
+			 */
+			memset(trx->lra_sort_arr, 0, mem);
+#endif
+			btr_pcur_init(trx->lra_cur);
+		} else {
+			byte* alloc;
+			ut_a(!trx->lra_ht1);
+			ut_a(!trx->lra_ht2);
+			ut_a(!trx->lra_sort_arr);
+			ut_a(!trx->lra_cur);
+			trx->lra_ht1 = hash_create(16384);
+			trx->lra_ht2 = hash_create(16384);
+			trx->lra_ht = trx->lra_ht1;
+			alloc = (byte*)ut_malloc(mem);
+#ifdef UNIV_DEBUG
+			memset(alloc, 0, mem);
+#endif
+			trx->lra_sort_arr = (ulint*)alloc;
+			alloc += 2 * sizeof(ulint) * n_pages_max;
+			trx->lra_arr1 = (page_no_holder_t*) alloc;
+			alloc +=  sizeof(page_no_holder_t) * n_pages_max;
+			trx->lra_arr2 = (page_no_holder_t*) alloc;
+			alloc +=  sizeof(page_no_holder_t) * n_pages_max;
+			trx->lra_cur = (btr_pcur_t*) alloc;
+			btr_pcur_init(trx->lra_cur);
+#ifdef TARGET_OS_LINUX
+			if (cachedev_enabled) {
+				pid_t pid = syscall(SYS_gettid);
+				ioctl(cachedev_fd,
+				      FLASHCACHEADDBLACKLIST,
+				      &pid);
+			}
+#endif /* TARGET_OS_LINUX */
+
+		}
+	} else {
+		if (trx->lra_ht) {
+			ut_a(trx->lra_ht1);
+			ut_a(trx->lra_ht2);
+			ut_a(trx->lra_sort_arr);
+			hash_table_free(trx->lra_ht1);
+			hash_table_free(trx->lra_ht2);
+			btr_pcur_close(trx->lra_cur);
+			ut_free(trx->lra_sort_arr);
+			trx->lra_sort_arr = NULL;
+			trx->lra_ht = NULL;
+			trx->lra_ht1 = NULL;
+			trx->lra_ht2 = NULL;
+			trx->lra_arr1 = NULL;
+			trx->lra_arr2 = NULL;
+			trx->lra_cur = NULL;
+#ifdef TARGET_OS_LINUX
+			if (cachedev_enabled) {
+				pid_t pid = syscall(SYS_gettid);
+				ioctl(cachedev_fd,
+				      FLASHCACHEDELBLACKLIST,
+				      &pid);
+			}
+#endif /* TARGET_OS_LINUX */
+		} else {
+			ut_a(!trx->lra_ht1);
+			ut_a(!trx->lra_ht2);
+			ut_a(!trx->lra_sort_arr);
+			ut_a(!trx->lra_cur);
+			ut_a(!trx->lra_arr1);
+			ut_a(!trx->lra_arr2);
+		}
+	}
+}
+
 /****************************************************************//**
 Creates and initializes a transaction object. It must be explicitly
 started with trx_start_if_not_started() before using it. The default
@@ -103,7 +347,7 @@ trx_create(void)
 	mem_heap_t*	heap;
 	ib_alloc_t*	heap_alloc;
 
-	trx = static_cast<trx_t*>(mem_zalloc(sizeof(*trx)));
+	trx = trx_allocate();
 
 	mutex_create(trx_mutex_key, &trx->mutex, SYNC_TRX);
 
@@ -116,6 +360,8 @@ trx_create(void)
 	trx->no = TRX_ID_MAX;
 
 	trx->support_xa = TRUE;
+
+	trx->fake_changes = FALSE;
 
 	trx->check_foreigns = TRUE;
 	trx->check_unique_secondary = TRUE;
@@ -133,11 +379,15 @@ trx_create(void)
 
 	trx->search_latch_timeout = BTR_SEA_TIMEOUT;
 
+	trx->always_enter_innodb = FALSE;
+
 	trx->global_read_view_heap = mem_heap_create(256);
 
 	trx->xid.formatID = -1;
 
 	trx->op_info = "";
+
+	memset(&trx->table_io_perf, 0, sizeof(trx->table_io_perf));
 
 	heap = mem_heap_create(sizeof(ib_vector_t) + sizeof(void*) * 8);
 	heap_alloc = ib_heap_allocator_create(heap);
@@ -151,6 +401,12 @@ trx_create(void)
 
 	trx->lock.table_locks = ib_vector_create(
 		heap_alloc, sizeof(void**), 32);
+
+	trx->lra_ht = NULL;
+	trx->lra_cur = NULL;
+	trx->lra_ht1 = NULL;
+	trx->lra_ht2 = NULL;
+	trx_lra_reset(trx, 0, 0, 0);
 
 	return(trx);
 }
@@ -193,6 +449,7 @@ trx_allocate_for_mysql(void)
 
 	return(trx);
 }
+
 
 /********************************************************************//**
 Frees a transaction object. */
@@ -240,8 +497,9 @@ trx_free(
 	}
 
 	mutex_free(&trx->mutex);
+	trx_lra_reset(trx, 0, 0, 0);
 
-	mem_free(trx);
+	trx_deallocate(trx);
 }
 
 /********************************************************************//**
@@ -979,6 +1237,7 @@ trx_write_serialisation_history(
 	mutex_exit(&rseg->mutex);
 
 	MONITOR_INC(MONITOR_TRX_COMMIT_UNDO);
+	srv_n_commit_with_undo++;
 
 	/* Update the latest MySQL binlog name and offset info
 	in trx sys header if MySQL binlogging is on or the database
@@ -990,9 +1249,11 @@ trx_write_serialisation_history(
 		trx_sys_update_mysql_binlog_offset(
 			trx->mysql_log_file_name,
 			trx->mysql_log_offset,
-			TRX_SYS_MYSQL_LOG_INFO, mtr);
+			TRX_SYS_MYSQL_LOG_INFO, mtr,
+			trx->mysql_gtid);
 
 		trx->mysql_log_file_name = NULL;
+		trx->mysql_gtid = NULL;
 	}
 }
 
@@ -1073,21 +1334,35 @@ static
 void
 trx_flush_log_if_needed_low(
 /*========================*/
-	lsn_t	lsn)	/*!< in: lsn up to which logs are to be
+	lsn_t	lsn,	/*!< in: lsn up to which logs are to be
 			flushed. */
+	ibool async) 	/*!< in: TRUE - don't sync log */
 {
-	switch (srv_flush_log_at_trx_commit) {
+	int flush_log_value = srv_flush_log_at_trx_commit;
+	if (async) {
+		flush_log_value = 2;
+	}
+
+	switch (flush_log_value) {
 	case 0:
 		/* Do nothing */
 		break;
 	case 1:
+	{
+		bool sync = srv_unix_file_flush_method != SRV_UNIX_NOSYNC;
+
 		/* Write the log and optionally flush it to disk */
 		log_write_up_to(lsn, LOG_WAIT_ONE_GROUP,
-				srv_unix_file_flush_method != SRV_UNIX_NOSYNC);
+				sync,
+				sync ? LOG_WRITE_FROM_COMMIT_SYNC :
+				       LOG_WRITE_FROM_COMMIT_ASYNC
+				);
 		break;
+	}
 	case 2:
 		/* Write the log but do not flush it to disk */
-		log_write_up_to(lsn, LOG_WAIT_ONE_GROUP, FALSE);
+		log_write_up_to(lsn, LOG_WAIT_ONE_GROUP, FALSE,
+				LOG_WRITE_FROM_COMMIT_ASYNC);
 
 		break;
 	default:
@@ -1104,10 +1379,11 @@ trx_flush_log_if_needed(
 /*====================*/
 	lsn_t	lsn,	/*!< in: lsn up to which logs are to be
 			flushed. */
-	trx_t*	trx)	/*!< in/out: transaction */
+	trx_t*	trx,	/*!< in/out: transaction */
+	ibool async)    /*!< in: TRUE - don't sync log */
 {
 	trx->op_info = "flushing log";
-	trx_flush_log_if_needed_low(lsn);
+	trx_flush_log_if_needed_low(lsn, async);
 	trx->op_info = "";
 }
 
@@ -1118,9 +1394,10 @@ void
 trx_commit_in_memory(
 /*=================*/
 	trx_t*	trx,	/*!< in/out: transaction */
-	lsn_t	lsn)	/*!< in: log sequence number of the mini-transaction
+	lsn_t	lsn,	/*!< in: log sequence number of the mini-transaction
 			commit of trx_write_serialisation_history(), or 0
 			if the transaction did not modify anything */
+	ibool	for_commit)	/*!< in: for rollback when FALSE */
 {
 	trx->must_flush_log_later = FALSE;
 
@@ -1152,6 +1429,9 @@ trx_commit_in_memory(
 		read_view_remove(trx->global_read_view, false);
 
 		MONITOR_INC(MONITOR_TRX_NL_RO_COMMIT);
+		if(for_commit) {
+			srv_n_commit_all++;
+		}
 	} else {
 		lock_trx_release_locks(trx);
 
@@ -1168,10 +1448,16 @@ trx_commit_in_memory(
 			UT_LIST_REMOVE(trx_list, trx_sys->ro_trx_list, trx);
 			ut_d(trx->in_ro_trx_list = FALSE);
 			MONITOR_INC(MONITOR_TRX_RO_COMMIT);
+			if(for_commit) {
+				srv_n_commit_all++;
+			}
 		} else {
 			UT_LIST_REMOVE(trx_list, trx_sys->rw_trx_list, trx);
 			ut_d(trx->in_rw_trx_list = FALSE);
 			MONITOR_INC(MONITOR_TRX_RW_COMMIT);
+			if(for_commit) {
+				srv_n_commit_all++;
+			}
 		}
 
 		/* If this transaction came from trx_allocate_for_mysql(),
@@ -1242,7 +1528,7 @@ trx_commit_in_memory(
 			   == HA_IGNORE_DURABILITY) {
 			/* Do nothing */
 		} else {
-			trx_flush_log_if_needed(lsn, trx);
+			trx_flush_log_if_needed(lsn, trx, false);
 		}
 
 		trx->commit_lsn = lsn;
@@ -1295,8 +1581,9 @@ void
 trx_commit_low(
 /*===========*/
 	trx_t*	trx,	/*!< in/out: transaction */
-	mtr_t*	mtr)	/*!< in/out: mini-transaction (will be committed),
+	mtr_t*	mtr,	/*!< in/out: mini-transaction (will be committed),
 			or NULL if trx made no modifications */
+	ibool	for_commit)	/*!< in: for rollback when FALSE */
 {
 	lsn_t	lsn;
 
@@ -1354,7 +1641,7 @@ trx_commit_low(
 		lsn = 0;
 	}
 
-	trx_commit_in_memory(trx, lsn);
+	trx_commit_in_memory(trx, lsn, for_commit);
 }
 
 /****************************************************************//**
@@ -1362,8 +1649,8 @@ Commits a transaction. */
 UNIV_INTERN
 void
 trx_commit(
-/*=======*/
-	trx_t*	trx)	/*!< in/out: transaction */
+	trx_t*	trx,		/*!< in/out: transaction */
+	ibool	for_commit)	/*!< in: for rollback when FALSE */
 {
 	mtr_t	local_mtr;
 	mtr_t*	mtr;
@@ -1375,7 +1662,7 @@ trx_commit(
 		mtr = NULL;
 	}
 
-	trx_commit_low(trx, mtr);
+	trx_commit_low(trx, mtr, for_commit);
 }
 
 /****************************************************************//**
@@ -1539,7 +1826,7 @@ trx_commit_step(
 
 		trx->lock.que_state = TRX_QUE_COMMITTING;
 
-		trx_commit(trx);
+		trx_commit(trx, TRUE);
 
 		ut_ad(trx->lock.wait_thr == NULL);
 
@@ -1593,7 +1880,7 @@ trx_commit_for_mysql(
 	case TRX_STATE_ACTIVE:
 	case TRX_STATE_PREPARED:
 		trx->op_info = "committing";
-		trx_commit(trx);
+		trx_commit(trx, TRUE);
 		MONITOR_DEC(MONITOR_TRX_ACTIVE);
 		trx->op_info = "";
 		return(DB_SUCCESS);
@@ -1611,7 +1898,8 @@ UNIV_INTERN
 void
 trx_commit_complete_for_mysql(
 /*==========================*/
-	trx_t*	trx)	/*!< in/out: transaction */
+	trx_t*	trx,	/*!< in/out: transaction */
+	ibool async)    /*!< in: TRUE - don't sync log */
 {
 	ut_a(trx);
 
@@ -1621,7 +1909,7 @@ trx_commit_complete_for_mysql(
 		return;
 	}
 
-	trx_flush_log_if_needed(trx->commit_lsn, trx);
+	trx_flush_log_if_needed(trx->commit_lsn, trx, async);
 
 	trx->must_flush_log_later = FALSE;
 }
@@ -1768,7 +2056,7 @@ state_ok:
 
 	if (trx->undo_no != 0) {
 		newline = TRUE;
-		fprintf(f, ", undo log entries "TRX_ID_FMT, trx->undo_no);
+		fprintf(f, ", undo log entries " TRX_ID_FMT, trx->undo_no);
 	}
 
 	if (newline) {
@@ -1919,7 +2207,8 @@ static
 void
 trx_prepare(
 /*========*/
-	trx_t*	trx)	/*!< in/out: transaction */
+	trx_t*	trx,	/*!< in/out: transaction */
+	ibool async)    /*!< in: TRUE - don't sync log */
 {
 	trx_rseg_t*	rseg;
 	lsn_t		lsn;
@@ -1995,7 +2284,7 @@ trx_prepare(
 		TODO: find out if MySQL holds some mutex when calling this.
 		That would spoil our group prepare algorithm. */
 
-		trx_flush_log_if_needed(lsn, trx);
+		trx_flush_log_if_needed(lsn, trx, async);
 	}
 }
 
@@ -2005,13 +2294,14 @@ UNIV_INTERN
 void
 trx_prepare_for_mysql(
 /*==================*/
-	trx_t*	trx)	/*!< in/out: trx handle */
+	trx_t*	trx,	/*!< in/out: trx handle */
+	ibool async)    /*!< in: TRUE - don't sync log */
 {
 	trx_start_if_not_started_xa(trx);
 
 	trx->op_info = "preparing";
 
-	trx_prepare(trx);
+	trx_prepare(trx, async);
 
 	trx->op_info = "";
 }
@@ -2067,7 +2357,7 @@ trx_recover_for_mysql(
 			ut_print_timestamp(stderr);
 			fprintf(stderr,
 				"  InnoDB: Transaction contains changes"
-				" to "TRX_ID_FMT" rows\n",
+				" to " TRX_ID_FMT " rows\n",
 				trx->undo_no);
 
 			count++;
@@ -2187,7 +2477,12 @@ trx_start_if_not_started_xa_low(
 		scenario where some undo generated by a transaction,
 		has XA stuff, and other undo, generated by the same
 		transaction, doesn't. */
+#ifdef XTRABACKUP
+		trx->support_xa = trx->mysql_thd
+		    ? thd_supports_xa(trx->mysql_thd) : FALSE;
+#else /* XTRABACKUP */
 		trx->support_xa = thd_supports_xa(trx->mysql_thd);
+#endif /* XTRABACKUP */
 
 		trx_start_low(trx);
 		/* fall through */

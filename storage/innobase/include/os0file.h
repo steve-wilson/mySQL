@@ -36,6 +36,7 @@ Created 10/21/1995 Heikki Tuuri
 #define os0file_h
 
 #include "univ.i"
+#include "mysqld.h"
 
 #ifndef __WIN__
 #include <dirent.h>
@@ -59,6 +60,16 @@ extern ulint	os_file_n_pending_pwrites;
 extern ulint	os_n_pending_reads;
 /** Number of pending write operations */
 extern ulint	os_n_pending_writes;
+
+/* Configurable variables for Histogram step sizes and units */
+extern char* innobase_histogram_step_size_async_read;
+extern char* innobase_histogram_step_size_async_write;
+extern char* innobase_histogram_step_size_sync_read;
+extern char* innobase_histogram_step_size_sync_write;
+extern char* innobase_histogram_step_size_log_write;
+extern char* innobase_histogram_step_size_double_write;
+extern char* innobase_histogram_step_size_file_flush_time;
+extern char* innobase_histogram_step_size_fsync;
 
 #ifdef __WIN__
 
@@ -156,6 +167,7 @@ enum os_file_create_t {
 #define OS_FILE_READ	10
 #define OS_FILE_WRITE	11
 
+#define OS_FILE_PAD	128
 #define OS_FILE_LOG	256	/* This can be ORed to type */
 /* @} */
 
@@ -184,6 +196,8 @@ enum os_file_create_t {
 				requests in a batch, and only after that
 				wake the i/o-handler thread; this has
 				effect only in simulated aio */
+#define OS_AIO_DOUBLE_WRITE	2048	/*!< ORed to mode in call to
+					os_aio for doublewrite writes */
 /* @} */
 
 #define OS_WIN31	1	/*!< Microsoft Windows 3.x */
@@ -201,6 +215,22 @@ enum os_file_create_t {
 extern ulint	os_n_file_reads;
 extern ulint	os_n_file_writes;
 extern ulint	os_n_fsyncs;
+extern ullint	os_fsync_freq;
+
+/** Seconds waiting for file flushes to finish */
+extern ulonglong	os_file_flush_time;
+
+/** Number of times InnoDB fsync took more than srv_io_slow_usecs */
+extern ulint	os_fsync_too_slow;
+
+/** Max time for InnoDB fsync */
+extern ulonglong	os_fsync_max_time;
+
+/** Number of async reads that waited longer than srv_io_old_usecs */
+extern ulint	os_async_read_old_ios;
+
+/** Number of async writes that waited longer than srv_io_old_usecs */
+extern ulint	os_async_write_old_ios;
 
 #ifdef UNIV_PFS_IO
 /* Keys to register InnoDB I/O with performance schema */
@@ -307,9 +337,11 @@ The wrapper functions have the prefix of "innodb_". */
 	pfs_os_file_close_func(file, __FILE__, __LINE__)
 
 # define os_aio(type, mode, name, file, buf, offset,			\
-		n, message1, message2)					\
+		n, message1, message2, primary_index_id, io_perf2, tab,	\
+		should_buffer) \
 	pfs_os_aio_func(type, mode, name, file, buf, offset,		\
-			n, message1, message2, __FILE__, __LINE__)
+		n, message1, message2, __FILE__, __LINE__, 		\
+		primary_index_id, io_perf2, tab, should_buffer)
 
 # define os_file_read(file, buf, offset, n)				\
 	pfs_os_file_read_func(file, buf, offset, n, __FILE__, __LINE__)
@@ -350,9 +382,12 @@ to original un-instrumented file I/O APIs */
 
 # define os_file_close(file)	os_file_close_func(file)
 
-# define os_aio(type, mode, name, file, buf, offset, n, message1, message2) \
+# define os_aio(type, mode, name, file, buf, offset, n,			\
+		message1, message2, primary_index_id, io_perf2, tab,	\
+		should_buffer)						\
 	os_aio_func(type, mode, name, file, buf, offset, n,		\
-		    message1, message2)
+		    message1, message2, primary_index_id, io_perf2, tab,\
+		    should_buffer)
 
 # define os_file_read(file, buf, offset, n)	\
 	os_file_read_func(file, buf, offset, n)
@@ -361,7 +396,7 @@ to original un-instrumented file I/O APIs */
 	os_file_read_no_error_handling_func(file, buf, offset, n)
 
 # define os_file_write(name, file, buf, offset, n)			\
-	os_file_write_func(name, file, buf, offset, n)
+	os_file_write_func(name, file, buf, offset, n, 0)
 
 # define os_file_flush(file)	os_file_flush_func(file)
 
@@ -408,6 +443,58 @@ typedef HANDLE	os_file_dir_t;	/*!< directory stream */
 #else
 typedef DIR*	os_file_dir_t;	/*!< directory stream */
 #endif
+
+/* Added so os_aio() can be called with one pointer for read and write
+performance counters. */
+struct os_io_perf2_struct {
+	my_io_perf_t	read;
+	my_io_perf_t	write;
+	my_io_perf_t	read_blob;
+	my_io_perf_t	read_primary;
+	my_io_perf_t	read_secondary;
+	page_stats_t	page_stats;
+};
+typedef struct os_io_perf2_struct os_io_perf2_t;
+
+/* Added so os_aio() can be called with one pointer for table
+performance counters. */
+struct os_io_table_perf_struct {
+	my_io_perf_t	read;			/*!< sync read */
+	my_io_perf_t	write;			/*!< sync write */
+	my_io_perf_t	read_blob;		/*!< sync blob read */
+	my_io_perf_t	read_primary;	/*!< sync read for primary index */
+	my_io_perf_t	read_secondary;/*!< sync read for secondary index */
+	longlong	index_inserts;		/*!< secondary index inserts */
+};
+typedef struct os_io_table_perf_struct os_io_table_perf_t;
+
+/** Performance statistics for async reads */
+extern my_io_perf_t	os_async_read_perf;
+
+/** Performance statistics for async writes */
+extern my_io_perf_t	os_async_write_perf;
+
+/** Performance statistics for sync reads */
+extern my_io_perf_t	os_sync_read_perf;
+
+/** Performance statistics for sync writes */
+extern my_io_perf_t	os_sync_write_perf;
+
+/** Performance statistics for log writes */
+extern my_io_perf_t	os_log_write_perf;
+
+/** Performance statistics for doublewrite writes */
+extern my_io_perf_t	os_double_write_perf;
+
+/**************************************************************************
+Prints IO statistics. */
+
+void
+os_io_perf_print(
+/*==============*/
+	FILE*		file,
+	my_io_perf_t*	perf,
+	ibool		newline);
 
 #ifdef __WIN__
 /***********************************************************************//**
@@ -521,9 +608,10 @@ os_file_create_simple_no_error_handling_func(
 	ibool*		success)/*!< out: TRUE if succeed, FALSE if error */
 	__attribute__((nonnull, warn_unused_result));
 /****************************************************************//**
-Tries to disable OS caching on an opened file descriptor. */
+Tries to disable OS caching on an opened file descriptor.
+@return !0 on error */
 UNIV_INTERN
-void
+int
 os_file_set_nocache(
 /*================*/
 	int		fd,		/*!< in: file descriptor to alter */
@@ -749,7 +837,20 @@ pfs_os_aio_func(
 				aio operation); ignored if mode is
                                 OS_AIO_SYNC */
 	const char*	src_file,/*!< in: file name where func invoked */
-	ulint		src_line);/*!< in: line where the func invoked */
+	ulint		src_line,/*!< in: line where the func invoked */
+	ib_uint64_t*	primary_index_id,/*!< in: index_id of primary index */
+	os_io_perf2_t*	io_perf2,/*!< in: per fil_space_t performance
+					counters */
+	os_io_table_perf_t* table_io_perf,
+				/*!< in/out: table IO stats counted for
+				IS.user_statistics only for sync read
+				and writes */
+	ibool		should_buffer);
+				/*!< in: Whether to buffer an aio request.
+				AIO read ahead uses this. If you plan to
+				use this parameter, make sure you remember
+				to call os_aio_linux_dispatch_read_array_submit
+				when you're ready to commit all your requests.*/
 /*******************************************************************//**
 NOTE! Please use the corresponding macro os_file_write(), not directly
 this function!
@@ -945,7 +1046,8 @@ os_file_write_func(
 	os_file_t	file,	/*!< in: handle to a file */
 	const void*	buf,	/*!< in: buffer from which to write */
 	os_offset_t	offset,	/*!< in: file offset where to write */
-	ulint		n);	/*!< in: number of bytes to write */
+	ulint		n,	/*!< in: number of bytes to write */
+	ulint		file_pad);	/*!< in: none-zero if pad log write */
 /*******************************************************************//**
 Check the existence and type of the given file.
 @return	TRUE if call succeeded */
@@ -1108,10 +1210,22 @@ os_aio_func(
 				(can be used to identify a completed
 				aio operation); ignored if mode is
 				OS_AIO_SYNC */
-	void*		message2);/*!< in: message for the aio handler
+	void*		message2,/*!< in: message for the aio handler
 				(can be used to identify a completed
 				aio operation); ignored if mode is
 				OS_AIO_SYNC */
+	ib_uint64_t*	primary_index_id,/*!< in: index_id of primary index */
+	os_io_perf2_t*	io_perf2,/*!< in: per fil_space_t performance
+				counters */
+	os_io_table_perf_t* table_io_perf,
+				/*!< in/out: table IO stats counted for
+				IS.user_statistics only for sync read
+				and writes */
+	ibool	should_buffer);	/*!< in: Whether to buffer an aio request.
+				AIO read ahead uses this. If you plan to
+				use this parameter, make sure you remember
+				to call os_aio_linux_dispatch_read_array_submit
+				when you're ready to commit all your requests.*/
 /************************************************************************//**
 Wakes up all async i/o threads so that they know to exit themselves in
 shutdown. */
@@ -1275,6 +1389,12 @@ os_aio_linux_handle(
 				parameters are valid and can be used to
 				restart the operation. */
 	ulint*	type);		/*!< out: OS_FILE_WRITE or ..._READ */
+/*******************************************************************//**
+Submit buffered AIO requests on the given segment to the kernel.
+@return	TRUE on success. */
+UNIV_INTERN
+ibool
+os_aio_linux_dispatch_read_array_submit();
 #endif /* LINUX_NATIVE_AIO */
 
 #ifndef UNIV_NONINL

@@ -565,6 +565,7 @@ lock_sec_rec_cons_read_sees(
 	const read_view_t*	view)	/*!< in: consistent read view */
 {
 	trx_id_t	max_trx_id;
+	bool		result;
 
 	ut_ad(page_rec_is_user_rec(rec));
 
@@ -579,7 +580,12 @@ lock_sec_rec_cons_read_sees(
 	max_trx_id = page_get_max_trx_id(page_align(rec));
 	ut_ad(max_trx_id);
 
-	return(max_trx_id < view->up_limit_id);
+	result = (max_trx_id < view->up_limit_id);
+
+	srv_sec_rec_read_check++;
+	srv_sec_rec_read_sees += result;
+
+	return result;
 }
 
 /*********************************************************************//**
@@ -1918,28 +1924,31 @@ lock_rec_enqueue_waiting(
 	its state can only be changed by this thread, which is
 	currently associated with the transaction. */
 
-	trx_mutex_exit(trx);
+	if (srv_deadlock_detect) {
 
-	victim_trx_id = lock_deadlock_check_and_resolve(lock, trx);
+		trx_mutex_exit(trx);
 
-	trx_mutex_enter(trx);
+		victim_trx_id = lock_deadlock_check_and_resolve(lock, trx);
 
-	if (victim_trx_id != 0) {
+		trx_mutex_enter(trx);
 
-		ut_ad(victim_trx_id == trx->id);
+		if (victim_trx_id != 0) {
 
-		lock_reset_lock_and_trx_wait(lock);
-		lock_rec_reset_nth_bit(lock, heap_no);
+			ut_ad(victim_trx_id == trx->id);
 
-		return(DB_DEADLOCK);
+			lock_reset_lock_and_trx_wait(lock);
+			lock_rec_reset_nth_bit(lock, heap_no);
 
-	} else if (trx->lock.wait_lock == NULL) {
+			return(DB_DEADLOCK);
 
-		/* If there was a deadlock but we chose another
-		transaction as a victim, it is possible that we
-		already have the lock now granted! */
+		} else if (trx->lock.wait_lock == NULL) {
 
-		return(DB_SUCCESS_LOCKED_REC);
+			/* If there was a deadlock but we chose another
+			transaction as a victim, it is possible that we
+			already have the lock now granted! */
+
+			return(DB_SUCCESS_LOCKED_REC);
+		}
 	}
 
 	trx->lock.que_state = TRX_QUE_LOCK_WAIT;
@@ -3261,6 +3270,47 @@ lock_update_merge_left(
 }
 
 /*************************************************************//**
+Updates the lock table when a page is split and merged to
+two pages. */
+UNIV_INTERN
+void
+lock_update_split_and_merge(
+	const buf_block_t* left_block,	/*!< in: left page to which merged */
+	const rec_t* orig_pred,		/*!< in: original predecessor of
+					supremum on the left page before merge*/
+	const buf_block_t* right_block)	/*!< in: right page from which merged */
+{
+	const rec_t* left_next_rec;
+
+	ut_a(left_block && right_block);
+	ut_a(orig_pred);
+
+	lock_mutex_enter();
+
+	left_next_rec = page_rec_get_next_const(orig_pred);
+
+	/* Inherit the locks on the supremum of the left page to the
+	first record which was moved from the right page */
+	lock_rec_inherit_to_gap(
+		left_block, left_block,
+		page_rec_get_heap_no(left_next_rec),
+		PAGE_HEAP_NO_SUPREMUM);
+
+	/* Reset the locks on the supremum of the left page,
+	releasing waiting transactions */
+	lock_rec_reset_and_release_wait(left_block,
+					PAGE_HEAP_NO_SUPREMUM);
+
+	/* Inherit the locks to the supremum of the left page from the
+	successor of the infimum on the right page */
+	lock_rec_inherit_to_gap(left_block, right_block,
+				PAGE_HEAP_NO_SUPREMUM,
+				lock_get_min_heap_no(right_block));
+
+	lock_mutex_exit();
+}
+
+/*************************************************************//**
 Resets the original locks on heir and replaces them with gap type locks
 inherited from rec. */
 UNIV_INTERN
@@ -3488,6 +3538,8 @@ lock_deadlock_start_print()
 {
 	ut_ad(lock_mutex_own());
 	ut_ad(!srv_read_only_mode);
+
+	srv_lock_deadlocks++;
 
 	rewind(lock_latest_err_file);
 	ut_print_timestamp(lock_latest_err_file);
@@ -4392,7 +4444,9 @@ lock_table(
 	ut_a(flags == 0);
 
 	trx = thr_get_trx(thr);
-
+	if (UNIV_UNLIKELY(trx->fake_changes) && mode == LOCK_IX) {
+		mode = LOCK_IS;
+	}
 	/* Look for equal or stronger locks the same trx already
 	has on the table. No need to acquire the lock mutex here
 	because only this transacton can add/access table locks
@@ -5206,6 +5260,18 @@ lock_print_info_summary(
 		"History list length %lu\n",
 		(ulong) trx_sys->rseg_history_len);
 
+	fprintf(file,
+		"Lock stats: %lu deadlocks, %lu lock wait timeouts\n",
+		srv_lock_deadlocks, srv_lock_wait_timeouts);
+
+	fprintf(file,
+		"Commits: %lu all, %lu with undo\n",
+		srv_n_commit_all, srv_n_commit_with_undo);
+
+	fprintf(file,
+		"Rollback: %lu total, %lu partial\n",
+		srv_n_rollback_total, srv_n_rollback_partial);
+
 #ifdef PRINT_NUM_OF_LOCK_STRUCTS
 	fprintf(file,
 		"Total number of lock structs in row lock hash table %lu\n",
@@ -5909,6 +5975,10 @@ lock_rec_insert_check_and_lock(
 	}
 
 	trx = thr_get_trx(thr);
+	if (UNIV_UNLIKELY(trx->fake_changes)) {
+		return(DB_SUCCESS);
+	}
+
 	next_rec = page_rec_get_next_const(rec);
 	next_rec_heap_no = page_rec_get_heap_no(next_rec);
 
@@ -6119,6 +6189,10 @@ lock_clust_rec_modify_check_and_lock(
 		return(DB_SUCCESS);
 	}
 
+	if (thr && UNIV_UNLIKELY(thr_get_trx(thr)->fake_changes)) {
+		return(DB_SUCCESS);
+	}
+
 	heap_no = rec_offs_comp(offsets)
 		? rec_get_heap_no_new(rec)
 		: rec_get_heap_no_old(rec);
@@ -6178,6 +6252,10 @@ lock_sec_rec_modify_check_and_lock(
 
 	if (flags & BTR_NO_LOCKING_FLAG) {
 
+		return(DB_SUCCESS);
+	}
+
+	if (thr && UNIV_UNLIKELY(thr_get_trx(thr)->fake_changes)) {
 		return(DB_SUCCESS);
 	}
 
@@ -6274,6 +6352,18 @@ lock_sec_rec_read_check_and_lock(
 		return(DB_SUCCESS);
 	}
 
+	if (!srv_fake_changes_locks)
+	{
+		if (thr && UNIV_UNLIKELY(thr_get_trx(thr)->fake_changes)) {
+			return(DB_SUCCESS);
+		}
+	} else {
+		if (thr && UNIV_UNLIKELY(thr_get_trx(thr)->fake_changes)
+		    && mode == LOCK_X) {
+			mode = LOCK_S;
+		}
+	}
+
 	heap_no = page_rec_get_heap_no(rec);
 
 	/* Some transaction may have an implicit x-lock on the record only
@@ -6351,6 +6441,19 @@ lock_clust_rec_read_check_and_lock(
 
 		return(DB_SUCCESS);
 	}
+
+	if (!srv_fake_changes_locks)
+	{
+		if (thr && UNIV_UNLIKELY(thr_get_trx(thr)->fake_changes)) {
+			return(DB_SUCCESS);
+		}
+	} else {
+		if (thr && UNIV_UNLIKELY(thr_get_trx(thr)->fake_changes)
+		    && mode == LOCK_X) {
+			mode = LOCK_S;
+		}
+	}
+
 
 	heap_no = page_rec_get_heap_no(rec);
 

@@ -966,8 +966,8 @@ bool mysqld_show_create_db(THD *thd, char *dbname,
   if (test_all_bits(sctx->master_access, DB_ACLS))
     db_access=DB_ACLS;
   else
-    db_access= (acl_get(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
-                        sctx->priv_user, dbname, 0) | sctx->master_access);
+    db_access= (acl_get(sctx->host, sctx->ip, sctx->priv_user, dbname, 0) |
+		sctx->master_access);
   if (!(db_access & DB_ACLS) && check_grant_db(thd,dbname))
   {
     my_error(ER_DBACCESS_DENIED_ERROR, MYF(0),
@@ -1998,6 +1998,7 @@ public:
   uint   command;
   const char *user,*host,*db,*proc_info,*state_info;
   CSET_STRING query_string;
+  ulong rows_examined, rows_sent;
 };
 
 // For sorting by thread_id.
@@ -2046,7 +2047,7 @@ void mysqld_list_processes(THD *thd,const char *user, bool verbose)
   DBUG_ENTER("mysqld_list_processes");
 
   field_list.push_back(new Item_int(NAME_STRING("Id"), 0, MY_INT64_NUM_DECIMAL_DIGITS));
-  field_list.push_back(new Item_empty_string("User",16));
+  field_list.push_back(new Item_empty_string("User",USERNAME_CHAR_LENGTH));
   field_list.push_back(new Item_empty_string("Host",LIST_PROCESS_HOST_LEN));
   field_list.push_back(field=new Item_empty_string("db",NAME_CHAR_LEN));
   field->maybe_null=1;
@@ -2057,6 +2058,10 @@ void mysqld_list_processes(THD *thd,const char *user, bool verbose)
   field->maybe_null=1;
   field_list.push_back(field=new Item_empty_string("Info",max_query_length));
   field->maybe_null=1;
+  field_list.push_back(new Item_return_int("Rows examined",
+        MY_INT32_NUM_DECIMAL_DIGITS, MYSQL_TYPE_LONG));
+  field_list.push_back(new Item_return_int("Rows sent",
+        MY_INT32_NUM_DECIMAL_DIGITS, MYSQL_TYPE_LONG));
   if (protocol->send_result_set_metadata(&field_list,
                             Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
     DBUG_VOID_RETURN;
@@ -2081,8 +2086,8 @@ void mysqld_list_processes(THD *thd,const char *user, bool verbose)
         thd_info->user= thd->strdup(tmp_sctx->user ? tmp_sctx->user :
                                     (tmp->system_thread ?
                                      "system user" : "unauthenticated user"));
-	if (tmp->peer_port && (tmp_sctx->get_host()->length() ||
-            tmp_sctx->get_ip()->length()) && thd->security_ctx->host_or_ip[0])
+	if (tmp->peer_port && (tmp_sctx->host || tmp_sctx->ip) &&
+            thd->security_ctx->host_or_ip[0])
 	{
 	  if ((thd_info->host= (char*) thd->alloc(LIST_PROCESS_HOST_LEN+1)))
 	    my_snprintf((char *) thd_info->host, LIST_PROCESS_HOST_LEN,
@@ -2091,12 +2096,11 @@ void mysqld_list_processes(THD *thd,const char *user, bool verbose)
 	else
 	  thd_info->host= thd->strdup(tmp_sctx->host_or_ip[0] ? 
                                       tmp_sctx->host_or_ip : 
-                                      tmp_sctx->get_host()->length() ?
-                                      tmp_sctx->get_host()->ptr() : "");
+                                      tmp_sctx->host ? tmp_sctx->host : "");
+        if ((thd_info->db=tmp->db))             // Safe test
+          thd_info->db=thd->strdup(thd_info->db);
         thd_info->command=(int) tmp->get_command();
         mysql_mutex_lock(&tmp->LOCK_thd_data);
-        if ((thd_info->db= tmp->db))             // Safe test
-          thd_info->db= thd->strdup(thd_info->db);
         if ((mysys_var= tmp->mysys_var))
           mysql_mutex_lock(&mysys_var->mutex);
         thd_info->proc_info= (char*) (tmp->killed == THD::KILL_CONNECTION? "Killed" : 0);
@@ -2104,6 +2108,8 @@ void mysqld_list_processes(THD *thd,const char *user, bool verbose)
         if (mysys_var)
           mysql_mutex_unlock(&mysys_var->mutex);
 
+        thd_info->rows_examined= tmp->status_var.rows_examined;
+        thd_info->rows_sent= tmp->status_var.rows_sent;
         /* Lock THD mutex that protects its data when looking at it. */
         if (tmp->query())
         {
@@ -2144,6 +2150,8 @@ void mysqld_list_processes(THD *thd,const char *user, bool verbose)
     protocol->store(thd_info->state_info, system_charset_info);
     protocol->store(thd_info->query_string.str(),
                     thd_info->query_string.charset());
+    protocol->store_long((longlong) thd_info->rows_examined);
+    protocol->store_long((longlong) thd_info->rows_sent);
     if (protocol->write())
       break; /* purecov: inspected */
   }
@@ -2172,7 +2180,7 @@ int fill_schema_processlist(THD* thd, TABLE_LIST* tables, Item* cond)
       THD* tmp= *it;
       Security_context *tmp_sctx= tmp->security_ctx;
       struct st_my_thread_var *mysys_var;
-      const char *val, *db;
+      const char *val;
 
       if ((!tmp->vio_ok() && !tmp->system_thread) ||
           (user && (!tmp_sctx->user || strcmp(tmp_sctx->user, user))))
@@ -2187,8 +2195,8 @@ int fill_schema_processlist(THD* thd, TABLE_LIST* tables, Item* cond)
             (tmp->system_thread ? "system user" : "unauthenticated user");
       table->field[1]->store(val, strlen(val), cs);
       /* HOST */
-      if (tmp->peer_port && (tmp_sctx->get_host()->length() ||
-          tmp_sctx->get_ip()->length()) && thd->security_ctx->host_or_ip[0])
+      if (tmp->peer_port && (tmp_sctx->host || tmp_sctx->ip) &&
+          thd->security_ctx->host_or_ip[0])
       {
         char host[LIST_PROCESS_HOST_LEN + 1];
         my_snprintf(host, LIST_PROCESS_HOST_LEN, "%s:%u",
@@ -2199,13 +2207,13 @@ int fill_schema_processlist(THD* thd, TABLE_LIST* tables, Item* cond)
         table->field[2]->store(tmp_sctx->host_or_ip,
                                strlen(tmp_sctx->host_or_ip), cs);
       /* DB */
-      mysql_mutex_lock(&tmp->LOCK_thd_data);
-      if ((db= tmp->db))
+      if (tmp->db)
       {
-        table->field[3]->store(db, strlen(db), cs);
+        table->field[3]->store(tmp->db, strlen(tmp->db), cs);
         table->field[3]->set_notnull();
       }
 
+      mysql_mutex_lock(&tmp->LOCK_thd_data);
       if ((mysys_var= tmp->mysys_var))
         mysql_mutex_lock(&mysys_var->mutex);
       /* COMMAND */
@@ -2352,6 +2360,8 @@ void reset_status_vars()
     /* Note that SHOW_LONG_NOFLUSH variables are not reset */
     if (ptr->type == SHOW_LONG || ptr->type == SHOW_SIGNED_LONG)
       *(ulong*) ptr->value= 0;
+    else if (ptr->type == SHOW_TIMER)
+      *(ulonglong*) ptr->value= 0;
   }  
 }
 
@@ -2520,6 +2530,15 @@ static bool show_status_array(THD *thd, const char *wild,
         case SHOW_DOUBLE:
           /* 6 is the default precision for '%f' in sprintf() */
           end= buff + my_fcvt(*(double *) value, 6, buff, NULL);
+          break;
+        case SHOW_TIMER_STATUS:
+          value= ((char *) status_var + (ulong) value);
+          /* fall through */
+        case SHOW_TIMER:
+          { /* 6 is the default precision for '%f' in sprintf() */
+            double tmp_val = my_timer_to_seconds(*(longlong*) value);
+            end= buff + my_fcvt(tmp_val, 6, buff, NULL);
+          }
           break;
         case SHOW_LONG_STATUS:
           value= ((char *) status_var + (ulong) value);
@@ -4003,8 +4022,7 @@ int get_all_tables(THD *thd, TABLE_LIST *tables, Item *cond)
                        &thd->col_access, NULL, 0, 1) ||
           (!thd->col_access && check_grant_db(thd, db_name->str))) ||
         sctx->master_access & (DB_ACLS | SHOW_DB_ACL) ||
-        acl_get(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
-                sctx->priv_user, db_name->str, 0))
+        acl_get(sctx->host, sctx->ip, sctx->priv_user, db_name->str, 0))
 #endif
     {
       List<LEX_STRING> table_names;
@@ -4175,8 +4193,7 @@ int fill_schema_schemata(THD *thd, TABLE_LIST *tables, Item *cond)
     }
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
     if (sctx->master_access & (DB_ACLS | SHOW_DB_ACL) ||
-	acl_get(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
-                sctx->priv_user, db_name->str, 0) ||
+	acl_get(sctx->host, sctx->ip, sctx->priv_user, db_name->str, 0) ||
 	!check_grant_db(thd, db_name->str))
 #endif
     {
@@ -6505,20 +6522,14 @@ int fill_status(THD *thd, TABLE_LIST *tables, Item *cond)
     tmp1= &thd->status_var;
   }
 
-  /*
-    Avoid recursive acquisition of LOCK_status in cases when WHERE clause
-    represented by "cond" contains subquery on I_S.SESSION/GLOBAL_STATUS.
-  */
-  if (thd->fill_status_recursion_level++ == 0) 
-    mysql_mutex_lock(&LOCK_status);
+  mysql_mutex_lock(&LOCK_status);
   if (option_type == OPT_GLOBAL)
     calc_sum_of_all_status(&tmp);
   res= show_status_array(thd, wild,
                          (SHOW_VAR *)all_status_vars.buffer,
                          option_type, tmp1, "", tables->table,
                          upper_case_names, cond);
-  if (thd->fill_status_recursion_level-- == 1) 
-    mysql_mutex_unlock(&LOCK_status);
+  mysql_mutex_unlock(&LOCK_status);
   DBUG_RETURN(res);
 }
 
@@ -7800,7 +7811,8 @@ ST_FIELD_INFO variables_fields_info[]=
 ST_FIELD_INFO processlist_fields_info[]=
 {
   {"ID", 21, MYSQL_TYPE_LONGLONG, 0, MY_I_S_UNSIGNED, "Id", SKIP_OPEN_TABLE},
-  {"USER", 16, MYSQL_TYPE_STRING, 0, 0, "User", SKIP_OPEN_TABLE},
+  {"USER", USERNAME_CHAR_LENGTH, MYSQL_TYPE_STRING, 0, 0, "User",
+   SKIP_OPEN_TABLE},
   {"HOST", LIST_PROCESS_HOST_LEN,  MYSQL_TYPE_STRING, 0, 0, "Host",
    SKIP_OPEN_TABLE},
   {"DB", NAME_CHAR_LEN, MYSQL_TYPE_STRING, 0, 1, "Db", SKIP_OPEN_TABLE},
@@ -8006,6 +8018,8 @@ ST_SCHEMA_TABLE schema_tables[]=
    fill_status, make_old_format, 0, 0, -1, 0, 0},
   {"GLOBAL_VARIABLES", variables_fields_info, create_schema_table,
    fill_variables, make_old_format, 0, 0, -1, 0, 0},
+  {"INDEX_STATISTICS", index_stats_fields_info, create_schema_table,
+    fill_index_stats, NULL, NULL, -1, -1, false, 0},
   {"KEY_COLUMN_USAGE", key_column_usage_fields_info, create_schema_table,
    get_all_tables, 0, get_schema_key_column_usage_record, 4, 5, 0,
    OPTIMIZE_I_S_TABLE|OPEN_TABLE_ONLY},
@@ -8060,11 +8074,19 @@ ST_SCHEMA_TABLE schema_tables[]=
    get_all_tables, make_table_names_old_format, 0, 1, 2, 1, 0},
   {"TABLE_PRIVILEGES", table_privileges_fields_info, create_schema_table,
    fill_schema_table_privileges, 0, 0, -1, -1, 0, 0},
+  {"TABLE_STATISTICS", table_stats_fields_info, create_schema_table,
+   fill_table_stats, NULL, NULL, -1, -1, false, 0},
+  {"DB_STATISTICS", db_stats_fields_info, create_schema_table,
+   fill_db_stats, NULL, NULL, -1, -1, false, 0},
   {"TRIGGERS", triggers_fields_info, create_schema_table,
    get_all_tables, make_old_format, get_schema_triggers_record, 5, 6, 0,
    OPEN_TRIGGER_ONLY|OPTIMIZE_I_S_TABLE},
   {"USER_PRIVILEGES", user_privileges_fields_info, create_schema_table, 
    fill_schema_user_privileges, 0, 0, -1, -1, 0, 0},
+#ifndef EMBEDDED_LIBRARY
+  {"USER_STATISTICS", user_stats_fields_info, create_schema_table,
+   fill_user_stats, NULL, NULL, -1, -1, false, 0},
+#endif
   {"VARIABLES", variables_fields_info, create_schema_table, fill_variables,
    make_old_format, 0, 0, -1, 1, 0},
   {"VIEWS", view_fields_info, create_schema_table, 

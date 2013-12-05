@@ -23,7 +23,7 @@
 #define HOSTNAME_LENGTH 60
 #define SYSTEM_CHARSET_MBMAXLEN 3
 #define NAME_CHAR_LEN	64              /* Field/table name length */
-#define USERNAME_CHAR_LENGTH 16
+#define USERNAME_CHAR_LENGTH 32
 #define NAME_LEN                (NAME_CHAR_LEN*SYSTEM_CHARSET_MBMAXLEN)
 #define USERNAME_LENGTH         (USERNAME_CHAR_LENGTH*SYSTEM_CHARSET_MBMAXLEN)
 
@@ -153,6 +153,8 @@ enum enum_server_command
 #define REFRESH_DES_KEY_FILE	0x40000L
 #define REFRESH_USER_RESOURCES	0x80000L
 #define REFRESH_FOR_EXPORT      0x100000L /* FLUSH TABLES ... FOR EXPORT */
+
+#define REFRESH_STATISTICS	0x100000L /* Reset performance tables */
 
 #define CLIENT_LONG_PASSWORD	1	/* new more secure passwords */
 #define CLIENT_FOUND_ROWS	2	/* Found instead of affected rows */
@@ -299,8 +301,91 @@ enum enum_server_command
 #define NET_WRITE_TIMEOUT	60		/* Timeout on write */
 #define NET_WAIT_TIMEOUT	8*60*60		/* Wait for new query */
 
+/* More statuses for async operations. */
+
+/* Is the async operation still pending? */
+enum net_async_status_enum
+{
+  NET_ASYNC_COMPLETE = 20100,
+  NET_ASYNC_NOT_READY
+};
+typedef enum net_async_status_enum net_async_status;
+
+/* For an async operation, what we are waiting for, if anything. */
+enum net_async_operation_enum
+{
+  NET_ASYNC_OP_IDLE = 0,
+  NET_ASYNC_OP_READING = 20200,
+  NET_ASYNC_OP_WRITING,
+  NET_ASYNC_OP_COMPLETE
+};
+typedef enum net_async_operation_enum net_async_operation;
+
+/* Reading a packet is a multi-step process, so we have a state machine. */
+enum net_async_read_packet_state_enum
+{
+  NET_ASYNC_PACKET_READ_IDLE = 0,
+  NET_ASYNC_PACKET_READ_HEADER = 20300,
+  NET_ASYNC_PACKET_READ_BODY,
+  NET_ASYNC_PACKET_READ_COMPLETE
+};
+typedef enum net_async_read_packet_state_enum net_async_read_packet_state;
+
+/* As is reading a query result. */
+enum net_read_query_result_status_enum
+{
+  NET_ASYNC_READ_QUERY_RESULT_IDLE = 0,
+  NET_ASYNC_READ_QUERY_RESULT_FIELD_COUNT = 20240,
+  NET_ASYNC_READ_QUERY_RESULT_FIELD_INFO
+};
+typedef enum net_read_query_result_status_enum net_read_query_result_status;
+
+/* Sending a command involves the write as well as reading the status. */
+enum net_send_command_status_enum
+{
+  NET_ASYNC_SEND_COMMAND_IDLE = 0,
+  NET_ASYNC_SEND_COMMAND_WRITE_COMMAND = 20340,
+  NET_ASYNC_SEND_COMMAND_READ_STATUS = 20340
+};
+typedef enum net_send_command_status_enum net_send_command_status;
+
+enum net_async_block_state_enum
+{
+  NET_NONBLOCKING_CONNECT = 20130,
+  NET_NONBLOCKING_READ = 20140,
+  NET_NONBLOCKING_WRITE = 20150
+};
+typedef enum net_async_block_state_enum net_async_block_state;
+
 #define ONLY_KILL_QUERY         1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+  In order to avoid confusion about whether a timeout value is in
+  seconds or milliseconds, a timeout_t struct is used.  It simply tracks
+  milliseconds but this helps ensure type safety and clear intention
+  when converting for use in syscalls etc.
+*/
+
+typedef struct {
+  uint value_ms_;
+} timeout_t;
+
+timeout_t timeout_from_seconds(uint seconds);
+timeout_t timeout_from_millis(uint ms);
+timeout_t timeout_infinite();
+my_bool timeout_is_infinite(const timeout_t t);
+int timeout_is_nonzero(const timeout_t t);
+uint timeout_to_millis(const timeout_t t);
+// toSeconds rounds down.
+uint timeout_to_seconds(const timeout_t t);
+
+#ifdef __cplusplus
+}
+#endif
 
 struct st_vio;					/* Only C */
 typedef struct st_vio Vio;
@@ -312,6 +397,10 @@ typedef struct st_vio Vio;
 #define MAX_BIGINT_WIDTH        20      /* Max width for a LONGLONG */
 #define MAX_CHAR_WIDTH		255	/* Max length for a CHAR colum */
 #define MAX_BLOB_WIDTH		16777216	/* Default width for blob */
+
+  /* Constants when using compression */
+#define NET_HEADER_SIZE 4		/* standard header size */
+#define COMP_HEADER_SIZE 3		/* compression header extra size */
 
 typedef struct st_net {
 #if !defined(CHECK_EMBEDDED_DIFFERENCES) || !defined(EMBEDDED_LIBRARY)
@@ -326,7 +415,8 @@ typedef struct st_net {
   unsigned long remain_in_buf,length, buf_length, where_b;
   unsigned long max_packet,max_packet_size;
   unsigned int pkt_nr,compress_pkt_nr;
-  unsigned int write_timeout, read_timeout, retry_count;
+  timeout_t write_timeout, read_timeout;
+  uint retry_count;
   int fcntl;
   unsigned int *return_status;
   unsigned char reading_or_writing;
@@ -361,6 +451,50 @@ typedef struct st_net {
     to maintain the server internal instrumentation for the connection.
   */
   void *extension;
+  unsigned int receive_buffer_size;
+
+  /* Async MySQL extension fields here. */
+
+  /* The position in buff we continue reads from when data is next
+   * available */
+  unsigned char *cur_pos;
+
+  /* Blocking state */
+  net_async_block_state async_blocking_state;
+
+  /* Our current operation */
+
+  net_async_operation async_operation;
+
+  /* How many bytes we want to read */
+  size_t async_bytes_wanted;
+
+  /* Simple state to know if we're reading the first row, and
+   * command/query statuses */
+  my_bool read_rows_is_first_read;
+  net_send_command_status async_send_command_status;
+  net_read_query_result_status async_read_query_result_status;
+
+  /* State when waiting on an async read */
+  net_async_read_packet_state async_packet_read_state;
+  /* Size of the packet we're currently reading */
+  size_t async_packet_length;
+
+  /* Headers and vector for our async writes; see net_serv.c for
+   * detailed description */
+  unsigned char *async_write_headers;
+
+  struct iovec* async_write_vector;
+  size_t async_write_vector_size;
+  size_t async_write_vector_current;
+
+  unsigned char inline_async_write_header[NET_HEADER_SIZE + COMP_HEADER_SIZE + 1 + 1];
+  struct iovec inline_async_write_vector[3];
+
+  /* State for reading responses that are larger than MAX_PACKET_LENGTH */
+  ulong async_multipacket_read_saved_whereb;
+  ulong async_multipacket_read_total_len;
+  my_bool async_multipacket_read_started;
 } NET;
 
 
@@ -491,9 +625,20 @@ my_bool	net_write_command(NET *net,unsigned char command,
 my_bool net_write_packet(NET *net, const unsigned char *packet, size_t length);
 unsigned long my_net_read(NET *net);
 
+net_async_status
+my_net_write_nonblocking(NET *net, const unsigned char *packet, size_t len,
+                         my_bool* res);
+net_async_status net_write_command_nonblocking(
+  NET *net, unsigned char command,
+  const unsigned char *prefix, size_t prefix_len,
+  const unsigned char *packet, size_t packet_len,
+  my_bool* res);
+net_async_status my_net_read_nonblocking(NET *net, ulong* len_ptr,
+                                         ulong* complen_ptr);
+
 #ifdef MY_GLOBAL_INCLUDED
-void my_net_set_write_timeout(NET *net, uint timeout);
-void my_net_set_read_timeout(NET *net, uint timeout);
+void my_net_set_write_timeout(NET *net, const timeout_t timeout);
+void my_net_set_read_timeout(NET *net, const timeout_t timeout);
 #endif
 
 struct rand_struct {
@@ -538,10 +683,6 @@ typedef struct st_udf_init
   See Item_udf_func::update_used_tables ()
 */
 
-  /* Constants when using compression */
-#define NET_HEADER_SIZE 4		/* standard header size */
-#define COMP_HEADER_SIZE 3		/* compression header extra size */
-
   /* Prototypes to password functions */
 
 #ifdef __cplusplus
@@ -585,9 +726,9 @@ my_bool my_thread_init(void);
 void my_thread_end(void);
 
 #ifdef MY_GLOBAL_INCLUDED
-ulong STDCALL net_field_length(uchar **packet);
-my_ulonglong net_field_length_ll(uchar **packet);
-uchar *net_store_length(uchar *pkg, ulonglong length);
+ulong STDCALL net_field_length(unsigned char **packet);
+my_ulonglong net_field_length_ll(unsigned char **packet);
+unsigned char *net_store_length(unsigned char *pkg, ulonglong length);
 #endif
 
 #ifdef __cplusplus

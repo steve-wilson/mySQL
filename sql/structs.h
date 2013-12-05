@@ -22,9 +22,12 @@
 
 #include "sql_plugin.h"                         /* plugin_ref */
 #include "sql_const.h"                          /* MAX_REFLENGTH */
+#include "hyperloglog.h"               /* hyperloglog */
 #include "my_time.h"                   /* enum_mysql_timestamp_type */
 #include "thr_lock.h"                  /* thr_lock_type */
 #include "my_base.h"                   /* ha_rows, ha_key_alg */
+#include "mysql_com.h"                 /* NAME_LEN */
+#include "mysqld.h"                    /* my_io_perf */
 
 struct TABLE;
 class Field;
@@ -208,6 +211,90 @@ typedef struct user_resources {
   uint specified_limits;
 } USER_RESOURCES;
 
+#define USER_STATS_MAGIC 0x17171717
+
+/** Counts resources consumed per-user.
+    Data is exported via IS.user_statistics.
+*/
+typedef struct st_user_stats {
+  my_io_perf_t     io_perf_read;
+  my_io_perf_t     io_perf_read_blob;
+  my_io_perf_t     io_perf_read_primary;
+  my_io_perf_t     io_perf_read_secondary;
+  ulonglong bytes_received;
+  ulonglong bytes_sent;
+  ulonglong binlog_bytes_written;
+  ulonglong commands_ddl;
+  ulonglong commands_delete;
+  ulonglong commands_handler;
+  ulonglong commands_insert;
+  ulonglong commands_other;
+  ulonglong commands_select;
+  ulonglong commands_transaction;
+  ulonglong commands_update;
+  ulonglong connections_denied_max_global; // global limit exceeded
+  ulonglong connections_denied_max_user;   // per user limit exceeded
+  ulonglong connections_lost;              // closed on error
+  ulonglong connections_total;             // total conns created
+  ulonglong errors_access_denied;          // denied access to table or db
+  ulonglong errors_total;
+  ulonglong microseconds_wall;
+  ulonglong microseconds_ddl;
+  ulonglong microseconds_delete;
+  ulonglong microseconds_handler;
+  ulonglong microseconds_insert;
+  ulonglong microseconds_other;
+  ulonglong microseconds_select;
+  ulonglong microseconds_transaction;
+  ulonglong microseconds_update;
+  ulonglong queries_empty;
+  ulonglong relay_log_bytes_written;
+  ulonglong rows_deleted;
+  ulonglong rows_fetched;
+  ulonglong rows_inserted;
+  ulonglong rows_read;
+  ulonglong rows_updated;
+  ulonglong query_comment_bytes;
+
+  /* see variables of same name in ha_statistics */
+  ulonglong volatile rows_index_first;
+  ulonglong volatile rows_index_next;
+
+  ulonglong transactions_commit;
+  ulonglong transactions_rollback;
+
+  /* stats tracking for gtid_unsafe commands*/
+  uint n_gtid_unsafe_create_select;
+  uint n_gtid_unsafe_create_drop_temporary_table_in_transaction;
+  uint n_gtid_unsafe_non_transactional_table;
+
+  uint magic;
+
+  /* TODO(mcallaghan) -- failed_queries, disk IO, parse and records_in_range
+     seconds, slow queries. I also want to count connections that fail
+     authentication but the hash_user_connections key is (user,host) and when
+     auth fails you know which user/host the login provided but you don't know
+     which pair it wanted to use. Read the docs for how auth uses mysql.user
+     table for more details. When auth failure occurs mysqld doesn't have
+     a referenced to a USER_STATS entry. This probably requires another hash
+     table keyed only by the login name.
+     Others:
+       errors_lock_wait_timeout, errors_deadlock
+       queries_slow
+  */
+} USER_STATS;
+
+/*
+   Hack to provide stats for SQL replication slave as THD::user_connect is
+   not set for it. See get_user_stats.
+*/
+extern USER_STATS slave_user_stats;
+
+/*
+   Hack to provide stats for anything that doesn't have THD::user_connect except
+   the SQL slave.  See get_user_stats.
+*/
+extern USER_STATS other_user_stats;
 
 /*
   This structure is used for counting resources consumed and for checking
@@ -237,9 +324,96 @@ typedef struct  user_conn {
      per hour and total number of statements per hour for this account.
   */
   uint conn_per_hour, updates, questions;
+
   /* Maximum amount of resources which account is allowed to consume. */
   USER_RESOURCES user_resources;
+  /*
+    Counts resources consumed for this user.
+    Use thd_get_user_stats(THD*) rather than USER_CONN::user_stats directly
+  */
+  USER_STATS user_stats;
 } USER_CONN;
+
+typedef struct st_index_stats {
+  char name [NAME_LEN + 1];   /* [name] + '\0' */
+
+  ulonglong rows_inserted;   /* Number of rows inserted */
+  ulonglong rows_updated;    /* Number of rows updated */
+  ulonglong rows_deleted;    /* Number of rows deleted */
+  ulonglong rows_read;       /* Number of rows read for index of this table */
+  ulonglong rows_requested;  /* Number of row read attempts for an index of
+                                         this table.  This counts requests
+                                         that do not return a row. */
+  ulonglong rows_index_first;
+  ulonglong rows_index_next;
+
+  my_io_perf_t io_perf_read;          /* Read IO performance counters */
+
+  ulonglong n_pages;
+  ulonglong n_pages_freed;
+  ulonglong n_btr_compress;
+  ulonglong n_btr_compress_failure;
+  ulonglong n_page_split;
+} INDEX_STATS;
+
+/*
+ * Maximum number of indexes for which stats are collected.
+ * Tables that have more use st_table_stats::indexes[MAX_INDEX_STATS-1]
+ * for the extra indexes.
+ */
+#define MAX_INDEX_STATS 10
+
+typedef struct st_table_stats {
+  char db[NAME_LEN + 1];     /* [db] + '\0' */
+  char table[NAME_LEN + 1];  /* [table] + '\0' */
+  /* Hash table key, table->s->table_cache_key for the table */
+  char hash_key[NAME_LEN * 2 + 2];
+  int hash_key_len;          /* table->s->key_length for the table */
+
+  INDEX_STATS indexes[MAX_INDEX_STATS];
+  uint num_indexes;         /* min(#indexes on table , MAX_INDEX_STATS) */
+
+  ulonglong queries_used;    /* number of times used by a query */
+
+  ulonglong rows_inserted;   /* Number of rows inserted */
+  ulonglong rows_updated;    /* Number of rows updated */
+  ulonglong rows_deleted;    /* Number of rows deleted */
+  ulonglong rows_read;       /* Number of rows read for this table */
+  ulonglong rows_requested;  /* Number of row read attempts for
+                                         this table.  This counts requests
+                                         that do not return a row. */
+
+  comp_stat_t comp_stat;       /* Compression statistics */
+  page_stats_t page_stats;    /* per page type statistics */
+  /* See variables of same name in ha_statistics */
+  ulonglong rows_index_first;
+  ulonglong rows_index_next;
+
+  bool should_update; /* Set for partitioned tables so later partitions will
+                         increment the perf stats. Clear after collecting
+                         table stats. */
+  my_io_perf_t io_perf_read;          /* Read IO performance counters */
+  my_io_perf_t io_perf_write;         /* Write IO performance counters */
+  my_io_perf_t io_perf_read_blob;     /* Blob read IO performance counters */
+  my_io_perf_t io_perf_read_primary;    /* Read IO performance counters for
+                                           primary index */
+  my_io_perf_t io_perf_read_secondary;  /* Read IO performance counters for
+                                           secondary index */
+  ulonglong index_inserts;            /* Number of secondary index inserts. */
+  ulonglong queries_empty;  /* Number of empty queries, exclude joins */
+  ulonglong comment_bytes;  /* Number of bytes of comments */
+
+  int n_lock_wait; /* Number of lock waits */
+  int n_lock_wait_timeout; /* Number of lock wait timeouts */
+
+  const char* engine_name;
+} TABLE_STATS;
+
+typedef struct st_db_stats {
+  char db[NAME_LEN + 1];
+  hyperloglog_t hll;
+  unsigned char index;
+} DB_STATS;
 
 	/* Bits in form->update */
 #define REG_MAKE_DUPP		1	/* Make a copy of record when read */

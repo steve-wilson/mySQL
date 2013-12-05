@@ -1424,7 +1424,7 @@ void Item_func_additive_op::result_precision()
   subtraction of UNSIGNED BIGINT to return negative values.
 */
 
-void Item_func_minus::fix_length_and_dec()
+void Item_func_additive_op::fix_length_and_dec()
 {
   Item_num_op::fix_length_and_dec();
   if (unsigned_flag &&
@@ -5756,6 +5756,7 @@ void Item_func_get_system_var::fix_length_and_dec()
       fix_char_length(1);
       decimals=0;
       break;
+    case SHOW_TIMER:
     case SHOW_DOUBLE:
       unsigned_flag= FALSE;
       decimals= 6;
@@ -5791,6 +5792,7 @@ enum Item_result Item_func_get_system_var::result_type() const
     case SHOW_CHAR_PTR: 
     case SHOW_LEX_STRING:
       return STRING_RESULT;
+    case SHOW_TIMER:
     case SHOW_DOUBLE:
       return REAL_RESULT;
     default:
@@ -5811,6 +5813,7 @@ enum_field_types Item_func_get_system_var::field_type() const
     case SHOW_SIGNED_LONG:
     case SHOW_LONGLONG:
     case SHOW_HA_ROWS:
+    case SHOW_TIMER:
       return MYSQL_TYPE_LONGLONG;
     case SHOW_CHAR: 
     case SHOW_CHAR_PTR: 
@@ -5885,6 +5888,7 @@ longlong Item_func_get_system_var::val_int()
     case SHOW_HA_ROWS:  get_sys_var_safe (ha_rows);
     case SHOW_BOOL:     get_sys_var_safe (bool);
     case SHOW_MY_BOOL:  get_sys_var_safe (my_bool);
+    case SHOW_TIMER:
     case SHOW_DOUBLE:
       {
         double dval= val_real();
@@ -5991,6 +5995,7 @@ String* Item_func_get_system_var::val_str(String* str)
     case SHOW_MY_BOOL:
       str->set (val_int(), collation.collation);
       break;
+    case SHOW_TIMER:
     case SHOW_DOUBLE:
       str->set_real (val_real(), decimals, collation.collation);
       break;
@@ -6043,6 +6048,12 @@ double Item_func_get_system_var::val_real()
 
   switch (var->show_type())
   {
+    case SHOW_TIMER:
+      cached_dval= my_timer_to_seconds((ulonglong)(val_int()));
+      cache_present|= GET_SYS_VAR_CACHE_DOUBLE;
+      used_query_id= thd->query_id;
+      cached_null_value= null_value;
+      return cached_dval;
     case SHOW_DOUBLE:
       mysql_mutex_lock(&LOCK_global_system_variables);
       cached_dval= *(double*) var->value_ptr(thd, var_type, &component);
@@ -6217,7 +6228,6 @@ bool Item_func_match::fix_fields(THD *thd, Item **ref)
     return TRUE;
   }
 
-  bool allows_multi_table_search= true;
   const_item_cache=0;
   for (uint i=1 ; i < arg_count ; i++)
   {
@@ -6229,10 +6239,7 @@ bool Item_func_match::fix_fields(THD *thd, Item **ref)
       my_error(ER_WRONG_ARGUMENTS, MYF(0), "AGAINST");
       return TRUE;
     }
-    allows_multi_table_search &= 
-      allows_search_on_non_indexed_columns(((Item_field *)item)->field->table);
   }
-
   /*
     Check that all columns come from the same table.
     We've already checked that columns in MATCH are fields so
@@ -6241,7 +6248,7 @@ bool Item_func_match::fix_fields(THD *thd, Item **ref)
   if ((used_tables_cache & ~PARAM_TABLE_BIT) != item->used_tables())
     key=NO_SUCH_KEY;
 
-  if (key == NO_SUCH_KEY && !allows_multi_table_search)
+  if (key == NO_SUCH_KEY && !(flags & FT_BOOL))
   {
     my_error(ER_WRONG_ARGUMENTS,MYF(0),"MATCH");
     return TRUE;
@@ -6339,7 +6346,7 @@ bool Item_func_match::fix_index()
   }
 
 err:
-  if (allows_search_on_non_indexed_columns(table))
+  if (flags & FT_BOOL)
   {
     key=NO_SUCH_KEY;
     return 0;

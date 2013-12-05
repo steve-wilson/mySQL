@@ -25,8 +25,8 @@ SET(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_SOURCE_DIR}/cmake)
 
 # First, decide about build type (debug or release)
 # If custom compiler flags are set or cmake is invoked with -DCMAKE_BUILD_TYPE, 
-# respect user wishes and do not (re)define CMAKE_BUILD_TYPE. If WITH_DEBUG{_FULL} 
-# is given, set CMAKE_BUILD_TYPE = Debug. Otherwise, use Relwithdebinfo.
+# respect user wishes and do not (re)define CMAKE_BUILD_TYPE.
+# If unset, set CMAKE_BUILD_TYPE = RelWithDebInfo
 
 
 IF(DEFINED CMAKE_BUILD_TYPE)
@@ -50,11 +50,8 @@ IF(NOT DEFINED MANUFACTURER)
   MARK_AS_ADVANCED(MANUFACTURER)
 ENDIF()
 
-# We choose to provide WITH_DEBUG as alias to standard CMAKE_BUILD_TYPE=Debug
-# which turns out to be not trivial, as this involves synchronization 
-# between CMAKE_BUILD_TYPE and WITH_DEBUG. Besides, we have to deal with cases
-# where WITH_DEBUG is  reset from ON to OFF  and here we need to reset 
-# CMAKE_BUILD_TYPE to either none or default RelWithDebInfo
+# We choose NOT to provide WITH_DEBUG as "alias" to standard
+# CMAKE_BUILD_TYPE=Debug... because that just causes confusion
 
 SET(BUILDTYPE_DOCSTRING
  "Choose the type of build, options are: None(CMAKE_CXX_FLAGS or
@@ -66,23 +63,12 @@ IF(CMAKE_OSX_ARCHITECTURES MATCHES "i386")
 ENDIF()
 
 IF(WITH_DEBUG)
-  SET(CMAKE_BUILD_TYPE "Debug" CACHE STRING ${BUILDTYPE_DOCSTRING} FORCE)
-  SET(MYSQL_MAINTAINER_MODE ON CACHE BOOL
-      "MySQL maintainer-specific development environment")
-  IF(UNIX AND NOT APPLE)
-    # Compiling with PIC speeds up embedded build, on PIC sensitive systems 
-    # Predefine it to ON, in case user chooses to build embedded. 
-    SET(WITH_PIC ON CACHE BOOL "Compile with PIC")
-  ENDIF()
-  SET(OLD_WITH_DEBUG 1 CACHE INTERNAL "" FORCE)
-ELSEIF(NOT HAVE_CMAKE_BUILD_TYPE OR OLD_WITH_DEBUG)
-  IF(CUSTOM_C_FLAGS)
-    SET(CMAKE_BUILD_TYPE "" CACHE STRING ${BUILDTYPE_DOCSTRING} FORCE)
-  ELSE(CMAKE_BUILD_TYPE MATCHES "Debug" OR NOT HAVE_CMAKE_BUILD_TYPE)
-    SET(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING 
-       ${BUILDTYPE_DOCSTRING} FORCE)
-  ENDIF()
-  SET(OLD_WITH_DEBUG 0 CACHE INTERNAL "" FORCE)
+  MESSAGE(FATAL_ERROR "Option '-DWITH_DEBUG' is no longer supported.  Use '-DCMAKE_BUILD_TYPE=Debug' instead.")
+ENDIF()
+
+IF(NOT HAVE_CMAKE_BUILD_TYPE)
+  SET(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING
+      ${BUILDTYPE_DOCSTRING} FORCE)
 ENDIF()
 
 # Optionally set project name, e.g.
@@ -280,7 +266,7 @@ ENDIF()
 
 # Add safemutex for debug configurations, except on Windows
 # (safemutex has never worked on Windows)
-IF(WITH_DEBUG AND NOT WIN32 AND NOT WITH_INNODB_MEMCACHED)
+IF(NOT WIN32 AND NOT WITH_INNODB_MEMCACHED)
   FOREACH(LANG C CXX)
       SET(CMAKE_${LANG}_FLAGS_DEBUG
           "${CMAKE_${LANG}_FLAGS_DEBUG} -DSAFE_MUTEX")
@@ -321,8 +307,8 @@ INCLUDE_DIRECTORIES(${CMAKE_CURRENT_BINARY_DIR}/include)
 MYSQL_CHECK_ZLIB_WITH_COMPRESS()
 # Add bundled yassl/taocrypt or system openssl.
 MYSQL_CHECK_SSL()
-# Add system/bundled editline.
-MYSQL_CHECK_EDITLINE()
+# Find system readline.
+MYSQL_CHECK_READLINE()
 # Add libevent
 MYSQL_CHECK_LIBEVENT()
 
@@ -343,11 +329,25 @@ IF(MYSQL_MAINTAINER_MODE)
 ENDIF()
 
 IF(CMAKE_COMPILER_IS_GNUCXX)
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++0x")
+ENDIF()
+
+IF(CMAKE_COMPILER_IS_GNUCC)
+  SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=c99")
+ENDIF()
+
+IF(CMAKE_COMPILER_IS_GNUCXX)
   STRING(REGEX MATCH "-Werror"
     BUILD_WITH_WERROR ${CMAKE_CXX_FLAGS})
   IF(BUILD_WITH_WERROR)
     SET("COMPILE_FLAG_WERROR" 1)
   ENDIF()
+ENDIF()
+
+OPTION(WITH_ASAN "Use gcc address sanitizer" OFF)
+IF(WITH_ASAN)
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
+  SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
 ENDIF()
 
 IF(WITH_UNIT_TESTS)

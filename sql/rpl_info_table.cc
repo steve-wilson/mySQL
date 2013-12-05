@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -144,13 +144,8 @@ int Rpl_info_table::do_flush_info(const bool force)
 
   DBUG_ENTER("Rpl_info_table::do_flush_info");
 
-  if (!(force || (sync_period &&
-      ++(sync_counter) >= sync_period)))
-    DBUG_RETURN(0);
-
   THD *thd= access->create_thd();
 
-  sync_counter= 0;
   saved_mode= thd->variables.sql_mode;
   tmp_disable_binlog(thd);
 
@@ -307,7 +302,6 @@ int Rpl_info_table::do_reset_info(uint nparam,
   Open_tables_backup backup;
   Rpl_info_table *info= NULL;
   THD *thd= NULL;
-  enum enum_return_id scan_retval= FOUND_ID;
 
   DBUG_ENTER("Rpl_info_table::do_reset_info");
 
@@ -328,18 +322,15 @@ int Rpl_info_table::do_reset_info(uint nparam,
     goto end;
 
   /*
-    Delete all rows in the rpl_info table. We cannot use truncate() since it
-    is a non-transactional DDL operation.
+    Deletes a row in the rpl_info table.
   */
-  while ((scan_retval= info->access->scan_info(table, 1)) == FOUND_ID)
+  if ((error= table->file->truncate()))
   {
-    if ((error= table->file->ha_delete_row(table->record[0])))
-    {
-       table->file->print_error(error, MYF(0));
-       goto end;
-    }
+     table->file->print_error(error, MYF(0));
+     goto end;
   }
-  error= (scan_retval == ERROR_ID);
+
+  error= 0;
 
 end:
   /*
@@ -585,6 +576,11 @@ bool Rpl_info_table::do_set_info(const int pos, const Dynamic_ids *value)
   return FALSE;
 }
 
+bool Rpl_info_table::do_set_info(const char *format, va_list args)
+{
+  return FALSE;
+}
+
 bool Rpl_info_table::do_get_info(const int pos, char *value, const size_t size,
                                  const char *default_value)
 {
@@ -709,4 +705,16 @@ end:
   thd->variables.sql_mode= saved_mode;
   access->drop_thd(thd);
   DBUG_RETURN(error);
+}
+
+bool Rpl_info_table::do_need_write(bool force)
+{
+  // Need to write when forced or when we reached sync_period.
+  if (force ||
+      (sync_period && ++(sync_counter) >= sync_period))
+  {
+    sync_counter = 0;
+    return true;
+  }
+  return false;
 }

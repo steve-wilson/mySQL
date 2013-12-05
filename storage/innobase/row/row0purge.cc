@@ -187,6 +187,10 @@ func_exit:
 	return(success);
 }
 
+#ifdef UNIV_DEBUG
+extern my_bool row_lra_test;
+#endif
+
 /***********************************************************//**
 Removes a clustered index record if it has not been modified after the delete
 marking.
@@ -203,6 +207,11 @@ row_purge_remove_clust_if_poss(
 		return(true);
 	}
 
+#ifdef UNIV_DEBUG
+	while (row_lra_test) {
+		os_thread_sleep(300000);
+	}
+#endif
 	for (ulint n_tries = 0;
 	     n_tries < BTR_CUR_RETRY_DELETE_N_TIMES;
 	     n_tries++) {
@@ -724,6 +733,7 @@ row_purge_parse_undo_rec(
 
 	if (node->table == NULL) {
 		/* The table has been dropped: no need to do purge */
+		++srv_drop_purge_skip_row;
 		goto err_exit;
 	}
 

@@ -33,6 +33,7 @@ Created 10/25/1995 Heikki Tuuri
 #include "dict0types.h"
 #include "ut0byte.h"
 #include "os0file.h"
+#include "hash0hash.h"
 #ifndef UNIV_HOTBACKUP
 #include "sync0rw.h"
 #include "ibuf0types.h"
@@ -64,10 +65,15 @@ of the address is FIL_NULL, the address is considered undefined. */
 
 typedef	byte	fil_faddr_t;	/*!< 'type' definition in C: an address
 				stored in a file page is a string of bytes */
+
+#endif /* !UNIV_INNOCHECKSUM */
+
 #define FIL_ADDR_PAGE	0	/* first in address is the page offset */
 #define	FIL_ADDR_BYTE	4	/* then comes 2-byte byte offset within page*/
 
 #define	FIL_ADDR_SIZE	6	/* address size is 6 bytes */
+
+#ifndef UNIV_INNOCHECKSUM
 
 /** File space address */
 struct fil_addr_t{
@@ -137,8 +143,6 @@ extern fil_addr_t	fil_addr_null;
 #define FIL_PAGE_DATA_END	8	/*!< size of the page trailer */
 /* @} */
 
-#ifndef UNIV_INNOCHECKSUM
-
 /** File page types (values of FIL_PAGE_TYPE) @{ */
 #define FIL_PAGE_INDEX		17855	/*!< B-tree node */
 #define FIL_PAGE_UNDO_LOG	2	/*!< Undo log page */
@@ -154,7 +158,10 @@ extern fil_addr_t	fil_addr_null;
 #define FIL_PAGE_TYPE_BLOB	10	/*!< Uncompressed BLOB page */
 #define FIL_PAGE_TYPE_ZBLOB	11	/*!< First compressed BLOB page */
 #define FIL_PAGE_TYPE_ZBLOB2	12	/*!< Subsequent compressed BLOB page */
-#define FIL_PAGE_TYPE_LAST	FIL_PAGE_TYPE_ZBLOB2
+#define FIL_PAGE_TYPE_DBLWR_HEADER	13	/*!< First page of the double
+write buffer holds the space ids and the page numbers for the most recently
+flushed pages. */
+#define FIL_PAGE_TYPE_LAST	FIL_PAGE_TYPE_DBLWR_HEADER
 					/*!< Last page type */
 /* @} */
 
@@ -162,6 +169,8 @@ extern fil_addr_t	fil_addr_null;
 #define FIL_TABLESPACE		501	/*!< tablespace */
 #define FIL_LOG			502	/*!< redo log */
 /* @} */
+
+#ifndef UNIV_INNOCHECKSUM
 
 /** The number of fsyncs done to the log */
 extern ulint	fil_n_log_flushes;
@@ -174,6 +183,236 @@ extern ulint	fil_n_pending_tablespace_flushes;
 /** Number of files currently open */
 extern ulint	fil_n_file_opened;
 
+struct fil_space_t;
+
+/** File node of a tablespace or the log data space */
+struct fil_node_t {
+	fil_space_t*	space;	/*!< backpointer to the space where this node
+				belongs */
+	char*		name;	/*!< path to the file */
+	ibool		open;	/*!< TRUE if file open */
+	os_file_t	handle;	/*!< OS handle to the file, if file open */
+	os_event_t	sync_event;/*!< Condition event to group and
+				serialize calls to fsync */
+	ibool		is_raw_disk;/*!< TRUE if the 'file' is actually a raw
+				device or a raw disk partition */
+	ulint		size;	/*!< size of the file in database pages, 0 if
+				not known yet; the possible last incomplete
+				megabyte may be ignored if space == 0 */
+	ulint		n_pending;
+				/*!< count of pending i/o's on this file;
+				closing of the file is not allowed if
+				this is > 0 */
+	ulint		n_pending_flushes;
+				/*!< count of pending flushes on this file;
+				closing of the file is not allowed if
+				this is > 0 */
+	ibool		being_extended;
+				/*!< TRUE if the node is currently
+				being extended. */
+	ib_int64_t	modification_counter;/*!< when we write to the file we
+				increment this by one */
+	ib_int64_t	flush_counter;/*!< up to what
+				modification_counter value we have
+				flushed the modifications to disk */
+	ulint		flush_size;/*!< size of file when last flushed,
+				used to force flush when file grows
+				to keep filesystem metadata synced when
+				using O_DIRECT */
+	UT_LIST_NODE_T(fil_node_t) chain;
+				/*!< link field for the file chain */
+	UT_LIST_NODE_T(fil_node_t) LRU;
+				/*!< link field for the LRU list */
+	ulint		magic_n;/*!< FIL_NODE_MAGIC_N */
+};
+
+/** Value of fil_node_t::magic_n */
+#define	FIL_NODE_MAGIC_N	89389
+
+/** Per-tablespace stats. Stored separate from fil_space_struct to reduce
+mutex contention on fil_system->mutex. Entries are removed from here
+before fil_space_free is called. Entries are added to here after
+fil_space_struct is added to fil_system->spaces. So there are two small
+windows when an id is in fil_system->spaces but not in
+fil_system->stats_hash.
+*/
+typedef struct fil_stats_struct {
+	hash_node_t	stats_next;	/*!< hash chain node */
+	comp_stat_t	comp_stat;	/*!< compression counters */
+	ulint		id;		/*!< space id */
+	int		n_lock_wait;	/*!< number of row lock wait */
+	int		n_lock_wait_timeout;	/*!< number of row lock
+					wait timeout */
+	ibool		used;		/*!< cleared by fil_update_table_stats
+					and set by fil_io */
+	ulint		magic_n;	/*!< FIL_STATS_MAGIC_N */
+	unsigned char db_stats_index;
+} fil_stats_t;
+
+/** Value of fil_stats_struct::magic_n */
+#define FIL_STATS_MAGIC_N	89411
+
+/** Tablespace or log data space: let us call them by a common name space */
+struct fil_space_t {
+	char*		name;	/*!< space name = the path to the first file in
+				it */
+	ulint		id;	/*!< space id */
+	ib_int64_t	tablespace_version;
+				/*!< in DISCARD/IMPORT this timestamp
+				is used to check if we should ignore
+				an insert buffer merge request for a
+				page because it actually was for the
+				previous incarnation of the space */
+	ibool		mark;	/*!< this is set to TRUE at database startup if
+				the space corresponds to a table in the InnoDB
+				data dictionary; so we can print a warning of
+				orphaned tablespaces */
+	ibool		stop_ios;/*!< TRUE if we want to rename the
+				.ibd file of tablespace and want to
+				stop temporarily posting of new i/o
+				requests on the file */
+	ibool		stop_new_ops;
+				/*!< we set this TRUE when we start
+				deleting a single-table tablespace.
+				When this is set following new ops
+				are not allowed:
+				* read IO request
+				* ibuf merge
+				* file flush
+				Note that we can still possibly have
+				new write operations because we don't
+				check this flag when doing flush
+				batches. */
+	ulint		purpose;/*!< FIL_TABLESPACE, FIL_LOG, or
+				FIL_ARCH_LOG */
+	UT_LIST_BASE_NODE_T(fil_node_t) chain;
+				/*!< base node for the file chain */
+	ulint		size;	/*!< space size in pages; 0 if a single-table
+				tablespace whose size we do not know yet;
+				last incomplete megabytes in data files may be
+				ignored if space == 0 */
+	ulint		flags;	/*!< tablespace flags; see
+				fsp_flags_is_valid(),
+				fsp_flags_get_zip_size() */
+	ulint		n_reserved_extents;
+				/*!< number of reserved free extents for
+				ongoing operations like B-tree page split */
+	ulint		n_pending_flushes; /*!< this is positive when flushing
+				the tablespace to disk; dropping of the
+				tablespace is forbidden if this is positive */
+	ulint		n_pending_ops;/*!< this is positive when we
+				have pending operations against this
+				tablespace. The pending operations can
+				be ibuf merges or lock validation code
+				trying to read a block.
+				Dropping of the tablespace is forbidden
+				if this is positive */
+	hash_node_t	hash;	/*!< hash chain node */
+	hash_node_t	name_hash;/*!< hash chain the name_hash table */
+#ifndef UNIV_HOTBACKUP
+	rw_lock_t	latch;	/*!< latch protecting the file space storage
+				allocation */
+#endif /* !UNIV_HOTBACKUP */
+	UT_LIST_NODE_T(fil_space_t) unflushed_spaces;
+				/*!< list of spaces with at least one unflushed
+				file we have written to */
+	bool		is_in_unflushed_spaces;
+				/*!< true if this space is currently in
+				unflushed_spaces */
+	UT_LIST_NODE_T(fil_space_t) space_list;
+				/*!< list of all spaces */
+	os_io_perf2_t	io_perf2;/*!< per tablespace IO perf counters */
+	fil_stats_t	stats;	/*!< per tablespace stats used in stats_hash */
+	/* If NAME_LEN were visible to InnoDB source, it would be used,
+	instead of FN_LEN+1. */
+	char		db_name[FN_LEN + 1];
+				/*!< name from first or only table */
+	char		table_name[FN_LEN + 1];
+				/*!< name from first or only table */
+	bool		is_partition; /*!< table is a partition */
+	ulint		magic_n;/*!< FIL_SPACE_MAGIC_N */
+	ib_uint64_t	primary_index_id;/*!< index_id of the primary index */
+};
+
+/** Value of fil_space_t::magic_n */
+#define	FIL_SPACE_MAGIC_N	89472
+
+/** Identifies the caller of fil_flush */
+typedef enum {
+	FLUSH_FROM_DIRTY_BUFFER,
+	FLUSH_FROM_OTHER,
+	FLUSH_FROM_CHECKPOINT,
+	FLUSH_FROM_LOG_IO_COMPLETE,
+	FLUSH_FROM_LOG_WRITE_UP_TO,
+	FLUSH_FROM_ARCHIVE,
+	FLUSH_FROM_DOUBLEWRITE,
+	FLUSH_FROM_NUMBER
+} flush_from_t;
+
+/** The tablespace memory cache; also the totality of logs (the log
+data space) is stored here; below we talk about tablespaces, but also
+the ib_logfiles form a 'space' and it is handled here */
+struct fil_system_t {
+#ifndef UNIV_HOTBACKUP
+	ib_mutex_t		mutex;		/*!< The mutex protecting the cache */
+#endif /* !UNIV_HOTBACKUP */
+	hash_table_t*	spaces;		/*!< The hash table of spaces in the
+					system; they are hashed on the space
+					id */
+	hash_table_t*	name_hash;	/*!< hash table based on the space
+					name */
+	hash_table_t* stats_hash;	/*!< hash table based on the space id
+					or fil_stats_t */
+	UT_LIST_BASE_NODE_T(fil_node_t) LRU;
+					/*!< base node for the LRU list of the
+					most recently used open files with no
+					pending i/o's; if we start an i/o on
+					the file, we first remove it from this
+					list, and return it to the start of
+					the list when the i/o ends;
+					log files and the system tablespace are
+					not put to this list: they are opened
+					after the startup, and kept open until
+					shutdown */
+	UT_LIST_BASE_NODE_T(fil_space_t) unflushed_spaces;
+					/*!< base node for the list of those
+					tablespaces whose files contain
+					unflushed writes; those spaces have
+					at least one file node where
+					modification_counter > flush_counter */
+	ulint		n_open;		/*!< number of files currently open */
+	ulint		max_n_open;	/*!< n_open is not allowed to exceed
+					this */
+	ib_int64_t	modification_counter;/*!< when we write to a file we
+					increment this by one */
+	ulint		max_assigned_id;/*!< maximum space id in the existing
+					tables, or assigned during the time
+					mysqld has been up; at an InnoDB
+					startup we scan the data dictionary
+					and set here the maximum of the
+					space id's of the tables there */
+	ib_int64_t	tablespace_version;
+					/*!< a counter which is incremented for
+					every space object memory creation;
+					every space mem object gets a
+					'timestamp' from this; in DISCARD/
+					IMPORT this is used to check if we
+					should ignore an insert buffer merge
+					request */
+	UT_LIST_BASE_NODE_T(fil_space_t) space_list;
+					/*!< list of all file spaces */
+	ibool		space_id_reuse_warned;
+					/* !< TRUE if fil_space_create()
+					has issued a warning about
+					potential space_id reuse */
+	ulint		flush_types[FLUSH_FROM_NUMBER];
+					/*!< calls to fil_flush by caller */
+};
+
+/** The tablespace memory cache. This variable is NULL before the module is
+initialized. */
+extern fil_system_t*	fil_system;
+
 #ifndef UNIV_HOTBACKUP
 /*******************************************************************//**
 Returns the version number of a tablespace, -1 if not found.
@@ -184,6 +423,52 @@ ib_int64_t
 fil_space_get_version(
 /*==================*/
 	ulint	id);	/*!< in: space id */
+/*******************************************************************//**
+Returns the table space by a given id, NULL if not found. */
+UNIV_INLINE
+fil_space_t*
+fil_space_get_by_id(
+/*================*/
+	ulint	id)	/*!< in: space id */
+{
+	fil_space_t*	space;
+
+	ut_ad(mutex_own(&fil_system->mutex));
+
+	HASH_SEARCH(hash, fil_system->spaces, id,
+		    fil_space_t*, space,
+		    ut_ad(space->magic_n == FIL_SPACE_MAGIC_N),
+		    space->id == id);
+
+	return(space);
+}
+/*******************************************************************//**
+Returns the fil_stats_t for a table space by a given id. This can return
+NULL the space for id is not found. There are small windows where this
+can return NULL right after a space was created and right before it is
+deleted. This also returns a mutex that was locked to access the hash
+table. That _must_ always be unlocked whether or not this returns NULL. */
+static inline
+fil_stats_t*
+fil_get_stats_lock_mutex_by_id(
+/*================*/
+	ulint		id,	/*!< in: space id */
+	ib_mutex_t**	mutex)	/*!< out: mutex to unlock when done */
+{
+	fil_stats_t*	stats;
+	ut_ad(!mutex_own(&fil_system->mutex));
+
+	*mutex = hash_get_mutex(fil_system->stats_hash, id);
+	ut_ad(!mutex_own(*mutex));
+	mutex_enter(*mutex);
+
+	HASH_SEARCH(stats_next, fil_system->stats_hash, id,
+		    fil_stats_t*, stats,
+		    ut_ad(stats->magic_n == FIL_STATS_MAGIC_N),
+		    stats->id == id);
+
+	return stats;
+}
 /*******************************************************************//**
 Returns the latch of a file space.
 @return	latch protecting storage allocation */
@@ -714,13 +999,33 @@ ulint
 fil_space_get_n_reserved_extents(
 /*=============================*/
 	ulint	id);		/*!< in: space id */
+
+#define fil_io(type, sync, space_id, zip_size, block_offset, \
+		byte_offset, len, buf, message) \
+	_fil_io(type, sync, space_id, zip_size, block_offset, \
+		byte_offset, len, buf, message, NULL, TRUE)
+
+/****************************************************************//**
+Update stats with per-table data from InnoDB tables. */
+UNIV_INTERN
+void
+fil_update_table_stats(
+/*===================*/
+	/* per-table stats callback */
+	void (*cb)(const char* db, const char* tbl, bool is_partition,
+		   my_io_perf_t *r, my_io_perf_t *w, my_io_perf_t *r_blob,
+		   my_io_perf_t *r_primary, my_io_perf_t *r_secondary,
+		   page_stats_t *page_stats, comp_stat_t *comp_stat,
+		   int n_lock_wait, int n_lock_wait_timeout,
+		   const char* engine));
+
 /********************************************************************//**
 Reads or writes data. This operation is asynchronous (aio).
 @return DB_SUCCESS, or DB_TABLESPACE_DELETED if we are trying to do
 i/o on a tablespace which does not exist */
 UNIV_INTERN
 dberr_t
-fil_io(
+_fil_io(
 /*===*/
 	ulint	type,		/*!< in: OS_FILE_READ or OS_FILE_WRITE,
 				ORed to OS_FILE_LOG, if a log i/o
@@ -745,8 +1050,13 @@ fil_io(
 	void*	buf,		/*!< in/out: buffer where to store read data
 				or from where to write; in aio this must be
 				appropriately aligned */
-	void*	message)	/*!< in: message for aio handler if non-sync
+	void*	message,	/*!< in: message for aio handler if non-sync
 				aio used, else ignored */
+	os_io_table_perf_t* table_io_perf, /*!< in/out: tracks table IO stats
+				to be used in IS.user_statistics only for
+				sync reads and writes */
+	ibool	should_buffer)	/*!< in: whether to buffer an aio request.
+				Only used by aio read ahead*/
 	__attribute__((nonnull(8)));
 /**********************************************************************//**
 Waits for an aio operation to complete. This function is used to write the
@@ -766,8 +1076,9 @@ UNIV_INTERN
 void
 fil_flush(
 /*======*/
-	ulint	space_id);	/*!< in: file space id (this can be a group of
+	ulint	space_id,	/*!< in: file space id (this can be a group of
 				log files or a tablespace of the database) */
+	flush_from_t	from);	/*!< in: identifies the caller */
 /**********************************************************************//**
 Flushes to disk writes in file spaces of the given type possibly cached by
 the OS. */
@@ -775,7 +1086,8 @@ UNIV_INTERN
 void
 fil_flush_file_spaces(
 /*==================*/
-	ulint	purpose);	/*!< in: FIL_TABLESPACE, FIL_LOG */
+	ulint	purpose,	/*!< in: FIL_TABLESPACE, FIL_LOG */
+	flush_from_t	from);	/*!< in: identifies the caller */
 /******************************************************************//**
 Checks the consistency of the tablespace cache.
 @return	TRUE if ok */
@@ -984,6 +1296,31 @@ fil_mtr_rename_log(
 					swapping */
 	mtr_t*		mtr)		/*!< in/out: mini-transaction */
 	__attribute__((nonnull));
+
+/*************************************************************************
+Changes count of pages on the lock wait for this space. Will lock/unlock
+fil_system->mutex */
+void
+fil_change_lock_wait_count(
+/*=================*/
+	ulint	space,		/* in: tablespace id for which count changes */
+	int	amount);	/* in: amount by which the count changes */
+
+/*************************************************************************
+Changes count of pages on the lock wait timeout for this space. Will lock/unlock
+fil_system->mutex */
+void
+fil_change_lock_wait_timeout_count(
+/*=================*/
+	ulint	space,		/* in: tablespace id for which count changes */
+	int	amount);	/* in: amount by which the count changes */
+
+/*************************************************************************
+Print tablespace data for SHOW INNODB STATUS. */
+void
+fil_print(
+/*=======*/
+	FILE* file);	/* in: print results to this */
 
 #endif /* !UNIV_INNOCHECKSUM */
 #endif /* fil0fil_h */

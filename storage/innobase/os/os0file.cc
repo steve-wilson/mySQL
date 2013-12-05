@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright (c) 1995, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2012, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2009, Percona Inc.
 
 Portions of this file contain modifications contributed and copyrighted
@@ -32,6 +32,7 @@ The interface to the operating system file i/o primitives
 Created 10/21/1995 Heikki Tuuri
 *******************************************************/
 
+#include "mysqld.h"
 #include "os0file.h"
 
 #ifdef UNIV_NONINL
@@ -43,6 +44,10 @@ Created 10/21/1995 Heikki Tuuri
 #include "srv0start.h"
 #include "fil0fil.h"
 #include "buf0buf.h"
+#include "btr0btr.h"
+#ifdef UNIV_DEBUG
+#include "log0log.h"
+#endif /*UNIV_DEBUG*/
 #include "srv0mon.h"
 #ifndef UNIV_HOTBACKUP
 # include "os0sync.h"
@@ -59,6 +64,8 @@ Created 10/21/1995 Heikki Tuuri
 #if defined(LINUX_NATIVE_AIO)
 #include <libaio.h>
 #endif
+
+#define max(a,b) ((a)>(b)?(a):(b))
 
 /** Insert buffer segment id */
 static const ulint IO_IBUF_SEGMENT = 0;
@@ -77,6 +84,8 @@ UNIV_INTERN ulint	os_innodb_umask = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP;
 /** Umask for creating files */
 UNIV_INTERN ulint	os_innodb_umask	= 0;
 #endif /* __WIN__ */
+
+UNIV_INTERN ullint os_fsync_freq = 1ULL << 27;
 
 #ifndef UNIV_HOTBACKUP
 /* We use these mutexes to protect lseek + file i/o operation, if the
@@ -157,7 +166,7 @@ struct os_aio_slot_t{
 	ulint		pos;		/*!< index of the slot in the aio
 					array */
 	ibool		reserved;	/*!< TRUE if this slot is reserved */
-	time_t		reservation_time;/*!< time when reserved */
+	ulonglong	reservation_time;/*!< time when reserved */
 	ulint		len;		/*!< length of the block to read or
 					write */
 	byte*		buf;		/*!< buffer used in i/o */
@@ -175,6 +184,8 @@ struct os_aio_slot_t{
 					and which can be used to identify
 					which pending aio operation was
 					completed */
+	os_io_perf2_t*	io_perf2;	/*!< per fil_space_t performance
+					counters */
 #ifdef WIN_ASYNC_IO
 	HANDLE		handle;		/*!< handle object we need in the
 					OVERLAPPED struct */
@@ -234,6 +245,16 @@ struct os_aio_array_t{
 				There is one such event for each
 				possible pending IO. The size of the
 				array is equal to n_slots. */
+	struct iocb**		pending;
+				/* Array to buffer the not-submitted aio
+				requests. The array length is n_slots.
+				It is divided into n_segments segments.
+				pending requests on each segment are buffered
+				separately.*/
+	ulint*			count;
+				/* Array of length n_segments. Each element
+				counts the number of not-submitted aio request
+				on that segment.*/
 #endif /* LINUX_NATIV_AIO */
 };
 
@@ -250,6 +271,24 @@ struct os_aio_array_t{
 
 /** Array of events used in simulated aio */
 static os_event_t*	os_aio_segment_wait_events = NULL;
+
+/** Per thread buffer used for merged IO requests. Used by
+os_aio_simulated_handle so that a buffer doesn't have to be allocated
+for each request. @{ */
+static byte* os_aio_thread_buffer[SRV_MAX_N_IO_THREADS];
+static ulint os_aio_thread_buffer_size[SRV_MAX_N_IO_THREADS];
+/* @} */
+
+/* Performance counters indexed by global segment number */
+static my_io_perf_t os_aio_perf[SRV_MAX_N_IO_THREADS];
+
+/** AIO requests are scheduled in file offset order until they are at least
+    this old and then they have priority. */
+#define SRV_IO_OLD_TIME (srv_io_old_usecs * my_timer.frequency * 1000000)
+
+/** IO requests that take long than this to service (excludes wait time)
+    are counted as "slow" requests and reported. */
+#define SRV_IO_SLOW_TIME (srv_io_slow_usecs * my_timer.frequency * 1000000)
 
 /** The aio arrays for non-ibuf i/o and ibuf i/o, as well as sync aio. These
 are NULL when the module has not yet been initialized. @{ */
@@ -277,6 +316,30 @@ UNIV_INTERN ulint	os_n_file_writes_old	= 0;
 UNIV_INTERN ulint	os_n_fsyncs_old		= 0;
 UNIV_INTERN time_t	os_last_printout;
 
+/** Number of fsyncs that took longer than srv_io_slow_usecs */
+ulint		os_fsync_too_slow	= 0;
+
+/** Max svc time for fsync */
+ulonglong	os_fsync_max_time	= 0;
+
+/** Number of async reads that waited longer than srv_io_old_usecs */
+ulint		os_async_read_old_ios	= 0;
+/** Number of async writes that waited longer than srv_io_old_usecs */
+ulint		os_async_write_old_ios	= 0;
+
+/* Global counters for sync and async IO */
+my_io_perf_t os_async_read_perf;
+my_io_perf_t os_async_write_perf;
+
+my_io_perf_t os_sync_read_perf;
+my_io_perf_t os_sync_write_perf;
+
+my_io_perf_t os_log_write_perf;
+my_io_perf_t os_double_write_perf;
+
+/* Timer units waiting for fsync or fdatasync to finish */
+ulonglong os_file_flush_time = 0;
+
 UNIV_INTERN ibool	os_has_said_disk_full	= FALSE;
 
 #if !defined(UNIV_HOTBACKUP)	\
@@ -293,6 +356,92 @@ UNIV_INTERN ulint	os_file_n_pending_pwrites = 0;
 UNIV_INTERN ulint	os_n_pending_writes = 0;
 /** Number of pending read operations */
 UNIV_INTERN ulint	os_n_pending_reads = 0;
+
+ulint os_file_trx_log_write_padding_end = 0;
+
+/**********************************************************************//**
+Update wait stats for my_io_perf_t for all blocks after the first block in
+a merged request. */
+
+UNIV_INLINE
+void
+os_io_perf_update_wait(
+	my_io_perf_t*	perf,		/*!< in: struct to update */
+	ulonglong	stop_time,	/*!< in: timer units since epoch */
+	ulonglong	req_time)	/*!< in: when IO request submitted */
+{
+	ulonglong wait_time = 0;
+	if (stop_time > req_time) {
+		wait_time = stop_time - req_time;
+	}
+
+	perf->wait_time += wait_time;
+	perf->wait_time_max = max(wait_time, perf->wait_time_max);
+}
+
+/***********************************************************************//**
+Update my_io_perf_t after an IO request. */
+
+UNIV_INLINE
+void
+os_io_perf_update_all(
+/*===============*/
+	my_io_perf_t*	perf,		/*!< in: struct to update */
+	ulint		bytes,		/*!< in: size of request */
+	ulonglong	svc_time,	/*!< in: timer units to perform IO */
+	ulonglong	stop_time,	/*!< in: timer units since epoch */
+	ulonglong	req_time)	/*!< in: when IO request submitted */
+{
+	perf->requests++;
+	perf->bytes += bytes;
+
+	perf->svc_time += svc_time;
+	perf->svc_time_max = max(svc_time, perf->svc_time_max);
+
+	if (svc_time >= SRV_IO_SLOW_TIME) {
+		perf->slow_ios += 1;
+	}
+	os_io_perf_update_wait(perf, stop_time, req_time);
+}
+
+/**********************************************************************//**
+Update per page type stats. */
+UNIV_INLINE
+void
+os_io_perf_update_page_stats(
+/*======================*/
+	ulint		io_type,
+	ulint		fil_type,
+	os_io_perf2_t*	io_perf2)
+{
+	if(io_type == OS_FILE_READ) {
+		io_perf2->page_stats.n_pages_read++;
+		switch (fil_type) {
+			case FIL_PAGE_INDEX:
+				io_perf2->page_stats.n_pages_read_index++;
+				break;
+			case FIL_PAGE_TYPE_BLOB:
+			case FIL_PAGE_TYPE_ZBLOB:
+			case FIL_PAGE_TYPE_ZBLOB2:
+				io_perf2->page_stats.n_pages_read_blob++;
+				break;
+		}
+	}
+	else if(io_type == OS_FILE_WRITE) {
+		io_perf2->page_stats.n_pages_written++;
+		switch (fil_type) {
+			case FIL_PAGE_INDEX:
+				io_perf2->page_stats.n_pages_written_index++;
+				break;
+			case FIL_PAGE_TYPE_BLOB:
+			case FIL_PAGE_TYPE_ZBLOB:
+			case FIL_PAGE_TYPE_ZBLOB2:
+				io_perf2->page_stats.n_pages_written_blob++;
+				break;
+		}
+	}
+}
+
 
 #ifdef UNIV_DEBUG
 # ifndef UNIV_HOTBACKUP
@@ -640,13 +789,26 @@ os_file_handle_error_cond_exit(
 		to the log. */
 
 		if (should_exit || !on_error_silent) {
-			ib_logf(IB_LOG_LEVEL_ERROR, "File %s: '%s' returned OS "
-				"error " ULINTPF ".%s", name ? name : "(unknown)",
-				operation, err, should_exit
-				? " Cannot continue operation" : "");
+			if (name) {
+				ut_print_timestamp(stderr);
+				fprintf(stderr,
+					"  InnoDB: File name %s\n", name);
+			}
+
+			ut_print_timestamp(stderr);
+			fprintf(stderr, "  InnoDB: File operation call: "
+				"'%s' returned OS error " ULINTPF ".\n",
+				operation, err);
 		}
 
 		if (should_exit) {
+			ut_print_timestamp(stderr);
+			fprintf(stderr, "  InnoDB: Cannot continue "
+				"operation.\n");
+
+			fflush(stderr);
+
+			ut_ad(0);  /* Report call stack, etc only in debug code. */
 			exit(1);
 		}
 	}
@@ -687,12 +849,12 @@ os_file_handle_error_no_exit(
 
 #undef USE_FILE_LOCK
 #define USE_FILE_LOCK
-#if defined(UNIV_HOTBACKUP) || defined(__WIN__)
+#if defined(XTRABACKUP) || defined(__WIN__)
 /* InnoDB Hot Backup does not lock the data files.
  * On Windows, mandatory locking is used.
  */
 # undef USE_FILE_LOCK
-#endif
+#endif /* XTRABACKUP || __WIN__ */
 #ifdef USE_FILE_LOCK
 /****************************************************************//**
 Obtain an exclusive lock on a file.
@@ -1118,7 +1280,6 @@ os_file_create_simple_func(
 	os_file_t	file;
 	ibool		retry;
 
-	*success = FALSE;
 #ifdef __WIN__
 	DWORD		access;
 	DWORD		create_flag;
@@ -1313,7 +1474,6 @@ os_file_create_simple_no_error_handling_func(
 {
 	os_file_t	file;
 
-	*success = FALSE;
 #ifdef __WIN__
 	DWORD		access;
 	DWORD		create_flag;
@@ -1440,7 +1600,7 @@ os_file_create_simple_no_error_handling_func(
 /****************************************************************//**
 Tries to disable OS caching on an opened file descriptor. */
 UNIV_INTERN
-void
+int
 os_file_set_nocache(
 /*================*/
 	int		fd		/*!< in: file descriptor to alter */
@@ -1461,6 +1621,7 @@ os_file_set_nocache(
 			"Failed to set DIRECTIO_ON on file %s: %s: %s, "
 			"continuing anyway.",
 			file_name, operation_name, strerror(errno_save));
+		return -1;
 	}
 #elif defined(O_DIRECT)
 	if (fcntl(fd, F_SETFL, O_DIRECT) == -1) {
@@ -1477,8 +1638,10 @@ os_file_set_nocache(
 				"argument' on Linux on tmpfs, see MySQL "
 				"Bug#26662");
 		}
+		return -1;
 	}
 #endif /* defined(UNIV_SOLARIS) && defined(DIRECTIO_ON) */
+	return 0;
 }
 
 /****************************************************************//**
@@ -1740,11 +1903,22 @@ os_file_create_func(
 
 	if (!srv_read_only_mode
 	    && *success
-	    && type != OS_LOG_FILE
-	    && (srv_unix_file_flush_method == SRV_UNIX_O_DIRECT
-		|| srv_unix_file_flush_method == SRV_UNIX_O_DIRECT_NO_FSYNC)) {
+	    && ((type != OS_LOG_FILE
+		 && (srv_unix_file_flush_method == SRV_UNIX_O_DIRECT
+		     || srv_unix_file_flush_method == SRV_UNIX_O_DIRECT_NO_FSYNC))
+		|| srv_unix_file_flush_method == SRV_UNIX_ALL_O_DIRECT)) {
 
-		os_file_set_nocache(file, name, mode_str);
+		if (os_file_set_nocache(file, name, mode_str)) {
+			/* In the FB patch we changed InnoDB to not fsync after
+			O_DIRECT writes unless file was extended. That is correct
+			on Linux but maybe not on other platforms. If we can't
+			set O_DIRECT then we would have to fsync writes, but
+			code to do that is gone, so we crash here. */	
+
+			fprintf(stderr, "InnoDB: unable to enable O_DIRECT "
+				"for data files\n");
+			ut_a(0);
+		}
 	}
 
 #ifdef USE_FILE_LOCK
@@ -2128,6 +2302,18 @@ os_file_set_size(
 					 / (100 << 20)));
 		}
 
+		/* Flush after each os_fsync_freq bytes */
+		if (os_fsync_freq) {
+			if ((ib_int64_t)(current_size + n_bytes) / os_fsync_freq
+			    != current_size / os_fsync_freq) {
+				ret = os_file_flush(file);
+				if (!ret) {
+					ut_free(buf2);
+					goto error_handling;
+				}
+			}
+		}
+
 		current_size += n_bytes;
 	}
 
@@ -2181,7 +2367,6 @@ os_file_fsync(
 	int	ret;
 	int	failures;
 	ibool	retry;
-
 	failures = 0;
 
 	do {
@@ -2255,6 +2440,8 @@ os_file_flush_func(
 	return(FALSE);
 #else
 	int	ret;
+	ulonglong	flush_time;
+	ulonglong	start_time = my_timer_now();
 
 #if defined(HAVE_DARWIN_THREADS)
 # ifndef F_FULLFSYNC
@@ -2285,7 +2472,14 @@ os_file_flush_func(
 #else
 	ret = os_file_fsync(file);
 #endif
+	flush_time = my_timer_since(start_time);
+	if (flush_time >= SRV_IO_SLOW_TIME)
+		++os_fsync_too_slow;
 
+	if (flush_time >= os_fsync_max_time)
+		os_fsync_max_time = flush_time;
+
+	os_file_flush_time += flush_time;
 	if (ret == 0) {
 		return(TRUE);
 	}
@@ -2624,7 +2818,7 @@ try_again:
 	}
 
 	ib_logf(IB_LOG_LEVEL_ERROR,
-		"Tried to read "ULINTPF" bytes at offset " UINT64PF". "
+		"Tried to read " ULINTPF " bytes at offset " UINT64PF ". "
 		"Was only able to read %ld.", n, offset, (lint) ret);
 #endif /* __WIN__ */
 #ifdef __WIN__
@@ -2799,7 +2993,8 @@ os_file_write_func(
 	os_file_t	file,	/*!< in: handle to a file */
 	const void*	buf,	/*!< in: buffer from which to write */
 	os_offset_t	offset,	/*!< in: file offset where to write */
-	ulint		n)	/*!< in: number of bytes to write */
+	ulint		n,	/*!< in: number of bytes to write */
+	ulint		file_pad)	/*!< in: none-zero if pad log write */
 {
 	ut_ad(!srv_read_only_mode);
 
@@ -2937,6 +3132,24 @@ retry:
 #else
 	ssize_t	ret;
 
+	if (srv_trx_log_write_block_size && file_pad) {
+		if (((offset + srv_trx_log_write_block_size - 1)
+		     / srv_trx_log_write_block_size)
+		    != ((offset + n + srv_trx_log_write_block_size - 1)
+		     / srv_trx_log_write_block_size)) {
+			// needs padding
+			ulint pad = ut_calc_align(offset + n,
+						  srv_trx_log_write_block_size);
+			if (pad != os_file_trx_log_write_padding_end) {
+				os_file_trx_log_write_padding_end = pad;
+#ifdef UNIV_DEBUG
+				log_update_padding(pad - offset - n);
+#endif /*UNIV_DEBUG*/
+				n = pad - offset;
+			}
+		}
+	}
+
 	ret = os_file_pwrite(file, buf, n, offset);
 
 	if ((ulint) ret == n) {
@@ -2950,7 +3163,7 @@ retry:
 
 		fprintf(stderr,
 			" InnoDB: Error: Write to file %s failed"
-			" at offset "UINT64PF".\n"
+			" at offset " UINT64PF ".\n"
 			"InnoDB: %lu bytes should have been written,"
 			" only %ld were written.\n"
 			"InnoDB: Operating system error number %lu.\n"
@@ -3728,13 +3941,17 @@ os_aio_array_create(
 	memset(io_event, 0x0, sizeof(*io_event) * n);
 	array->aio_events = io_event;
 
+	array->pending = static_cast<struct iocb**>(
+		ut_malloc(n * sizeof(struct iocb*)));
+	memset(array->pending, 0x0, sizeof(struct iocb*) * n);
+	array->count = static_cast<ulint*>(
+		ut_malloc(n_segments * sizeof(ulint)));
+	memset(array->count, 0x0, sizeof(ulint) * n_segments);
+
 skip_native_aio:
 #endif /* LINUX_NATIVE_AIO */
-	for (ulint i = 0; i < n; i++) {
-		os_aio_slot_t*	slot;
-
-		slot = os_aio_array_get_nth_slot(array, i);
-
+	os_aio_slot_t* slot = os_aio_array_get_nth_slot(array, 0);
+	for (uint i = 0; i < n; i++, slot++) {
 		slot->pos = i;
 		slot->reserved = FALSE;
 #ifdef WIN_ASYNC_IO
@@ -3784,6 +4001,8 @@ os_aio_array_free(
 	if (srv_use_native_aio) {
 		ut_free(array->aio_events);
 		ut_free(array->aio_ctx);
+		ut_free(array->pending);
+		ut_free(array->count);
 	}
 #endif /* LINUX_NATIVE_AIO */
 
@@ -3824,6 +4043,17 @@ os_aio_init(
 #endif /* LINUX_NATIVE_AIO */
 
 	srv_reset_io_thread_op_info();
+	for (ulint i = 0; i < (2 + n_read_segs + n_write_segs); i++) {
+		my_io_perf_init(&os_aio_perf[i]);
+		os_aio_thread_buffer[i] = 0;
+		os_aio_thread_buffer_size[i] = 0;
+	}
+
+	my_io_perf_init(&os_async_read_perf);
+	my_io_perf_init(&os_async_write_perf);
+
+	my_io_perf_init(&os_sync_read_perf);
+	my_io_perf_init(&os_sync_write_perf);
 
 	os_aio_read_array = os_aio_array_create(
 		n_read_segs * n_per_seg, n_read_segs);
@@ -3856,6 +4086,9 @@ os_aio_init(
 		srv_io_thread_function[1] = "log thread";
 
 		os_aio_ibuf_array = os_aio_array_create(n_per_seg, 1);
+
+		my_io_perf_init(&os_log_write_perf);
+		my_io_perf_init(&os_double_write_perf);
 
 		if (os_aio_ibuf_array == NULL) {
 			return(FALSE);
@@ -3934,6 +4167,10 @@ os_aio_free(void)
 
 	for (ulint i = 0; i < os_aio_n_segments; i++) {
 		os_event_free(os_aio_segment_wait_events[i]);
+#ifdef UNIV_DEBUG_VALGRIND
+		if (os_aio_thread_buffer[i])
+			ut_free(os_aio_thread_buffer[i]);
+#endif
 	}
 
 	ut_free(os_aio_segment_wait_events);
@@ -4046,7 +4283,7 @@ os_aio_get_segment_no_from_slot(
 		seg_len = os_aio_read_array->n_slots
 			/ os_aio_read_array->n_segments;
 
-		segment = (srv_read_only_mode ? 0 : 2) + slot->pos / seg_len;
+		segment = 2 + slot->pos / seg_len;
 	} else {
 		ut_ad(!srv_read_only_mode);
 		ut_a(array == os_aio_write_array);
@@ -4114,6 +4351,7 @@ os_aio_array_reserve_slot(
 				the aio operation */
 	void*		message2,/*!< in: message to be passed along with
 				the aio operation */
+	os_io_perf2_t*	io_perf2,/*!< in: per fil_space_t perf counters */
 	os_file_t	file,	/*!< in: file handle */
 	const char*	name,	/*!< in: name of the file or path as a
 				null-terminated string */
@@ -4171,14 +4409,14 @@ loop:
 	/* We start our search for an available slot from our preferred
 	local segment and do a full scan of the array. We are
 	guaranteed to find a slot in full scan. */
-	for (i = local_seg * slots_per_seg, counter = 0;
-	     counter < array->n_slots;
-	     i++, counter++) {
-
-		i %= array->n_slots;
-
-		slot = os_aio_array_get_nth_slot(array, i);
-
+        i = (local_seg * slots_per_seg) % array->n_slots;
+	slot = os_aio_array_get_nth_slot(array, i);
+	for (counter = 0;
+	     counter < array->n_slots; i++, counter++, slot++) {
+		if (i == array->n_slots) {
+			i = 0;
+			slot = os_aio_array_get_nth_slot(array, 0);
+		}
 		if (slot->reserved == FALSE) {
 			goto found;
 		}
@@ -4200,9 +4438,10 @@ found:
 	}
 
 	slot->reserved = TRUE;
-	slot->reservation_time = ut_time();
+	slot->reservation_time = my_timer_now();
 	slot->message1 = message1;
 	slot->message2 = message2;
+	slot->io_perf2 = io_perf2;
 	slot->file     = file;
 	slot->name     = name;
 	slot->len      = len;
@@ -4322,10 +4561,9 @@ os_aio_simulated_wake_handler_thread(
 
 	os_mutex_enter(array->mutex);
 
-	for (ulint i = 0; i < n; ++i) {
-		const os_aio_slot_t*	slot;
 
-		slot = os_aio_array_get_nth_slot(array, segment + i);
+	os_aio_slot_t* slot = os_aio_array_get_nth_slot(array, segment);
+	for (uint i = 0; i < n; i++, slot++) {
 
 		if (slot->reserved) {
 
@@ -4405,6 +4643,55 @@ readahead requests. */
 
 #if defined(LINUX_NATIVE_AIO)
 /*******************************************************************//**
+Submit buffered AIO requests on the given segment to the kernel.
+@return	TRUE on success. */
+UNIV_INTERN
+ibool
+os_aio_linux_dispatch_read_array_submit()
+{
+	os_aio_array_t* array = os_aio_read_array;
+	ulint total_submitted = 0;
+	ulint total_count = 0;
+	if (!srv_use_native_aio) {
+		return TRUE;
+	}
+	os_mutex_enter(array->mutex);
+	/* Submit aio requests buffered on all segments. */
+	for (ulint i = 0; i < array->n_segments; i++) {
+		ulint count = array->count[i];
+		if (count > 0) {
+			ulint iocb_index = i * array->n_slots
+					   / array->n_segments;
+			ulint submitted;
+			total_count += count;
+			submitted = io_submit(array->aio_ctx[i], count,
+					      &(array->pending[iocb_index]));
+			if (submitted > 0) {
+				total_submitted += submitted;
+			} else {
+				/* io_submit returns number of successfully
+				queued requests or -errno. */
+				errno = -submitted;
+				break;
+			}
+		}
+	}
+	/* Reset the aio request buffer. */
+	memset(array->pending, 0x0,
+	       sizeof(struct iocb*) * array->n_slots);
+	memset(array->count, 0x0, sizeof(ulint) * array->n_segments);
+	os_mutex_exit(array->mutex);
+
+	srv_stats.n_aio_submitted.add(total_submitted);
+
+	if (UNIV_UNLIKELY(total_count != total_submitted)) {
+		return(FALSE);
+	}
+
+	return(TRUE);
+}
+
+/*******************************************************************//**
 Dispatch an AIO request to the kernel.
 @return	TRUE on success. */
 static
@@ -4412,24 +4699,48 @@ ibool
 os_aio_linux_dispatch(
 /*==================*/
 	os_aio_array_t*	array,	/*!< in: io request array. */
-	os_aio_slot_t*	slot)	/*!< in: an already reserved slot. */
+	os_aio_slot_t*	slot,	/*!< in: an already reserved slot. */
+	ibool		should_buffer)	/*!< in: should buffer the request
+					rather than submit. */
 {
 	int		ret;
-	ulint		io_ctx_index;
+	ulint		io_ctx_index = 0;
 	struct iocb*	iocb;
+	ulint slots_per_segment;
 
-	ut_ad(slot != NULL);
+	ut_ad(slot);
 	ut_ad(array);
-
 	ut_a(slot->reserved);
 
 	/* Find out what we are going to work with.
 	The iocb struct is directly in the slot.
 	The io_context is one per segment. */
 
+	slots_per_segment = array->n_slots / array->n_segments;
 	iocb = &slot->control;
-	io_ctx_index = (slot->pos * array->n_segments) / array->n_slots;
-
+	io_ctx_index = slot->pos / slots_per_segment;
+	if (should_buffer && array == os_aio_read_array) {
+		ulint n;
+		ulint count;
+		os_mutex_enter(array->mutex);
+		/* There are array->n_slots elements in array->pending,
+		which is divided into array->n_segments area of equal size.
+		The iocb of each segment are buffered in its corresponding area
+		in the pending array consecutively as they come.
+		array->count[i] records the number of buffered aio requests
+		in the ith segment.*/
+		n = io_ctx_index * slots_per_segment
+			  + array->count[io_ctx_index];
+		array->pending[n] = iocb;
+		array->count[io_ctx_index] ++;
+		count = array->count[io_ctx_index];
+		os_mutex_exit(array->mutex);
+		if (count == slots_per_segment) {
+			return os_aio_linux_dispatch_read_array_submit();
+		}
+		return(TRUE);
+	}
+	/* Submit the given request. */
 	ret = io_submit(array->aio_ctx[io_ctx_index], 1, &iocb);
 
 #if defined(UNIV_AIO_DEBUG)
@@ -4484,10 +4795,21 @@ os_aio_func(
 				(can be used to identify a completed
 				aio operation); ignored if mode is
 				OS_AIO_SYNC */
-	void*		message2)/*!< in: message for the aio handler
+	void*		message2,/*!< in: message for the aio handler
 				(can be used to identify a completed
 				aio operation); ignored if mode is
 				OS_AIO_SYNC */
+	ib_uint64_t*	primary_index_id,/*!< in: index_id of primary index */
+	os_io_perf2_t*	io_perf2,/*!< in: per fil_space_t perf counters */
+	os_io_table_perf_t* table_io_perf,/*!< in/out: counts table IO stats
+				for IS.user_statistics only for sync
+				reads and writes */
+	ibool	should_buffer)	/*!< in: Whether to buffer an aio request.
+				AIO read ahead uses this. If you plan to
+				use this parameter, make sure you remember
+				to call os_aio_linux_dispatch_read_array_submit
+				when you're ready to commit all your requests.*/
+
 {
 	os_aio_array_t*	array;
 	os_aio_slot_t*	slot;
@@ -4500,6 +4822,10 @@ os_aio_func(
 	ulint		dummy_type;
 #endif /* WIN_ASYNC_IO */
 	ulint		wake_later;
+	ulint		is_log_write;
+	ulint		is_double_write;
+	ulint		is_file_pad;
+	ib_uint64_t	index_id;
 
 	ut_ad(file);
 	ut_ad(buf);
@@ -4511,8 +4837,13 @@ os_aio_func(
 	ut_ad((n & 0xFFFFFFFFUL) == n);
 #endif
 
+	is_log_write = mode & OS_FILE_LOG;
+	is_double_write = mode & OS_AIO_DOUBLE_WRITE;
+	is_file_pad = mode & OS_FILE_PAD;
 	wake_later = mode & OS_AIO_SIMULATED_WAKE_LATER;
-	mode = mode & (~OS_AIO_SIMULATED_WAKE_LATER);
+	mode = mode & ~(OS_AIO_SIMULATED_WAKE_LATER |
+			OS_FILE_LOG | OS_FILE_PAD |
+			OS_AIO_DOUBLE_WRITE);
 
 	if (mode == OS_AIO_SYNC
 #ifdef WIN_ASYNC_IO
@@ -4532,14 +4863,91 @@ os_aio_func(
 		os_file_write(). Instead, we should use os_file_read_func()
 		and os_file_write_func() */
 
+		ibool r;
+		ulonglong start_time;
+
+		start_time = my_timer_now();
 		if (type == OS_FILE_READ) {
-			return(os_file_read_func(file, buf, offset, n));
+			r = os_file_read_func(file, buf, offset, n);
+		} else {
+			ut_ad(!srv_read_only_mode);
+			ut_a(type == OS_FILE_WRITE);
+			r = os_file_write_func(name, file, buf, offset, n,
+					       is_file_pad);
 		}
 
-		ut_ad(!srv_read_only_mode);
-		ut_a(type == OS_FILE_WRITE);
+		ulonglong elapsed_time = my_timer_since(start_time);
+		ulonglong end_time = start_time + elapsed_time;
+		/* These stats are not exact because a mutex is not locked. */
+		if (type == OS_FILE_READ) {
+			os_io_perf_update_all(&os_sync_read_perf, n,
+				elapsed_time, end_time, start_time);
+			/* Per fil_space_t counters */
+			os_io_perf_update_all(&(io_perf2->read), n,
+				elapsed_time, end_time, start_time);
+			if (table_io_perf) {
+				/* Per table counters */
+				os_io_perf_update_all(&(table_io_perf->read), n,
+					elapsed_time, end_time, start_time);
+			}
+			/* Handle type spacific page IO stats */
+			ulint page_type = fil_page_get_type((const unsigned char *)buf);
+			os_io_perf_update_page_stats(type, page_type, io_perf2);
+			my_io_perf_t* space_index_io_perf= NULL;
+			my_io_perf_t* table_index_io_perf= NULL;
+			if (primary_index_id && FIL_PAGE_INDEX == page_type)
+			{
+				index_id= btr_page_get_index_id((uchar*)buf);
+				if (index_id == *primary_index_id)
+				{
+					space_index_io_perf= &io_perf2->read_primary;
+					table_index_io_perf= &table_io_perf->read_primary;
+				} else {
+					space_index_io_perf= &io_perf2->read_secondary;
+					table_index_io_perf= &table_io_perf->read_secondary;
+				}
+			}
+			else if (FIL_PAGE_TYPE_BLOB == page_type ||
+				FIL_PAGE_TYPE_ZBLOB == page_type ||
+				FIL_PAGE_TYPE_ZBLOB2 == page_type)
+			{
+				space_index_io_perf= &io_perf2->read_blob;
+				table_index_io_perf= &table_io_perf->read_blob;
+			}
+			if (space_index_io_perf != NULL &&
+			    table_index_io_perf != NULL) {
+				/* Per fil_space_t counters */
+				os_io_perf_update_all(space_index_io_perf, n,
+				elapsed_time, end_time, start_time);
+				if (table_io_perf)
+				{
+					/* Per table counters */
+					os_io_perf_update_all(table_index_io_perf, n,
+					elapsed_time, end_time, start_time);
+				}
+			}
 
-		return(os_file_write_func(name, file, buf, offset, n));
+		} else {
+			my_io_perf_t *perf;
+			if (is_log_write)
+				perf = &os_log_write_perf;
+			else if (is_double_write)
+				perf = &os_double_write_perf;
+			else
+				perf = &os_sync_write_perf;
+
+			os_io_perf_update_all(perf, n,
+				elapsed_time, end_time, start_time);
+			/* Per fil_space_t counters */
+			os_io_perf_update_all(&(io_perf2->write), n,
+				elapsed_time, end_time, start_time);
+			if (table_io_perf) {
+				/* Per table counters */
+				os_io_perf_update_all(&(table_io_perf->write), n,
+					elapsed_time, end_time, start_time);
+			}
+		}
+		return r;
 	}
 
 try_again:
@@ -4584,8 +4992,8 @@ try_again:
 		array = NULL; /* Eliminate compiler warning */
 	}
 
-	slot = os_aio_array_reserve_slot(type, array, message1, message2, file,
-					 name, buf, offset, n);
+	slot = os_aio_array_reserve_slot(type, array, message1, message2,
+					 io_perf2, file, name, buf, offset, n);
 	if (type == OS_FILE_READ) {
 		if (srv_use_native_aio) {
 			os_n_file_reads++;
@@ -4595,7 +5003,8 @@ try_again:
 				       &(slot->control));
 
 #elif defined(LINUX_NATIVE_AIO)
-			if (!os_aio_linux_dispatch(array, slot)) {
+			if (!os_aio_linux_dispatch(array, slot,
+						   should_buffer)) {
 				goto err_exit;
 			}
 #endif /* WIN_ASYNC_IO */
@@ -4615,7 +5024,7 @@ try_again:
 					&(slot->control));
 
 #elif defined(LINUX_NATIVE_AIO)
-			if (!os_aio_linux_dispatch(array, slot)) {
+			if (!os_aio_linux_dispatch(array, slot, FALSE)) {
 				goto err_exit;
 			}
 #endif /* WIN_ASYNC_IO */
@@ -5002,6 +5411,7 @@ os_aio_linux_handle(
 	ulint		n;
 	ulint		i;
 	ibool		ret = FALSE;
+	ulonglong now = 0;
 
 	/* Should never be doing Sync IO here. */
 	ut_a(global_seg != ULINT_UNDEFINED);
@@ -5021,6 +5431,7 @@ os_aio_linux_handle(
 				continue;
 			} else if (slot->io_already_done) {
 				/* Something for us to work on. */
+				now = my_timer_now();
 				goto found;
 			} else {
 				any_reserved = TRUE;
@@ -5062,6 +5473,7 @@ found:
 	ut_ad(slot != NULL);
 	ut_ad(slot->reserved);
 	ut_ad(slot->io_already_done);
+	ut_ad(now);
 
 	*message1 = slot->message1;
 	*message2 = slot->message2;
@@ -5087,6 +5499,28 @@ found:
 	}
 
 	os_mutex_exit(array->mutex);
+
+	/* Update stats for this request. */
+	os_io_perf_update_all(&os_aio_perf[global_seg], slot->n_bytes, 0, now,
+			       slot->reservation_time);
+	/* Update async stats. */
+	os_io_perf_update_all(slot->type == OS_FILE_WRITE
+			      ? &os_async_write_perf
+			      : &os_async_read_perf,
+			      slot->n_bytes,
+			      0, /*native aio svc_time not known*/
+			      now, slot->reservation_time);
+	/* Per fil_space_t counters */
+	os_io_perf_update_all(slot->type == OS_FILE_WRITE
+			      ? &(slot->io_perf2->write)
+			      : &(slot->io_perf2->read),
+			      slot->n_bytes,
+			      0, /*native aio svc_time not known*/
+			      now, slot->reservation_time);
+	/* Per page type counters */
+	os_io_perf_update_page_stats(slot->type, fil_page_get_type(slot->buf),
+				     slot->io_perf2);
+
 
 	os_aio_array_free_slot(array, slot);
 
@@ -5118,18 +5552,26 @@ os_aio_simulated_handle(
 	os_aio_array_t*	array;
 	ulint		segment;
 	os_aio_slot_t*	consecutive_ios[OS_AIO_MERGE_N_CONSECUTIVE];
+	os_aio_slot_t*	lowest_request;
+	os_aio_slot_t*	oldest_request;
 	ulint		n_consecutive;
 	ulint		total_len;
 	ulint		offs;
 	os_offset_t	lowest_offset;
-	ulint		biggest_age;
-	ulint		age;
+	ulonglong	biggest_age;
+	ulonglong	age;
+	ulint		oldest_offset;
 	byte*		combined_buf;
 	byte*		combined_buf2;
 	ibool		ret;
 	ibool		any_reserved;
 	ulint		n;
-	os_aio_slot_t*	aio_slot;
+	os_aio_slot_t*	aio_slot = NULL;
+	os_aio_slot_t*	slot;
+	os_aio_slot_t* slot_start = NULL;
+
+	ulonglong	start_time, stop_time, elapsed_time;
+	ulonglong	now;
 
 	/* Fix compiler warning */
 	*consecutive_ios = NULL;
@@ -5167,11 +5609,10 @@ restart:
 
 	os_mutex_enter(array->mutex);
 
-	for (ulint i = 0; i < n; i++) {
-		os_aio_slot_t*	slot;
+	now = my_timer_now();
 
-		slot = os_aio_array_get_nth_slot(array, i + segment * n);
-
+	slot = os_aio_array_get_nth_slot(array, segment * n);
+	for (uint i = 0; i < n; i++, slot++) {
 		if (!slot->reserved) {
 			continue;
 		} else if (slot->io_already_done) {
@@ -5185,6 +5626,17 @@ restart:
 
 			aio_slot = slot;
 			ret = TRUE;
+
+			/* Update wait stats for this request. Other stats were
+			updated as part of the merged request. */
+			os_io_perf_update_wait(&os_aio_perf[global_segment],
+						now, slot->reservation_time);
+			/* Per fil_space_t counters */
+			os_io_perf_update_wait(slot->type == OS_FILE_WRITE ?
+						&(slot->io_perf2->write) :
+						&(slot->io_perf2->read),
+						now, slot->reservation_time);
+
 			goto slot_io_done;
 		} else {
 			any_reserved = TRUE;
@@ -5203,69 +5655,59 @@ restart:
 
 	n_consecutive = 0;
 
-	/* If there are at least 2 seconds old requests, then pick the oldest
-	one to prevent starvation. If several requests have the same age,
+	/* If there are requests of at least age=SRV_IO_OLD_TIME, then pick the
+	oldest one to prevent starvation. If several requests have the same age,
 	then pick the one at the lowest offset. */
 
 	biggest_age = 0;
-	lowest_offset = IB_UINT64_MAX;
+	oldest_request = lowest_request = NULL;
+	oldest_offset = lowest_offset = IB_UINT64_MAX;
 
-	for (ulint i = 0; i < n; i++) {
-		os_aio_slot_t*	slot;
-
-		slot = os_aio_array_get_nth_slot(array, i + segment * n);
-
+	slot = os_aio_array_get_nth_slot(array, segment * n);
+	for (uint i = 0; i < n; i++, slot++) {
 		if (slot->reserved) {
+			age = now - slot->reservation_time;
 
-			age = (ulint) difftime(
-				ut_time(), slot->reservation_time);
-
-			if ((age >= 2 && age > biggest_age)
-			    || (age >= 2 && age == biggest_age
-				&& slot->offset < lowest_offset)) {
+			if ((age >= SRV_IO_OLD_TIME && age > biggest_age)
+			    || (age >= SRV_IO_OLD_TIME && age == biggest_age
+				&& slot->offset < oldest_offset)) {
 
 				/* Found an i/o request */
-				consecutive_ios[0] = slot;
-
-				n_consecutive = 1;
-
 				biggest_age = age;
+				oldest_request = slot;
+				oldest_offset = slot->offset;
+			}
+
+			/* Look for an i/o request at the lowest offset in the array
+			 * (we ignore the high 32 bits of the offset) */
+			if (slot->offset < lowest_offset) {
+			        /* Found an i/o request */
+				lowest_request = slot;
 				lowest_offset = slot->offset;
 			}
 		}
 	}
 
-	if (n_consecutive == 0) {
-		/* There were no old requests. Look for an i/o request at the
-		lowest offset in the array (we ignore the high 32 bits of the
-		offset in these heuristics) */
-
-		lowest_offset = IB_UINT64_MAX;
-
-		for (ulint i = 0; i < n; i++) {
-			os_aio_slot_t*	slot;
-
-			slot = os_aio_array_get_nth_slot(
-				array, i + segment * n);
-
-			if (slot->reserved && slot->offset < lowest_offset) {
-
-				/* Found an i/o request */
-				consecutive_ios[0] = slot;
-
-				n_consecutive = 1;
-
-				lowest_offset = slot->offset;
-			}
-		}
-	}
-
-	if (n_consecutive == 0) {
+	if (!lowest_request && !oldest_request) {
 
 		/* No i/o requested at the moment */
 
 		goto wait_for_io;
 	}
+
+	if (oldest_request) {
+		slot = oldest_request;
+		if (biggest_age >= SRV_IO_OLD_TIME) {
+			if (slot && slot->type == OS_FILE_WRITE)
+				os_async_write_old_ios += 1;
+			else
+				os_async_read_old_ios += 1;
+		}
+	} else {
+		slot = lowest_request;
+	}
+	consecutive_ios[0] = slot;
+	n_consecutive = 1;
 
 	/* if n_consecutive != 0, then we have assigned
 	something valid to consecutive_ios[0] */
@@ -5275,13 +5717,10 @@ restart:
 	aio_slot = consecutive_ios[0];
 
 	/* Check if there are several consecutive blocks to read or write */
-
+	slot_start = os_aio_array_get_nth_slot(array, segment * n);
 consecutive_loop:
-	for (ulint i = 0; i < n; i++) {
-		os_aio_slot_t*	slot;
-
-		slot = os_aio_array_get_nth_slot(array, i + segment * n);
-
+	slot = slot_start;
+	for (uint i = 0; i < n; i++, slot++) {
 		if (slot->reserved
 		    && slot != aio_slot
 		    && slot->offset == aio_slot->offset + aio_slot->len
@@ -5322,8 +5761,19 @@ consecutive_loop:
 		combined_buf = aio_slot->buf;
 		combined_buf2 = NULL;
 	} else {
-		combined_buf2 = static_cast<byte*>(
-			ut_malloc(total_len + UNIV_PAGE_SIZE));
+		if ((total_len + UNIV_PAGE_SIZE) >
+			os_aio_thread_buffer_size[global_segment]) {
+
+			if (os_aio_thread_buffer[global_segment])
+				ut_free(os_aio_thread_buffer[global_segment]);
+
+			os_aio_thread_buffer[global_segment] =
+				static_cast<byte*>(
+					ut_malloc(total_len + UNIV_PAGE_SIZE));
+			os_aio_thread_buffer_size[global_segment] =
+				total_len + UNIV_PAGE_SIZE;
+		}
+		combined_buf2 = os_aio_thread_buffer[global_segment];
 
 		ut_a(combined_buf2);
 
@@ -5353,6 +5803,7 @@ consecutive_loop:
 	srv_set_io_thread_op_info(global_segment, "doing file i/o");
 
 	/* Do the i/o with ordinary, synchronous i/o functions: */
+	start_time = my_timer_now();
 	if (aio_slot->type == OS_FILE_WRITE) {
 		ut_ad(!srv_read_only_mode);
 		ret = os_file_write(
@@ -5363,6 +5814,8 @@ consecutive_loop:
 			aio_slot->file, combined_buf,
 			aio_slot->offset, total_len);
 	}
+	elapsed_time = my_timer_since(start_time);
+	stop_time = start_time + elapsed_time;
 
 	ut_a(ret);
 	srv_set_io_thread_op_info(global_segment, "file i/o done");
@@ -5379,9 +5832,28 @@ consecutive_loop:
 		}
 	}
 
-	if (combined_buf2) {
-		ut_free(combined_buf2);
+	/* Update statistics. The mutex is not locked and the race is OK. */
+	if (aio_slot->type == OS_FILE_WRITE) {
+		os_io_perf_update_all(&os_async_write_perf,
+			n_consecutive * UNIV_PAGE_SIZE, elapsed_time, stop_time,
+			aio_slot->reservation_time);
+		/* Per fil_space_t counters */
+		os_io_perf_update_all(&(aio_slot->io_perf2->write),
+			n_consecutive * UNIV_PAGE_SIZE, elapsed_time, stop_time,
+			aio_slot->reservation_time);
+	} else {
+		os_io_perf_update_all(&os_async_read_perf,
+			n_consecutive * UNIV_PAGE_SIZE, elapsed_time, stop_time,
+			aio_slot->reservation_time);
+		/* Per fil_space_t counters */
+		os_io_perf_update_all(&(aio_slot->io_perf2->read),
+			n_consecutive * UNIV_PAGE_SIZE, elapsed_time, stop_time,
+			aio_slot->reservation_time);
 	}
+
+	os_io_perf_update_all(&os_aio_perf[global_segment],
+			n_consecutive * UNIV_PAGE_SIZE, elapsed_time, stop_time,
+			aio_slot->reservation_time);
 
 	os_mutex_enter(array->mutex);
 
@@ -5403,6 +5875,11 @@ slot_io_done:
 	*message2 = aio_slot->message2;
 
 	*type = aio_slot->type;
+	if(aio_slot->type == OS_FILE_READ || aio_slot->type == OS_FILE_WRITE) {
+		os_io_perf_update_page_stats(aio_slot->type,
+					     fil_page_get_type(aio_slot->buf),
+					     aio_slot->io_perf2);
+	}
 
 	os_mutex_exit(array->mutex);
 
@@ -5445,11 +5922,8 @@ os_aio_array_validate(
 	ut_a(array->n_slots > 0);
 	ut_a(array->n_segments > 0);
 
-	for (i = 0; i < array->n_slots; i++) {
-		os_aio_slot_t*	slot;
-
-		slot = os_aio_array_get_nth_slot(array, i);
-
+	os_aio_slot_t* slot = os_aio_array_get_nth_slot(array, 0);
+	for (i = 0; i < array->n_slots; i++, slot++) {
 		if (slot->reserved) {
 			n_reserved++;
 			ut_a(slot->len > 0);
@@ -5490,6 +5964,46 @@ os_aio_validate(void)
 	}
 
 	return(TRUE);
+}
+
+struct os_io_perf_stats_struct {
+	ulint	bytes;
+	ulint	requests;
+	ulonglong	svc_time;
+	ulonglong	svc_time_max;
+	ulonglong	wait_time;
+	ulonglong	wait_time_max;
+};
+
+/**********************************************************************//**
+Prints IO statistics. */
+
+void
+os_io_perf_print(
+/*==============*/
+	FILE*           file,
+	my_io_perf_t*   perf,
+	ibool           newline)
+{
+	double nzero_requests = max(perf->requests, 1);
+
+	fprintf(file,
+		"%llu requests, %llu slow, %.2f bytes/r, "
+		"svc: %.2f secs, %.2f msecs/r, %.2f max msecs, "
+		"wait: %.2f secs %.2f msecs/r, %.2f max msecs",
+		perf->requests, perf->slow_ios,
+		perf->bytes / nzero_requests,
+		/* svc: starts here */
+		my_timer_to_seconds(perf->svc_time),
+		my_timer_to_milliseconds(perf->svc_time) / nzero_requests,
+		my_timer_to_milliseconds(perf->svc_time_max),
+		/* wait: starts here */
+		my_timer_to_seconds(perf->wait_time),
+		my_timer_to_milliseconds(perf->wait_time) / nzero_requests,
+		my_timer_to_milliseconds(perf->wait_time_max));
+
+	if (newline)
+		fprintf(file, "\n");
 }
 
 /**********************************************************************//**
@@ -5537,6 +6051,8 @@ os_aio_print_array(
 {
 	ulint			n_reserved = 0;
 	ulint			n_res_seg[SRV_MAX_N_IO_THREADS];
+	ulint			num_pending = 0;
+	ulint			num_done = 0;
 
 	os_mutex_enter(array->mutex);
 
@@ -5545,15 +6061,18 @@ os_aio_print_array(
 
 	memset(n_res_seg, 0x0, sizeof(n_res_seg));
 
-	for (ulint i = 0; i < array->n_slots; ++i) {
-		os_aio_slot_t*	slot;
-		ulint		seg_no;
-
-		slot = os_aio_array_get_nth_slot(array, i);
+	os_aio_slot_t* slot = os_aio_array_get_nth_slot(array, 0);
+	for (uint i = 0; i < array->n_slots; i++, slot++) {
+		ulint	seg_no;
 
 		seg_no = (i * array->n_segments) / array->n_slots;
 
 		if (slot->reserved) {
+			if (slot->io_already_done)
+				num_done++;
+			else
+				num_pending++;
+
 			++n_reserved;
 			++n_res_seg[seg_no];
 
@@ -5566,6 +6085,12 @@ os_aio_print_array(
 	fprintf(file, " %lu", (ulong) n_reserved);
 
 	os_aio_print_segment_info(file, n_res_seg, array);
+
+	fprintf(file,
+		"Summary of background IO slot status: %lu pending, "
+		"%lu done, sleep set %lu\n",
+		num_pending, num_done,
+		os_aio_recommend_sleep_for_read_threads);
 
 	os_mutex_exit(array->mutex);
 }
@@ -5583,13 +6108,15 @@ os_aio_print(
 	double		avg_bytes_read;
 
 	for (ulint i = 0; i < srv_n_file_io_threads; ++i) {
-		fprintf(file, "I/O thread %lu state: %s (%s)",
+		fprintf(file, "I/O thread %lu state: %s (%s) ",
 			(ulong) i,
 			srv_io_thread_op_info[i],
 			srv_io_thread_function[i]);
 
+		os_io_perf_print(file, &os_aio_perf[i], FALSE);
+
 #ifndef __WIN__
-		if (os_aio_segment_wait_events[i]->is_set) {
+		if (IS_SET(&os_aio_segment_wait_events[i]->ev)) {
 			fprintf(file, " ev set");
 		}
 #endif /* __WIN__ */
@@ -5633,6 +6160,37 @@ os_aio_print(
 		(ulong) os_n_file_reads,
 		(ulong) os_n_file_writes,
 		(ulong) os_n_fsyncs);
+
+	fprintf(file, "Async reads: ");
+	os_io_perf_print(file, &os_async_read_perf, TRUE);
+
+	fprintf(file, "Async writes: ");
+	os_io_perf_print(file, &os_async_write_perf, TRUE);
+
+	fprintf(file, "Sync reads: ");
+	os_io_perf_print(file, &os_sync_read_perf, TRUE);
+
+	fprintf(file, "Sync writes: ");
+	os_io_perf_print(file, &os_sync_write_perf, TRUE);
+
+	fprintf(file, "Log writes: ");
+	os_io_perf_print(file, &os_log_write_perf, TRUE);
+
+	fprintf(file, "Doublewrite buffer writes: ");
+	os_io_perf_print(file, &os_double_write_perf, TRUE);
+
+	double os_file_flush_sec = my_timer_to_seconds(os_file_flush_time);
+	fprintf(file,
+		"File flushes: %lu requests, %.2f seconds, %.2f msecs/r"
+		", %lu slow, %.2f max ms\n",
+		os_n_fsyncs, os_file_flush_sec,
+		os_file_flush_sec / (double)(max(os_n_fsyncs, 1)),
+		os_fsync_too_slow,
+		my_timer_to_milliseconds(os_fsync_max_time));
+
+	fprintf(file,
+		"Old async requests: %lu read, %lu write\n",
+		os_async_read_old_ios, os_async_write_old_ios);
 
 	if (os_file_n_pending_preads != 0 || os_file_n_pending_pwrites != 0) {
 		fprintf(file,

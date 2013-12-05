@@ -1,4 +1,4 @@
-/* Copyright (c) 2002, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2002, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <m_string.h>
 #include "my_default.h"
+#include <algorithm>
 
 typedef void (*init_func_p)(const struct my_option *option, void *variable,
                             longlong value);
@@ -38,7 +39,6 @@ static void init_one_value(const struct my_option *, void *, longlong);
 static void fini_one_value(const struct my_option *, void *, longlong);
 static int setval(const struct my_option *, void *, char *, my_bool);
 static char *check_struct_option(char *cur_arg, char *key_name);
-static void print_cmdline_password_warning();
 static my_bool get_bool_argument(const struct my_option *opts,
                                  const char *argument,
                                  bool *error);
@@ -56,6 +56,9 @@ enum enum_special_opt
 
 char *disabled_my_option= (char*) "0";
 char *enabled_my_option= (char*) "1";
+
+/* Multiplication factor to support MYSQL_SYSVAR_DOUBLE */
+const double multiplication_factor = 1000000.0;
 
 /* 
    This is a flag that can be set in client programs. 0 means that
@@ -112,35 +115,6 @@ int handle_options(int *argc, char ***argv,
                    my_get_one_option get_one_option)
 {
   return my_handle_options(argc, argv, longopts, get_one_option, NULL);
-}
-
-union ull_dbl
-{
-  ulonglong ull;
-  double dbl;
-};
-
-/**
-  Returns an ulonglong value containing a raw
-  representation of the given double value.
-*/
-ulonglong getopt_double2ulonglong(double v)
-{
-  union ull_dbl u;
-  u.dbl= v;
-  compile_time_assert(sizeof(ulonglong) >= sizeof(double));
-  return u.ull;
-}
-
-/**
-  Returns the double value which corresponds to
-  the given raw representation.
-*/
-double getopt_ulonglong2double(ulonglong v)
-{
-  union ull_dbl u;
-  u.ull= v;
-  return u.dbl;
 }
 
 /**
@@ -209,10 +183,11 @@ double getopt_ulonglong2double(ulonglong v)
   @return error in case of ambiguous or unknown options,
           0 on success.
 */
-int my_handle_options(int *argc, char ***argv,
+
+int my_handle_options_low(int *argc, char ***argv,
                       const struct my_option *longopts,
                       my_get_one_option get_one_option,
-                      const char **command_list)
+                      const char **command_list, my_bool fix_doubles)
 {
   uint UNINIT_VAR(opt_found), argvpos= 0, length;
   my_bool end_of_options= 0, must_be_var, set_maximum_value,
@@ -223,6 +198,20 @@ int my_handle_options(int *argc, char ***argv,
   void *value;
   int error, i;
   my_bool is_cmdline_arg= 1;
+  struct my_option *opt = (struct my_option*) longopts;
+
+  if (fix_doubles) {
+    for (; opt->name; opt++) {
+      switch (opt->var_type) {
+        case GET_DOUBLE:
+          opt->def_value *= multiplication_factor;
+          opt->min_value *= multiplication_factor;
+          opt->max_value *= multiplication_factor;
+        default:
+          continue;
+      }
+    }
+  }
 
   /* handle_options() assumes arg0 (program name) always exists */
   DBUG_ASSERT(argc && *argc >= 1);
@@ -497,8 +486,6 @@ int my_handle_options(int *argc, char ***argv,
 	else
 	  argument= optend;
 
-        if (optp->var_type == GET_PASSWORD && is_cmdline_arg && argument)
-          print_cmdline_password_warning();
       }
       else  /* must be short option */
       {
@@ -536,8 +523,6 @@ int my_handle_options(int *argc, char ***argv,
 		  argument= optend + 1;
 		  /* This is in effect a jump out of the outer loop */
 		  optend= (char*) " ";
-                  if (optp->var_type == GET_PASSWORD && is_cmdline_arg)
-                    print_cmdline_password_warning();
 		}
 		else
 		{
@@ -650,25 +635,14 @@ done:
   return 0;
 }
 
-
-/**
- * This function should be called to print a warning message
- * if password string is specified on the command line.
- */
-
-static void print_cmdline_password_warning()
+int my_handle_options(int *argc, char ***argv,
+                      const struct my_option *longopts,
+                      my_get_one_option get_one_option,
+                      const char **command_list)
 {
-  static my_bool password_warning_announced= FALSE;
-
-  if (!password_warning_announced)
-  {
-    fprintf(stderr, "Warning: Using a password on the command line "
-            "interface can be insecure.\n");
-    (void) fflush(stderr);
-    password_warning_announced= TRUE;
-  }
+  return my_handle_options_low(argc, argv, longopts, get_one_option,
+           command_list, TRUE);
 }
-
 
 /*
   function: check_struct_option
@@ -917,7 +891,6 @@ static int findopt(char *optpat, uint length,
 {
   uint count;
   const struct my_option *opt= *opt_res;
-  my_bool is_prefix= FALSE;
 
   for (count= 0; opt->name; opt++)
   {
@@ -926,14 +899,11 @@ static int findopt(char *optpat, uint length,
       (*opt_res)= opt;
       if (!opt->name[length])		/* Exact match */
 	return 1;
-
       if (!count)
       {
         /* We only need to know one prev */
 	count= 1;
 	*ffname= opt->name;
-        if (opt->name[length])
-          is_prefix= TRUE;
       }
       else if (strcmp(*ffname, opt->name))
       {
@@ -945,12 +915,6 @@ static int findopt(char *optpat, uint length,
       }
     }
   }
-  if (is_prefix && count == 1)
-    my_getopt_error_reporter(WARNING_LEVEL,
-                             "Using unique option prefix %.*s instead of %s "
-                             "is deprecated and will be removed in a future "
-                             "release. Please use the full name instead.",
-                             length, optpat, *ffname);
   return count;
 }
 
@@ -1172,18 +1136,14 @@ double getopt_double_limit_value(double num, const struct my_option *optp,
 {
   my_bool adjusted= FALSE;
   double old= num;
-  double min, max;
-
-  max= getopt_ulonglong2double(optp->max_value);
-  min= getopt_ulonglong2double(optp->min_value);
-  if (max && num > max)
+  if (optp->max_value && num > (double) optp->max_value)
   {
-    num= max;
+    num= (double) optp->max_value;
     adjusted= TRUE;
   }
-  if (num < min)
+  if (num < (double) optp->min_value)
   {
-    num= min;
+    num= (double) optp->min_value;
     adjusted= TRUE;
   }
   if (fix)
@@ -1211,8 +1171,14 @@ static double getopt_double(char *arg, const struct my_option *optp, int *err)
 {
   double num;
   int error;
+  bool adjusted = false;
   char *end= arg + 1000;                     /* Big enough as *arg is \0 terminated */
-  num= my_strtod(arg, &end, &error);
+  num = my_strtod(arg, &end, &error);
+  double old = num;
+  double max_value = (static_cast <double> (optp->max_value))
+                     / multiplication_factor;
+  double min_value = (static_cast <double> (optp->min_value))
+                     / multiplication_factor;
   if (end[0] != 0 || error)
   {
     my_getopt_error_reporter(ERROR_LEVEL,
@@ -1220,7 +1186,20 @@ static double getopt_double(char *arg, const struct my_option *optp, int *err)
     *err= EXIT_ARGUMENT_INVALID;
     return 0.0;
   }
-  return getopt_double_limit_value(num, optp, NULL);
+  if (optp->max_value && num > max_value) {
+    num = max_value;
+    adjusted = true;
+  }
+  if (num < min_value) {
+    num = min_value;
+    adjusted = true;
+  }
+  if (adjusted) {
+    my_getopt_error_reporter(WARNING_LEVEL,
+                             "option '%s': value %g adjusted to %g",
+                             optp->name, old, num);
+  }
+  return num;
 }
 
 /*
@@ -1266,7 +1245,7 @@ static void init_one_value(const struct my_option *option, void *variable,
     *((ulonglong*) variable)= (ulonglong) value;
     break;
   case GET_DOUBLE:
-    *((double*) variable)= getopt_ulonglong2double(value);
+    *((double*) variable)= ulonglong2double(value) / multiplication_factor;
     break;
   case GET_STR:
   case GET_PASSWORD:

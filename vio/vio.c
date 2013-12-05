@@ -69,7 +69,7 @@ static void vio_init(Vio *vio, enum enum_vio_type type,
   vio->mysql_socket= MYSQL_INVALID_SOCKET;
   mysql_socket_setfd(&vio->mysql_socket, sd);
   vio->localhost= flags & VIO_LOCALHOST;
-  vio->read_timeout= vio->write_timeout= -1;
+  vio->read_timeout = vio->write_timeout = timeout_infinite();
   if ((flags & VIO_BUFFERED_READ) &&
       !(vio->read_buffer= (char*)my_malloc(VIO_READ_BUFFER_SIZE, MYF(MY_WME))))
     flags&= ~VIO_BUFFERED_READ;
@@ -89,6 +89,8 @@ static void vio_init(Vio *vio, enum enum_vio_type type,
     vio->io_wait        =no_io_wait;
     vio->is_connected   =vio_is_connected_pipe;
     vio->has_data       =has_no_data;
+    vio->is_blocking    =vio_is_blocking;
+    vio->set_blocking   =vio_set_blocking;
     DBUG_VOID_RETURN;
   }
 #endif
@@ -108,6 +110,8 @@ static void vio_init(Vio *vio, enum enum_vio_type type,
     vio->io_wait        =no_io_wait;
     vio->is_connected   =vio_is_connected_shared_memory;
     vio->has_data       =has_no_data;
+    vio->is_blocking    =vio_is_blocking;
+    vio->set_blocking   =vio_set_blocking;
     DBUG_VOID_RETURN;
   }
 #endif
@@ -128,6 +132,8 @@ static void vio_init(Vio *vio, enum enum_vio_type type,
     vio->is_connected   =vio_is_connected;
     vio->has_data       =vio_ssl_has_data;
     vio->timeout        =vio_socket_timeout;
+    vio->is_blocking    =vio_is_blocking;
+    vio->set_blocking   =vio_set_blocking;
     DBUG_VOID_RETURN;
   }
 #endif /* HAVE_OPENSSL */
@@ -146,6 +152,10 @@ static void vio_init(Vio *vio, enum enum_vio_type type,
   vio->timeout          =vio_socket_timeout;
   vio->has_data=        (flags & VIO_BUFFERED_READ) ?
                             vio_buff_has_data : has_no_data;
+  vio->is_blocking      =vio_is_blocking;
+  vio->set_blocking     =vio_set_blocking;
+
+  vio->is_blocking_flag = TRUE;
   DBUG_VOID_RETURN;
 }
 
@@ -196,10 +206,10 @@ my_bool vio_reset(Vio* vio, enum enum_vio_type type,
     the underlying proprieties associated with the timeout,
     such as the socket blocking mode.
   */
-  if (old_vio.read_timeout >= 0)
+  if (timeout_is_nonzero(old_vio.read_timeout))
     ret|= vio_timeout(vio, 0, old_vio.read_timeout);
 
-  if (old_vio.write_timeout >= 0)
+  if (timeout_is_nonzero(old_vio.write_timeout))
     ret|= vio_timeout(vio, 1, old_vio.write_timeout);
 
   DBUG_RETURN(test(ret));
@@ -298,32 +308,24 @@ Vio *vio_new_win32shared_memory(HANDLE handle_file_map, HANDLE handle_map,
 
   @param vio      A VIO object.
   @param which    Whether timeout is for send (1) or receive (0).
-  @param timeout  Timeout interval in seconds.
+  @param timeout  timeout_t interval in seconds.
 
   @return FALSE on success, TRUE otherwise.
 */
 
-int vio_timeout(Vio *vio, uint which, int timeout_sec)
+int vio_timeout(Vio *vio, uint which, timeout_t timeout)
 {
-  int timeout_ms;
   my_bool old_mode;
 
-  /*
-    Vio timeouts are measured in milliseconds. Check for a possible
-    overflow. In case of overflow, set to infinite.
-  */
-  if (timeout_sec > INT_MAX/1000)
-    timeout_ms= -1;
-  else
-    timeout_ms= (int) (timeout_sec * 1000);
-
   /* Deduce the current timeout status mode. */
-  old_mode= vio->write_timeout < 0 && vio->read_timeout < 0;
+  old_mode =
+    timeout_is_infinite(vio->write_timeout) &&
+    timeout_is_infinite(vio->read_timeout);
 
   if (which)
-    vio->write_timeout= timeout_ms;
+    vio->write_timeout = timeout;
   else
-    vio->read_timeout= timeout_ms;
+    vio->read_timeout = timeout;
 
   /* VIO-specific timeout handling. Might change the blocking mode. */
   return vio->timeout ? vio->timeout(vio, which, old_mode) : 0;

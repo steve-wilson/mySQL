@@ -335,6 +335,16 @@ bool reload_acl_and_cache(THD *thd, unsigned long options,
 #endif
  if (options & REFRESH_USER_RESOURCES)
    reset_mqh((LEX_USER *) NULL, 0);             /* purecov: inspected */
+
+  if (options & REFRESH_STATISTICS)
+  {
+    reset_global_table_stats();
+    reset_global_db_stats();
+#ifndef EMBEDDED_LIBRARY
+    reset_global_user_stats();
+#endif
+  }
+
  if (*write_to_binlog != -1)
    *write_to_binlog= tmp_write_to_binlog;
  /*
@@ -422,6 +432,12 @@ bool flush_tables_with_read_lock(THD *thd, TABLE_LIST *all_tables)
 {
   Lock_tables_prelocking_strategy lock_tables_prelocking_strategy;
   TABLE_LIST *table_list;
+
+  if (block_ftwrl)
+  {
+    my_error(ER_BLOCK_FTWRL, MYF(0));
+    goto error;
+  }
 
   /*
     This is called from SQLCOM_FLUSH, the transaction has
@@ -512,6 +528,11 @@ bool flush_tables_for_export(THD *thd, TABLE_LIST *all_tables)
 {
   Lock_tables_prelocking_strategy lock_tables_prelocking_strategy;
 
+  if (block_ftwrl)
+  {
+    my_error(ER_BLOCK_FTWRL, MYF(0));
+    return true;
+  }
   /*
     This is called from SQLCOM_FLUSH, the transaction has
     been committed implicitly.

@@ -37,6 +37,10 @@
 #include "sql_priv.h"
 #include <signal.h>
 #include <my_dir.h>
+#include <map>
+#include <string>
+using std::map;
+using std::string;
 
 /*
   error() is used in macro BINLOG_ERROR which is invoked in
@@ -54,6 +58,7 @@ static void warning(const char *format, ...) ATTRIBUTE_FORMAT(printf, 1, 2);
 #include "sql_string.h"
 #include "my_decimal.h"
 #include "rpl_constants.h"
+#include "semisync_slave_client.h"
 
 #include <algorithm>
 
@@ -184,12 +189,22 @@ enum Exit_status {
   Options that will be used to filter out events.
 */
 static char *opt_include_gtids_str= NULL,
-            *opt_exclude_gtids_str= NULL;
+            *opt_exclude_gtids_str= NULL,
+            *opt_start_gtid_str = NULL,
+            *opt_find_gtid_str = NULL;
+static char *opt_index_file_str = NULL;
+std::map<std::string, std::string> previous_gtid_set_map;
 static my_bool opt_skip_gtids= 0;
 static bool filter_based_on_gtids= false;
 
 static bool in_transaction= false;
 static bool seen_gtids= false;
+static bool opt_use_semisync = false;
+static uint opt_semisync_debug = 0;
+ReplSemiSyncSlave repl_semisync;
+
+static uint opt_receive_buffer_size = 0;
+static uint opt_flush_result_file = 0;
 
 static Exit_status dump_local_log_entries(PRINT_EVENT_INFO *print_event_info,
                                           const char* logname);
@@ -1584,6 +1599,45 @@ static struct my_option my_long_options[] =
    "Identifiers were provided.",
    &opt_exclude_gtids_str, &opt_exclude_gtids_str, 0,
    GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+  {"receive-buffer-size", OPT_RECEIVE_BUFFER_SIZE,
+   "The size of input buffer for the socket used while "
+   "receving events from the server",
+   &opt_receive_buffer_size, &opt_receive_buffer_size, 0,
+   GET_UINT, REQUIRED_ARG,
+   1024 * 1024, // Default value
+   1024, // Minimum value,
+   UINT_MAX, // Maximum value,
+   1024, // Block size,
+   0, 0},
+  {"start-gtid", OPT_START_GTID,
+   "Binlog dump from the given gtid. This requires index-file option.",
+   &opt_start_gtid_str, &opt_start_gtid_str, 0,
+   GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+  {"find-gtid-position", OPT_FIND_GTID_POSITION,
+   "Prints binlog file name and starting position of Gtid_log_event "
+   "corresponding to the given gtid. This requires index-file option.",
+   &opt_find_gtid_str, &opt_find_gtid_str, 0,
+   GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+  {"index-file", OPT_INDEX_FILE, "Path to the index file, required "
+   "for initialization of previous gtid sets (local log only).",
+   &opt_index_file_str, &opt_index_file_str, 0,
+   GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+  {"use-semisync", OPT_USE_SEMISYNC,
+   "mysqlbinlog functions as a semisync slave sending acknowledgement "
+   "for received events.",
+   &opt_use_semisync, &opt_use_semisync, 0,
+   GET_BOOL, OPT_ARG, 0, 0, 0, 0, 0, 0},
+  {"semisync-debug", OPT_SEMISYNC_DEBUG,
+   "A value of 2 prints debug information of semi-sync. "
+   "A value of 1 prints function traces of semi-sync. "
+   "A value of of 0 doesn't print any debug information.",
+   &opt_semisync_debug, &opt_semisync_debug, 0,
+   GET_UINT, REQUIRED_ARG, 0, 0, 2, 1, 0, 0},
+  {"flush-result-file", OPT_FLUSH_RESULT_FILE,
+   "The maximum number of events received by mysqlbinlog in raw_mode without "
+   "flushing the result file. ",
+   &opt_flush_result_file, &opt_flush_result_file, 0,
+   GET_UINT, REQUIRED_ARG, 1000, 1, UINT_MAX, 1, 0, 0},
   {0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
 };
 
@@ -1613,21 +1667,6 @@ static void error_or_warning(const char *format, va_list args, const char *msg)
   varargs.
 */
 static void error(const char *format,...)
-{
-  va_list args;
-  va_start(args, format);
-  error_or_warning(format, args, "ERROR");
-  va_end(args);
-}
-
-
-/**
-  This function is used in log_event.cc to report errors.
-
-  @param format Printf-style format string, followed by printf
-  varargs.
-*/
-static void sql_print_error(const char *format,...)
 {
   va_list args;
   va_start(args, format);
@@ -1841,12 +1880,35 @@ static Exit_status safe_connect()
   mysql_options(mysql, MYSQL_OPT_CONNECT_ATTR_RESET, 0);
   mysql_options4(mysql, MYSQL_OPT_CONNECT_ATTR_ADD,
                  "program_name", "mysqlbinlog");
+
+  mysql_options(mysql, MYSQL_OPT_NET_RECEIVE_BUFFER_SIZE,
+                &opt_receive_buffer_size);
+
   if (!mysql_real_connect(mysql, host, user, pass, 0, port, sock, 0))
   {
     error("Failed on connect: %s", mysql_error(mysql));
     return ERROR_STOP;
   }
-  mysql->reconnect= 1;
+  if (opt_use_semisync)
+  {
+    // set semi sync slave status to true
+    rpl_semi_sync_slave_enabled = 1;
+    // Note that kTraceDetail and kTraceFunction are the only trace
+    // levels used by semi-sync slave.
+    if (opt_semisync_debug == 2)
+      rpl_semi_sync_slave_trace_level = Trace::kTraceDetail;
+    else if (opt_semisync_debug == 1)
+      rpl_semi_sync_slave_trace_level = Trace::kTraceFunction;
+    else
+      rpl_semi_sync_slave_trace_level = 0;
+    // Initialize semi sync slave functionality
+    repl_semisync.initObject();
+    // Check with master if it has semisync enabled and notify
+    // master this is a semisync enabled slave.
+    if (repl_semisync.slaveRequestDump(mysql))
+      return ERROR_STOP;
+  }
+  mysql->reconnect= 0;
   return OK_CONTINUE;
 }
 
@@ -2041,8 +2103,12 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
   my_off_t old_off= start_position_mot;
   char fname[FN_REFLEN + 1];
   char log_file_name[FN_REFLEN + 1];
+  char *log_file = NULL;
   Exit_status retval= OK_CONTINUE;
   enum enum_server_command command= COM_END;
+
+  bool semi_sync_need_reply = false;
+  uint event_count = 0;
 
   DBUG_ENTER("dump_remote_log_entries");
 
@@ -2065,7 +2131,7 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
     slave on the mysql server.
   */
   server_id= ((to_last_remote_log && stop_never) ? stop_never_server_id : 0);
-  size_t tlen = strlen(logname);
+  size_t tlen = logname ? strlen(logname) : 0;
   if (tlen > UINT_MAX) 
   {
     error("Log name too long.");
@@ -2123,6 +2189,8 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
     }
     uchar* ptr_buffer= command_buffer;
 
+    if (opt_start_gtid_str != NULL)
+      binlog_flags |= USING_START_GTID_PROTOCOL;
     int2store(ptr_buffer, binlog_flags);
     ptr_buffer+= ::BINLOG_FLAGS_INFO_SIZE;
     int4store(ptr_buffer, server_id);
@@ -2173,8 +2241,21 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
       ROTATE_EVENT or FORMAT_DESCRIPTION_EVENT
     */
 
-    type= (Log_event_type) net->read_pos[1 + EVENT_TYPE_OFFSET];
-
+    const char *event_buf = (const char*)net->read_pos + 1;
+    ulong event_len = len - 1;
+    if (rpl_semi_sync_slave_status)
+    {
+      // semisync event has 2 extra flags at the beginning of the event
+      // header.
+      type = (Log_event_type) net->read_pos[1 + 2 + EVENT_TYPE_OFFSET];
+      repl_semisync.slaveReadSyncHeader((const char*)net->read_pos + 1,
+                                        event_len, &semi_sync_need_reply,
+                                        &event_buf, &event_len);
+    }
+    else
+    {
+      type = (Log_event_type) net->read_pos[1 + EVENT_TYPE_OFFSET];
+    }
     /*
       Ignore HEARBEAT events. They can show up if mysqlbinlog is
       running with:
@@ -2191,8 +2272,7 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
 
     if (!raw_mode || (type == ROTATE_EVENT) || (type == FORMAT_DESCRIPTION_EVENT))
     {
-      if (!(ev= Log_event::read_log_event((const char*) net->read_pos + 1 ,
-                                          len - 1, &error_msg,
+      if (!(ev= Log_event::read_log_event(event_buf, event_len, &error_msg,
                                           glob_description_event,
                                           opt_verify_binlog_checksum)))
       {
@@ -2203,7 +2283,7 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
         If reading from a remote host, ensure the temp_buf for the
         Log_event class is pointing to the incoming stream.
       */
-      ev->register_temp_buf((char *) net->read_pos + 1);
+      ev->register_temp_buf((char *)event_buf);
     }
     if (raw_mode || (type != LOAD_EVENT))
     {
@@ -2237,6 +2317,7 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
           {
             strmov(log_file_name, rev->new_log_ident);
           }
+          log_file = log_file_name + dirname_length(log_file_name);
         }
 
         if (rev->when.tv_sec == 0)
@@ -2261,7 +2342,7 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
              next binlog file (fake rotate) picked by mysqlbinlog --to-last-log
          */
           old_off= start_position_mot;
-          len= 1; // fake Rotate, so don't increment old_off
+          event_len = 0; // fake Rotate, so don't increment old_off
         }
       }
       else if (type == FORMAT_DESCRIPTION_EVENT)
@@ -2275,7 +2356,7 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
         */
         // fake event when not in raw mode, don't increment old_off
         if ((old_off != BIN_LOG_HEADER_SIZE) && (!raw_mode))
-          len= 1;
+          event_len = 0;
         if (raw_mode)
         {
           if (result_file && (result_file != stdout))
@@ -2310,7 +2391,12 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
 
       if (raw_mode)
       {
-        my_fwrite(result_file, net->read_pos + 1 , len - 1, MYF(0));
+        my_fwrite(result_file, (const uchar*) event_buf, event_len, MYF(0));
+        if (type == XID_EVENT || ++event_count == opt_flush_result_file)
+        {
+          event_count = 0;
+          fflush(result_file);
+        }
         if (ev)
         {
           ev->temp_buf=0;
@@ -2350,7 +2436,12 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
       Let's adjust offset for remote log as for local log to produce
       similar text and to have --stop-position to work identically.
     */
-    old_off+= len-1;
+    old_off += event_len;
+    if (rpl_semi_sync_slave_status && semi_sync_need_reply)
+    {
+      DBUG_ASSERT(raw_mode);
+      repl_semisync.slaveReply(mysql, log_file, old_off);
+    }
   }
 
   DBUG_RETURN(OK_CONTINUE);
@@ -2378,6 +2469,9 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
 
   @param[in] logname Name of input binlog.
 
+  @param[in] stream_file Used to indicate that file is a stream and
+             therefore can't seek back and forth
+
   @retval ERROR_STOP An error occurred - the program should terminate.
   @retval OK_CONTINUE No error, the program should continue.
   @retval OK_STOP No error, but the end of the specified range of
@@ -2385,7 +2479,8 @@ static Exit_status dump_remote_log_entries(PRINT_EVENT_INFO *print_event_info,
 */
 static Exit_status check_header(IO_CACHE* file,
                                 PRINT_EVENT_INFO *print_event_info,
-                                const char* logname)
+                                const char* logname,
+                                bool stream_file)
 {
   DBUG_ENTER("check_header");
   uchar header[BIN_LOG_HEADER_SIZE];
@@ -2402,14 +2497,22 @@ static Exit_status check_header(IO_CACHE* file,
 
   pos= my_b_tell(file);
 
-  /* fstat the file to check if the file is a regular file. */
-  if (my_fstat(file->file, &my_file_stat, MYF(0)) == -1)
+  if (!stream_file)
   {
-    error("Unable to stat the file.");
+    /* fstat the file to check if the file is a regular file. */
+    if (my_fstat(file->file, &my_file_stat, MYF(0)) == -1)
+    {
+      error("Unable to stat the file.");
+      DBUG_RETURN(ERROR_STOP);
+    }
+    if ((my_file_stat.st_mode & S_IFMT) == S_IFREG)
+      my_b_seek(file, (my_off_t)0);
+  }
+  if (stream_file && pos != (my_off_t)0)
+  {
+    error("Cannot rewind to header in a stream.");
     DBUG_RETURN(ERROR_STOP);
   }
-  if ((my_file_stat.st_mode & S_IFMT) == S_IFREG)
-    my_b_seek(file, (my_off_t)0);
 
   if (my_b_read(file, header, sizeof(header)))
   {
@@ -2420,6 +2523,72 @@ static Exit_status check_header(IO_CACHE* file,
   {
     error("File is not a binary log file.");
     DBUG_RETURN(ERROR_STOP);
+  }
+
+  /*
+    The rest of this function tries to figure out binlog format etc by reading
+    some events. We have two codepaths based on whether it is streaming file
+    or not. This is because we cannot go back and forth in a stream. Since the
+    streaming file only needs to be supported for 5.0+ formats, the code for
+    streaming path is simpler than the non-streaming case that handles all
+    formats.
+  */
+  if (stream_file)
+  {
+    for (;;)
+    {
+      pos= my_b_tell(file);
+
+      if (pos >= start_position)
+      {
+        DBUG_RETURN(OK_CONTINUE);
+      }
+
+      Log_event *ev;
+      if (!(ev= Log_event::read_log_event(file, glob_description_event,
+                                          opt_verify_binlog_checksum)))
+      {
+        if (file->error)
+        {
+          error("Could not read a log_event at offset %llu;"
+                " this could be a log format error or read error.",
+                (ulonglong)pos);
+          DBUG_RETURN(ERROR_STOP);
+        }
+        // EOF
+        DBUG_RETURN(OK_CONTINUE);
+      }
+
+      if (ev->get_type_code() != FORMAT_DESCRIPTION_EVENT)
+      {
+        delete ev;
+        ev = NULL;
+        continue;
+      }
+
+      Format_description_log_event *new_description_event =
+        static_cast<Format_description_log_event *>(ev);
+
+      if (opt_base64_output_mode == BASE64_OUTPUT_AUTO)
+      {
+        /*
+          process_event will delete *description_event and set it to
+          the new one, so we should not do it ourselves in this
+          case.
+        */
+        Exit_status retval= process_event(print_event_info,
+                                          new_description_event, pos,
+                                          logname);
+        if (retval != OK_CONTINUE)
+          DBUG_RETURN(retval);
+      }
+      else
+      {
+        delete glob_description_event;
+        glob_description_event= new_description_event;
+      }
+    }
+    DBUG_RETURN(OK_CONTINUE);
   }
 
   /*
@@ -2577,7 +2746,8 @@ static Exit_status dump_local_log_entries(PRINT_EVENT_INFO *print_event_info,
       my_close(fd, MYF(MY_WME));
       return ERROR_STOP;
     }
-    if ((retval= check_header(file, print_event_info, logname)) != OK_CONTINUE)
+    if ((retval= check_header(file, print_event_info, logname, false))
+        != OK_CONTINUE)
       goto end;
   }
   else
@@ -2599,28 +2769,14 @@ static Exit_status dump_local_log_entries(PRINT_EVENT_INFO *print_event_info,
     }
 #endif 
     if (init_io_cache(file, my_fileno(stdin), 0, READ_CACHE, (my_off_t) 0,
-		      0, MYF(MY_WME | MY_NABP | MY_DONT_CHECK_FILESIZE)))
+		      0, MYF(MY_WME | MY_NABP | MY_DONT_CHECK_FILESIZE | MY_FULL_IO)))
     {
       error("Failed to init IO cache.");
       return ERROR_STOP;
     }
-    if ((retval= check_header(file, print_event_info, logname)) != OK_CONTINUE)
+    if ((retval= check_header(file, print_event_info, logname, true))
+        != OK_CONTINUE)
       goto end;
-    if (start_position)
-    {
-      /* skip 'start_position' characters from stdin */
-      uchar buff[IO_SIZE];
-      my_off_t length,tmp;
-      for (length= start_position_mot ; length > 0 ; length-=tmp)
-      {
-	tmp= min<size_t>(length, sizeof(buff));
-	if (my_b_read(file, buff, (uint) tmp))
-        {
-          error("Failed reading from file.");
-          goto err;
-        }
-      }
-    }
   }
 
   if (!glob_description_event || !glob_description_event->is_valid())
@@ -2737,6 +2893,12 @@ static int args_post_process(void)
     }
   }
 
+  if (opt_start_gtid_str != NULL && opt_exclude_gtids_str != NULL)
+  {
+    error("--start-gtid and --exclude-gtids should not be used together");
+    DBUG_RETURN(ERROR_STOP);
+  }
+
   global_sid_lock->rdlock();
 
   if (opt_include_gtids_str != NULL)
@@ -2763,6 +2925,45 @@ static int args_post_process(void)
 
   global_sid_lock->unlock();
 
+  if (opt_start_gtid_str != NULL && opt_find_gtid_str != NULL)
+  {
+    error("--start-gtid and --find-gtid-position options should not be "
+          "used together");
+    DBUG_RETURN(ERROR_STOP);
+  }
+
+  if (opt_find_gtid_str != NULL && opt_index_file_str == NULL)
+  {
+    error("--find-gtid-position requires --index-file option");
+    DBUG_RETURN(ERROR_STOP);
+  }
+
+  if (opt_start_gtid_str != NULL && opt_index_file_str == NULL
+      && opt_remote_proto != BINLOG_DUMP_GTID)
+  {
+    error("--start-gtid requires --index-file option or "
+          "--read-from-remote-server=BINLOG_DUMP_GTID option");
+    DBUG_RETURN(ERROR_STOP);
+  }
+
+  if (opt_start_gtid_str != NULL && opt_remote_proto == BINLOG_DUMP_GTID)
+  {
+    global_sid_lock->rdlock();
+    if (gtid_set_excluded->add_gtid_text(opt_start_gtid_str) !=
+        RETURN_STATUS_OK)
+    {
+      error("Could not configure --start-gtid '%s'", opt_start_gtid_str);
+      global_sid_lock->unlock();
+      DBUG_RETURN(ERROR_STOP);
+    }
+    global_sid_lock->unlock();
+  }
+
+  if (opt_use_semisync && !raw_mode)
+  {
+    error("--raw option must be used when using --use_semisync option");
+    DBUG_RETURN(ERROR_STOP);
+  }
   DBUG_RETURN(OK_CONTINUE);
 }
 
@@ -2802,8 +3003,183 @@ inline bool gtid_client_init()
   return res;
 }
 
+/**
+   Parses the index file and builds the previous_gtid_set_map
+
+   @param index_file_path path to index file
+
+   @return true  Failure
+           false Success
+*/
+static bool init_previous_gtid_set_map(char *index_file_path)
+{
+  DBUG_ENTER("init_previous_gtid_set_map");
+  char file_name_and_gtid_set_length[FILE_AND_GTID_SET_LENGTH];
+  uchar *previous_gtid_set_in_file = NULL;
+  int length;
+  int index_dir_len = dirname_length(opt_index_file_str);
+
+  IO_CACHE index_file;
+  File file = -1;
+
+  if ((file = my_open(index_file_path, O_RDONLY, MYF(MY_WME))) < 0)
+  {
+    error("Error opening index file");
+    DBUG_RETURN(true);
+  }
+
+  if (init_io_cache(&index_file, file, IO_SIZE, READ_CACHE, 0, 0, MYF(MY_WME)))
+  {
+    error("Error initializing index file cache");
+    DBUG_RETURN(true);
+  }
+
+  my_b_seek(&index_file, 0);
+  while ((length = my_b_gets(&index_file, file_name_and_gtid_set_length,
+                             sizeof(file_name_and_gtid_set_length))) >= 1)
+  {
+    file_name_and_gtid_set_length[length - 1] = 0;
+    uint gtid_string_length = 0;
+    char *save_ptr = strchr(file_name_and_gtid_set_length, ' ');
+    if (save_ptr != NULL)
+    {
+      *save_ptr = 0; // replace ' ' with '\0'
+      save_ptr++;
+      gtid_string_length = atol(save_ptr);
+    }
+    if (gtid_string_length > 0)
+    {
+      previous_gtid_set_in_file =
+        (uchar *) my_malloc(gtid_string_length + 1, MYF(MY_WME));
+      if (previous_gtid_set_in_file == NULL)
+      {
+        error("Malloc Failed to allocate %d bytes of memory",
+              gtid_string_length + 1);
+        DBUG_RETURN(true);
+      }
+      if (my_b_read(&index_file, previous_gtid_set_in_file,
+                    gtid_string_length + 1))
+      {
+        error("Previous gtid set of binlog %s is corrupted in binlog "
+              "index file", file_name_and_gtid_set_length);
+        my_free(previous_gtid_set_in_file);
+        DBUG_RETURN(true);
+      }
+    }
+    int binlog_dir_len = dirname_length(file_name_and_gtid_set_length);
+    char binlog_file[FN_REFLEN];
+    strcpy(binlog_file, opt_index_file_str);
+    strcpy(binlog_file + index_dir_len,
+           file_name_and_gtid_set_length + binlog_dir_len);
+    previous_gtid_set_map.insert(std::pair<string, string>(
+                                   string(binlog_file),
+                                   string((char*)previous_gtid_set_in_file,
+                                   gtid_string_length)));
+    my_free(previous_gtid_set_in_file);
+  }
+  DBUG_RETURN(false);
+}
+
+/**
+  Finds starting binlog to start the dump by iterating over
+  previous_gtid_set_map. Dumps events starting from the given GTID
+  if find_position is false, otherwise prints binlog name and starting
+  position of Gtid_log_event corresponding to the given GTID.
+
+  @param gtid_string   GTID to start the dump
+  @param find_position true if using find-gtid-position
+                       false if using start-gtid
+
+  @retval ERROR_STOP  An error occurred - the program should terminate.
+  @retval OK_CONTINUE No error, the program should continue.
+  @retval OK_STOP     No error, but the end of the specified range of
+                      events to process has been reached and the program
+                      should terminate.
+*/
+static Exit_status start_gtid_dump(char *gtid_string, bool find_position)
+{
+  DBUG_ENTER("start_gtid_dump");
+  Exit_status retval = OK_CONTINUE;
+  Sid_map sid_map = NULL;
+  Gtid gtid;
+  std::map<std::string, std::string>::reverse_iterator rit;
+  std::map<std::string, std::string>::iterator it, last_log_it;
+  it = previous_gtid_set_map.end();
+  last_log_it = --previous_gtid_set_map.end();
+
+  Gtid_set previous_gtid_set(&sid_map);
+  if (gtid.parse(&sid_map, gtid_string) != RETURN_STATUS_OK)
+  {
+    error("Couldn't find position of a malformed Gtid %s", gtid_string);
+    DBUG_RETURN(ERROR_STOP);
+  }
+
+  for (rit = previous_gtid_set_map.rbegin();
+       rit != previous_gtid_set_map.rend(); ++rit)
+  {
+    previous_gtid_set.add_gtid_encoding((const uchar*)rit->second.c_str(),
+                                        rit->second.length());
+    if (!previous_gtid_set.contains_gtid(gtid))
+    {
+      it = previous_gtid_set_map.find(rit->first.c_str());
+      break;
+    }
+    previous_gtid_set.clear();
+  }
+
+  if (it == previous_gtid_set_map.end())
+  {
+    error("Requested Gtid is purged and so cannot be found in binary logs");
+    DBUG_RETURN(ERROR_STOP);
+  }
+
+  my_off_t pos = find_gtid_pos_in_log(it->first.c_str(), gtid, &sid_map);
+  if (pos == 0)
+  {
+    error("Request gtid is not in executed set and so cannot be "
+          "found in binary logs");
+    DBUG_RETURN(ERROR_STOP);
+  }
+
+  if (find_position)
+  {
+    int dir_len = dirname_length(it->first.c_str());
+    fprintf(result_file, "Log_name: %s\n", it->first.c_str() + dir_len);
+    fprintf(result_file, "Position: %llu", pos);
+    DBUG_RETURN(OK_CONTINUE);
+  }
+
+  my_off_t save_stop_position = stop_position;
+  stop_position = ULONGLONG_MAX;
+  start_position = pos;
+
+  while (it != previous_gtid_set_map.end())
+  {
+    const char *log_name = it->first.c_str();
+    if ((retval= dump_log_entries(log_name)) != OK_CONTINUE)
+      DBUG_RETURN(retval);
+    start_position = BIN_LOG_HEADER_SIZE;
+    if (++it == last_log_it)
+      stop_position = save_stop_position;
+  }
+  DBUG_RETURN(retval);
+}
+
+/*
+   Send a kill command to the server to safely abort the dump thread.
+   This ensures semisync status on master is turned OFF immediately without
+   waiting for timeout.
+*/
+static void handle_kill_signal(int sig)
+{
+  repl_semisync.killConnection(mysql);
+}
+
 int main(int argc, char** argv)
 {
+  signal(SIGINT, handle_kill_signal);
+  signal(SIGHUP, handle_kill_signal);
+  signal(SIGTERM, handle_kill_signal);
   char **defaults_argv;
   Exit_status retval= OK_CONTINUE;
   ulonglong save_stop_position;
@@ -2833,7 +3209,8 @@ int main(int argc, char** argv)
 
   parse_args(&argc, &argv);
 
-  if (!argc)
+  if (!argc && opt_find_gtid_str == NULL &&
+      opt_start_gtid_str == NULL)
   {
     usage();
     free_defaults(defaults_argv);
@@ -2844,6 +3221,13 @@ int main(int argc, char** argv)
   if (gtid_client_init())
   {
     error("Could not initialize GTID structuress.");
+    exit(1);
+  }
+
+  if ((argc == 1) && (stop_position != (ulonglong)(~(my_off_t)0)) &&
+      (!strcmp(argv[0], "-")))
+  {
+    error("stop_position not allowed when input is STDIN");
     exit(1);
   }
 
@@ -2875,7 +3259,7 @@ int main(int argc, char** argv)
   else
     load_processor.init_by_cur_dir();
 
-  if (!raw_mode)
+  if (!raw_mode && opt_find_gtid_str == NULL)
   {
     fprintf(result_file, "/*!50530 SET @@SESSION.PSEUDO_SLAVE_MODE=1*/;\n");
 
@@ -2902,19 +3286,43 @@ int main(int argc, char** argv)
               "\n/*!40101 SET NAMES %s */;\n", charset);
   }
 
-  for (save_stop_position= stop_position, stop_position= ~(my_off_t)0 ;
-       (--argc >= 0) ; )
+  if (opt_start_gtid_str != NULL || opt_find_gtid_str != NULL)
   {
-    if (argc == 0) // last log, --stop-position applies
-      stop_position= save_stop_position;
-    if ((retval= dump_log_entries(*argv++)) != OK_CONTINUE)
-      break;
-
-    // For next log, --start-position does not apply
-    start_position= BIN_LOG_HEADER_SIZE;
+    if (opt_start_gtid_str != NULL && opt_remote_proto == BINLOG_DUMP_GTID)
+    {
+      retval = dump_log_entries(NULL);
+    }
+    else
+    {
+      if (init_previous_gtid_set_map(opt_index_file_str))
+      {
+        error("initialization of the previous gtid log events from index file "
+              "failed");
+        exit(1);
+      }
+      if (opt_start_gtid_str)
+        retval = start_gtid_dump(opt_start_gtid_str, false);
+      else if (opt_find_gtid_str)
+        retval = start_gtid_dump(opt_find_gtid_str, true);
+    }
   }
 
-  if (!raw_mode)
+  else
+  {
+    for (save_stop_position= stop_position, stop_position= ~(my_off_t)0 ;
+         (--argc >= 0) ; )
+    {
+      if (argc == 0) // last log, --stop-position applies
+        stop_position= save_stop_position;
+      if ((retval= dump_log_entries(*argv++)) != OK_CONTINUE)
+        break;
+
+      // For next log, --start-position does not apply
+      start_position= BIN_LOG_HEADER_SIZE;
+    }
+  }
+
+  if (!raw_mode && opt_find_gtid_str == NULL)
   {
     /*
       Issue a ROLLBACK in case the last printed binlog was crashed and had half
@@ -2969,4 +3377,3 @@ int main(int argc, char** argv)
 #include "uuid.cc"
 #include "rpl_gtid_set.cc"
 #include "rpl_gtid_specification.cc"
-#include "rpl_tblmap.cc"

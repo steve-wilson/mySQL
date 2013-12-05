@@ -22,6 +22,7 @@
 #define	vio_violite_h_
 
 #include "my_net.h"   /* needed because of struct in_addr */
+#include "mysql_com.h"
 #include <mysql/psi/mysql_socket.h>
 
 
@@ -75,6 +76,8 @@ void    vio_delete(Vio* vio);
 int vio_shutdown(Vio* vio);
 my_bool vio_reset(Vio* vio, enum enum_vio_type type,
                   my_socket sd, void *ssl, uint flags);
+my_bool vio_is_blocking(Vio* vio);
+int     vio_set_blocking(Vio * vio, my_bool set_blocking_mode);
 size_t  vio_read(Vio *vio, uchar *	buf, size_t size);
 size_t  vio_read_buff(Vio *vio, uchar * buf, size_t size);
 size_t  vio_write(Vio *vio, const uchar * buf, size_t size);
@@ -97,16 +100,16 @@ my_socket vio_fd(Vio*vio);
 /* Remote peer's address and name in text form */
 my_bool vio_peer_addr(Vio *vio, char *buf, uint16 *port, size_t buflen);
 /* Wait for an I/O event notification. */
-int vio_io_wait(Vio *vio, enum enum_vio_io_event event, int timeout);
+int vio_io_wait(Vio *vio, enum enum_vio_io_event event, timeout_t timeout);
 my_bool vio_is_connected(Vio *vio);
 #ifndef DBUG_OFF
 ssize_t vio_pending(Vio *vio);
 #endif
 /* Set timeout for a network operation. */
-int vio_timeout(Vio *vio, uint which, int timeout_sec);
+int vio_timeout(Vio *vio, uint which, timeout_t timeout);
 /* Connect to a peer. */
 my_bool vio_socket_connect(Vio *vio, struct sockaddr *addr, socklen_t len,
-                           int timeout);
+                           my_bool nonblocking, timeout_t timeout);
 
 my_bool vio_get_normalized_ip_string(const struct sockaddr *addr, int addr_length,
                                      char *ip_string, size_t ip_string_size);
@@ -193,6 +196,8 @@ void vio_end(void);
 #define vio_peer_addr(vio, buf, prt, buflen)    (vio)->peer_addr(vio, buf, prt, buflen)
 #define vio_io_wait(vio, event, timeout)        (vio)->io_wait(vio, event, timeout)
 #define vio_is_connected(vio)                   (vio)->is_connected(vio)
+#define vio_is_blocking(vio)                    (vio)->is_blocking(vio)
+#define vio_set_blocking(vio, val)              (vio)->set_blocking(vio, val)
 #endif /* !defined(DONT_MAP_VIO) */
 
 /* This enumerator is used in parser - should be always visible */
@@ -226,8 +231,8 @@ struct st_vio
   char                  *read_pos;      /* start of unfetched data in the
                                            read buffer */
   char                  *read_end;      /* end of unfetched data */
-  int                   read_timeout;   /* Timeout value (ms) for read ops. */
-  int                   write_timeout;  /* Timeout value (ms) for write ops. */
+  timeout_t               read_timeout;   /* timeout_t value for read ops. */
+  timeout_t               write_timeout;  /* timeout_t value for write ops. */
   
   /* 
      VIO vtable interface to be implemented by VIO's like SSL, Socket,
@@ -257,7 +262,7 @@ struct st_vio
   int     (*vioshutdown)(Vio*);
   my_bool (*is_connected)(Vio*);
   my_bool (*has_data) (Vio*);
-  int (*io_wait)(Vio*, enum enum_vio_io_event, int);
+  int (*io_wait)(Vio*, enum enum_vio_io_event, timeout_t);
   my_bool (*connect)(Vio*, struct sockaddr *, socklen_t, int);
 #ifdef _WIN32
   OVERLAPPED overlapped;
@@ -277,5 +282,8 @@ struct st_vio
   size_t  shared_memory_remain;
   char    *shared_memory_pos;
 #endif /* HAVE_SMEM */
+  my_bool (*is_blocking)(Vio* vio);
+  int     (*set_blocking)(Vio * vio, my_bool val);
+  my_bool is_blocking_flag;
 };
 #endif /* vio_violite_h_ */

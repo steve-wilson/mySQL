@@ -23,7 +23,9 @@
   the owner of the client process matches the user name that was used when
   connecting to mysqld.
 */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE /* for struct ucred */
+#endif
 
 #include <mysql/plugin_auth.h>
 #include <sys/socket.h>
@@ -89,7 +91,7 @@ mysql_declare_plugin(socket_auth)
   NULL,
   NULL,
   NULL,
-  0,
+  0
 }
 mysql_declare_plugin_end;
 

@@ -1235,10 +1235,17 @@ static void close_open_tables(THD *thd)
 {
   mysql_mutex_assert_not_owner(&LOCK_open);
 
+  /*
+     Update global table stats before LOCK_open might be locked.
+     This is done for performance so it is OK when LOCK_open has been
+     locked by the caller.
+  */
+  update_table_stats(thd, thd->open_tables, true);
+
   DBUG_PRINT("info", ("thd->open_tables: 0x%lx", (long) thd->open_tables));
 
   while (thd->open_tables)
-    close_thread_table(thd, &thd->open_tables);
+    close_thread_table(thd, &thd->open_tables, false);
 }
 
 
@@ -1298,7 +1305,7 @@ close_all_tables_for_name(THD *thd, TABLE_SHARE *share,
       if (table->db_stat && /* Not true for partitioned tables. */
           skip_table == NULL)
         table->file->extra(HA_EXTRA_PREPARE_FOR_DROP);
-      close_thread_table(thd, prev);
+      close_thread_table(thd, prev, true);
     }
     else
     {
@@ -1333,7 +1340,7 @@ close_all_tables_for_name(THD *thd, TABLE_SHARE *share,
     leave prelocked mode if needed.
 */
 
-void close_thread_tables(THD *thd)
+void close_thread_tables(THD *thd, bool async_commit)
 {
   TABLE *table;
   DBUG_ENTER("close_thread_tables");
@@ -1472,7 +1479,7 @@ void close_thread_tables(THD *thd)
 
 /* move one table to free list */
 
-void close_thread_table(THD *thd, TABLE **table_ptr)
+void close_thread_table(THD *thd, TABLE **table_ptr, bool update_stats)
 {
   TABLE *table= *table_ptr;
   DBUG_ENTER("close_thread_table");
@@ -1488,6 +1495,14 @@ void close_thread_table(THD *thd, TABLE **table_ptr)
                                              table->s->table_name.str,
                                              MDL_SHARED));
   table->mdl_ticket= NULL;
+
+  /* Avoid a mutex hotspot by allowing some callers to update table stats
+     prior to calling this function.
+  */
+  if (update_stats && table->file)
+  {
+    table->file->update_global_table_stats(thd);
+  }
 
   mysql_mutex_lock(&thd->LOCK_thd_data);
   *table_ptr=table->next;
@@ -1557,7 +1572,7 @@ bool close_temporary_tables(THD *thd)
     for (table= thd->temporary_tables; table; table= tmp_next)
     {
       tmp_next= table->next;
-      close_temporary(table, 1, 1);
+      close_temporary(thd, table, 1, 1);
     }
     thd->temporary_tables= 0;
     DBUG_RETURN(FALSE);
@@ -1647,7 +1662,7 @@ bool close_temporary_tables(THD *thd)
                           strlen(table->s->table_name.str));
         s_query.append(',');
         next= table->next;
-        close_temporary(table, 1, 1);
+        close_temporary(thd, table, 1, 1);
       }
       thd->clear_error();
       const CHARSET_INFO *cs_save= thd->variables.character_set_client;
@@ -1662,7 +1677,7 @@ bool close_temporary_tables(THD *thd)
 
       thd->get_stmt_da()->set_overwrite_status(true);
       if ((error= (mysql_bin_log.write_event(&qinfo) ||
-                   mysql_bin_log.commit(thd, true) ||
+                   mysql_bin_log.commit(thd, true, false) ||
                    error)))
       {
         /*
@@ -1688,7 +1703,7 @@ bool close_temporary_tables(THD *thd)
     else
     {
       next= table->next;
-      close_temporary(table, 1, 1);
+      close_temporary(thd, table, 1, 1);
     }
   }
   if (!was_quote_show)
@@ -2114,7 +2129,7 @@ void close_temporary_table(THD *thd, TABLE *table,
     DBUG_ASSERT(slave_open_temp_tables || !thd->temporary_tables);
     modify_slave_open_temp_tables(thd, -1);
   }
-  close_temporary(table, free_share, delete_table);
+  close_temporary(thd, table, free_share, delete_table);
   DBUG_VOID_RETURN;
 }
 
@@ -2127,13 +2142,14 @@ void close_temporary_table(THD *thd, TABLE *table,
     If this is needed, use close_temporary_table()
 */
 
-void close_temporary(TABLE *table, bool free_share, bool delete_table)
+void close_temporary(THD *thd, TABLE *table, bool free_share, bool delete_table)
 {
   handlerton *table_type= table->s->db_type();
   DBUG_ENTER("close_temporary");
   DBUG_PRINT("tmptable", ("closing table: '%s'.'%s'",
                           table->s->db.str, table->s->table_name.str));
 
+  table->file->update_global_table_stats(thd);
   free_io_cache(table);
   closefrm(table, 0);
   if (delete_table)
@@ -2243,7 +2259,7 @@ void drop_open_table(THD *thd, TABLE *table, const char *db_name,
     handlerton *table_type= table->s->db_type();
 
     table->file->extra(HA_EXTRA_PREPARE_FOR_DROP);
-    close_thread_table(thd, &thd->open_tables);
+    close_thread_table(thd, &thd->open_tables, true);
     /* Remove the table share from the table cache. */
     tdc_remove_table(thd, TDC_RT_REMOVE_ALL, db_name, table_name,
                      FALSE);
@@ -2802,8 +2818,7 @@ bool open_table(THD *thd, TABLE_LIST *table_list, Open_table_context *ot_ctx)
   hash_value= my_calc_hash(&table_def_cache, (uchar*) key, key_length);
 
 
-  if (table_list->open_strategy == TABLE_LIST::OPEN_IF_EXISTS ||
-      table_list->open_strategy == TABLE_LIST::OPEN_FOR_CREATE)
+  if (table_list->open_strategy == TABLE_LIST::OPEN_IF_EXISTS)
   {
     bool exists;
 
@@ -2811,31 +2826,7 @@ bool open_table(THD *thd, TABLE_LIST *table_list, Open_table_context *ot_ctx)
       DBUG_RETURN(TRUE);
 
     if (!exists)
-    {
-      if (table_list->open_strategy == TABLE_LIST::OPEN_FOR_CREATE &&
-          ! (flags & (MYSQL_OPEN_FORCE_SHARED_MDL |
-                      MYSQL_OPEN_FORCE_SHARED_HIGH_PRIO_MDL)))
-      {
-        MDL_deadlock_handler mdl_deadlock_handler(ot_ctx);
-
-        thd->push_internal_handler(&mdl_deadlock_handler);
-
-        DEBUG_SYNC(thd, "before_upgrading_lock_from_S_to_X_for_create_table");
-        bool wait_result= thd->mdl_context.upgrade_shared_lock(
-                                 table_list->mdl_request.ticket,
-                                 MDL_EXCLUSIVE,
-                                 thd->variables.lock_wait_timeout);
-
-        thd->pop_internal_handler();
-        DEBUG_SYNC(thd, "after_upgrading_lock_from_S_to_X_for_create_table");
-
-        /* Deadlock or timeout occurred while upgrading the lock. */
-        if (wait_result)
-          DBUG_RETURN(TRUE);
-      }
-
       DBUG_RETURN(FALSE);
-    }
 
     /* Table exists. Let us try to open it. */
   }
@@ -3109,6 +3100,8 @@ table_found:
 
   table->next= thd->open_tables;		/* Link into simple list */
   thd->set_open_tables(table);
+  table->count_comment_bytes= thd->count_comment_bytes;    /* Assigning the
+                                   comment bytes count to the relevant table */
 
   table->reginfo.lock_type=TL_READ;		/* Assume read */
 
@@ -3473,7 +3466,7 @@ unlink_all_closed_tables(THD *thd, MYSQL_LOCK *lock, size_t reopen_count)
 
       thd->open_tables->pos_in_locked_tables->table= NULL;
 
-      close_thread_table(thd, &thd->open_tables);
+      close_thread_table(thd, &thd->open_tables, true);
     }
   }
   /* Exclude all closed tables from the LOCK TABLES list. */
@@ -3953,8 +3946,7 @@ end_unlock:
 /** Open_table_context */
 
 Open_table_context::Open_table_context(THD *thd, uint flags)
-  :m_thd(thd),
-   m_failed_table(NULL),
+  :m_failed_table(NULL),
    m_start_of_statement_svp(thd->mdl_context.mdl_savepoint()),
    m_timeout(flags & MYSQL_LOCK_IGNORE_TIMEOUT ?
              LONG_TIMEOUT : thd->variables.lock_wait_timeout),
@@ -3963,7 +3955,6 @@ Open_table_context::Open_table_context(THD *thd, uint flags)
    m_has_locks(thd->mdl_context.has_locks()),
    m_has_protection_against_grl(FALSE)
 {}
-
 
 /**
   Check if we can back-off and set back off action if we can.
@@ -4013,6 +4004,14 @@ request_backoff_action(enum_open_table_action action_arg,
       Action type name is OT_REOPEN_TABLES. Re-trying
       while holding some locks may lead to a livelock,
       and thus we don't do it.
+      A deadlock error can also occur when the MDL lock "S"
+      acquired on table being created is getting upgraded
+      to "X" and some other session is waiting on locks
+      acquired in CREATE and has lock on table
+      being created. The way to recover from this error
+      is to release all locks and close all tables
+      opened in CREATE, and re-try to open the tables and
+      acquire locks again.
     * Finally, this session has open TABLEs from different
       "generations" of the table cache. This can happen, e.g.,
       when, after this session has successfully opened one
@@ -4028,10 +4027,10 @@ request_backoff_action(enum_open_table_action action_arg,
       keep tables open between statements and a livelock
       is not possible.
   */
-  if (action_arg != OT_REOPEN_TABLES && m_has_locks)
+  if (action_arg != OT_REOPEN_TABLES &&
+      m_flags != MYSQL_OPEN_TABLE_FOR_CREATE && m_has_locks)
   {
     my_error(ER_LOCK_DEADLOCK, MYF(0));
-    mark_transaction_to_rollback(m_thd, true);
     return TRUE;
   }
   /*
@@ -4041,7 +4040,7 @@ request_backoff_action(enum_open_table_action action_arg,
   if (table)
   {
     DBUG_ASSERT(action_arg == OT_DISCOVER || action_arg == OT_REPAIR);
-    m_failed_table= (TABLE_LIST*) m_thd->alloc(sizeof(TABLE_LIST));
+    m_failed_table= (TABLE_LIST*) current_thd->alloc(sizeof(TABLE_LIST));
     if (m_failed_table == NULL)
       return TRUE;
     m_failed_table->init_one_table(table->db, table->db_length,
@@ -4058,6 +4057,8 @@ request_backoff_action(enum_open_table_action action_arg,
 /**
    Recover from failed attempt of open table by performing requested action.
 
+   @param  thd     Thread context
+
    @pre This function should be called only with "action" != OT_NO_ACTION
         and after having called @sa close_tables_for_reopen().
 
@@ -4067,7 +4068,7 @@ request_backoff_action(enum_open_table_action action_arg,
 
 bool
 Open_table_context::
-recover_from_failed_open()
+recover_from_failed_open(THD *thd)
 {
   bool result= FALSE;
   /* Execute the action. */
@@ -4079,31 +4080,31 @@ recover_from_failed_open()
       break;
     case OT_DISCOVER:
       {
-        if ((result= lock_table_names(m_thd, m_failed_table, NULL,
+        if ((result= lock_table_names(thd, m_failed_table, NULL,
                                       get_timeout(), 0)))
           break;
 
-        tdc_remove_table(m_thd, TDC_RT_REMOVE_ALL, m_failed_table->db,
+        tdc_remove_table(thd, TDC_RT_REMOVE_ALL, m_failed_table->db,
                          m_failed_table->table_name, FALSE);
-        ha_create_table_from_engine(m_thd, m_failed_table->db,
+        ha_create_table_from_engine(thd, m_failed_table->db,
                                     m_failed_table->table_name);
 
-        m_thd->get_stmt_da()->clear_warning_info(m_thd->query_id);
-        m_thd->clear_error();                 // Clear error message
-        m_thd->mdl_context.release_transactional_locks();
+        thd->get_stmt_da()->clear_warning_info(thd->query_id);
+        thd->clear_error();                 // Clear error message
+        thd->mdl_context.release_transactional_locks();
         break;
       }
     case OT_REPAIR:
       {
-        if ((result= lock_table_names(m_thd, m_failed_table, NULL,
+        if ((result= lock_table_names(thd, m_failed_table, NULL,
                                       get_timeout(), 0)))
           break;
 
-        tdc_remove_table(m_thd, TDC_RT_REMOVE_ALL, m_failed_table->db,
+        tdc_remove_table(thd, TDC_RT_REMOVE_ALL, m_failed_table->db,
                          m_failed_table->table_name, FALSE);
 
-        result= auto_repair_table(m_thd, m_failed_table);
-        m_thd->mdl_context.release_transactional_locks();
+        result= auto_repair_table(thd, m_failed_table);
+        thd->mdl_context.release_transactional_locks();
         break;
       }
     default:
@@ -4683,11 +4684,8 @@ extern "C" uchar *schema_set_get_key(const uchar *record, size_t *length,
 
 /**
   Acquire upgradable (SNW, SNRW) metadata locks on tables used by
-  LOCK TABLES or by a DDL statement.
-  Acquire lock "S" on table being created in CREATE TABLE statement.
-
-  @note  Under LOCK TABLES, we can't take new locks, so use
-         open_tables_check_upgradable_mdl() instead.
+  LOCK TABLES or by a DDL statement. Under LOCK TABLES, we can't take
+  new locks, so use open_tables_check_upgradable_mdl() instead.
 
   @param thd               Thread context.
   @param tables_start      Start of list of tables on which upgradable locks
@@ -4717,7 +4715,8 @@ lock_table_names(THD *thd,
        table= table->next_global)
   {
     if ((table->mdl_request.type < MDL_SHARED_UPGRADABLE &&
-         table->open_strategy != TABLE_LIST::OPEN_FOR_CREATE) ||
+         !(table->mdl_request.type == MDL_SHARED &&
+           flags == MYSQL_OPEN_TABLE_FOR_CREATE)) ||
         table->open_type == OT_TEMPORARY_ONLY ||
         (table->open_type == OT_TEMPORARY_OR_BASE && is_temporary_table(table)))
     {
@@ -4955,7 +4954,7 @@ restart:
            table= table->next_global)
       {
         if (table->mdl_request.type >= MDL_SHARED_UPGRADABLE ||
-            table->open_strategy == TABLE_LIST::OPEN_FOR_CREATE)
+            flags == MYSQL_OPEN_TABLE_FOR_CREATE)
           table->mdl_request.ticket= NULL;
       }
     }
@@ -5006,7 +5005,7 @@ restart:
             TABLE_LIST element. Altough currently this assumption is valid
             it may change in future.
           */
-          if (ot_ctx.recover_from_failed_open())
+          if (ot_ctx.recover_from_failed_open(thd))
             goto err;
 
           /* Re-open temporary tables after close_tables_for_reopen(). */
@@ -5066,7 +5065,7 @@ restart:
           {
             close_tables_for_reopen(thd, start,
                                     ot_ctx.start_of_statement_svp());
-            if (ot_ctx.recover_from_failed_open())
+            if (ot_ctx.recover_from_failed_open(thd))
               goto err;
 
             /* Re-open temporary tables after close_tables_for_reopen(). */
@@ -5529,7 +5528,7 @@ TABLE *open_ltable(THD *thd, TABLE_LIST *table_list, thr_lock_type lock_type,
     */
     thd->mdl_context.rollback_to_savepoint(ot_ctx.start_of_statement_svp());
     table_list->mdl_request.ticket= 0;
-    if (ot_ctx.recover_from_failed_open())
+    if (ot_ctx.recover_from_failed_open(thd))
       break;
   }
 
@@ -5581,6 +5580,57 @@ end:
     close_thread_tables(thd);
   }
   DBUG_RETURN(table);
+}
+
+
+/**
+  Upgrade "S" lock acquired on table being created to "X" lock.
+
+  @param[in]  thd                  Thread context.
+  @param[out] close_thread_tables  If failed to upgrade table because of
+                                   deadlock situation then set this to
+                                   "true" to inform caller backoff and
+                                   retry to open tables, acquire and
+                                   upgrade locks.
+  @note This function is used by only create table functions.
+        While creating table, "S" lock is acquired on table being
+        created to check its existence. If table does not exist
+        then this function is called to upgrade lock to "X".
+*/
+bool upgrade_lock_from_S_to_X_for_create(THD *thd,
+                                         bool &close_and_reopen_tables)
+{
+  bool result= false;
+  Open_table_context ot_ctx(thd, MYSQL_OPEN_TABLE_FOR_CREATE);
+  MDL_deadlock_handler mdl_deadlock_handler(&ot_ctx);
+  TABLE_LIST *tables= thd->lex->query_tables;
+  DBUG_ENTER("upgrade_lock_from_S_to_X_for_create");
+
+  DBUG_ASSERT(!tables->table && !tables->view && thd);
+
+  /* If MDL lock "S" is acquired then upgrade lock to "X" */
+  if (tables->mdl_request.ticket)
+  {
+    DEBUG_SYNC(thd, "before_upgrading_lock_from_S_to_X_for_create");
+    thd->push_internal_handler(&mdl_deadlock_handler);
+    result=
+      thd->mdl_context.upgrade_shared_lock(tables->mdl_request.ticket,
+                                           MDL_EXCLUSIVE,
+                                           thd->variables.lock_wait_timeout);
+    thd->pop_internal_handler();
+
+    /* Deadlock occurred while upgrading the lock */
+    if (result && ot_ctx.get_action() ==
+        Open_table_context::OT_BACKOFF_AND_RETRY)
+      close_and_reopen_tables= true;
+  }
+  else
+  {
+    /* Shared lock was not acquired on the table */
+    thd->lex->query_tables->mdl_request.set_type(MDL_EXCLUSIVE);
+  }
+
+  DBUG_RETURN(result);
 }
 
 
@@ -6341,6 +6391,8 @@ bool open_temporary_table(THD *thd, TABLE_LIST *tl)
   tl->table= table;
 
   table->init(thd, tl);
+
+  table->file->set_max_bytes(thd->variables.tmp_table_max_file_size);
 
   DBUG_PRINT("info", ("Using temporary table"));
   DBUG_RETURN(FALSE);

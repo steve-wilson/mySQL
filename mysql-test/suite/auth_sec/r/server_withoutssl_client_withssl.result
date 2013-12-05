@@ -31,10 +31,6 @@ select @@global.secure_auth;
 @@global.secure_auth
 0
 0 Expected
-**** connecting client using the ssl credentials
-**** connecting client using the ssl credentials
-**** connecting client using the ssl credentials
-**** connecting client using the ssl credentials
 DROP USER 'Tanjotuser1'@'localhost';
 
 
@@ -148,10 +144,6 @@ select @@global.secure_auth;
 @@global.secure_auth
 0
 0 Expected
-**** connecting client using the ssl credentials
-**** connecting client using the ssl credentials
-**** connecting client using the ssl credentials
-**** connecting client using the ssl credentials
 DROP USER 'Tanjotuser1'@'localhost';
 
 

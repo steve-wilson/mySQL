@@ -470,7 +470,12 @@ MYSQL_METHODS embedded_methods=
   emb_free_embedded_thd,
   emb_read_statistics,
   emb_read_query_result,
-  emb_read_rows_from_cursor
+  emb_read_rows_from_cursor,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
 };
 
 /*
@@ -566,8 +571,7 @@ int init_embedded_server(int argc, char **argv, char **groups)
     return 1;
   }
 
-  ulong requested_open_files_dummy;
-  adjust_related_options(&requested_open_files_dummy);
+  adjust_related_options();
 
   if (init_common_variables())
   {
@@ -785,8 +789,7 @@ int check_embedded_connection(MYSQL *mysql, const char *db)
   thd_init_client_charset(thd, mysql->charset->number);
   thd->update_charset();
   Security_context *sctx= thd->security_ctx;
-  sctx->set_host(my_localhost);
-  sctx->host_or_ip= sctx->get_host()->ptr();
+  sctx->host_or_ip= sctx->host= (char*) my_localhost;
   strmake(sctx->priv_host, (char*) my_localhost,  MAX_HOSTNAME-1);
   strmake(sctx->priv_user, mysql->user,  USERNAME_LENGTH-1);
   sctx->user= my_strdup(mysql->user, MYF(0));
@@ -821,14 +824,14 @@ int check_embedded_connection(MYSQL *mysql, const char *db)
                  connect_attrs_len + 2);
   if (mysql->options.client_ip)
   {
-    sctx->set_host(my_strdup(mysql->options.client_ip, MYF(0)));
-    sctx->set_ip(my_strdup(sctx->get_host()->ptr(), MYF(0)));
+    sctx->host= my_strdup(mysql->options.client_ip, MYF(0));
+    sctx->ip= my_strdup(sctx->host, MYF(0));
   }
   else
-    sctx->set_host((char*)my_localhost);
-  sctx->host_or_ip= sctx->host->ptr();
+    sctx->host= (char*)my_localhost;
+  sctx->host_or_ip= sctx->host;
 
-  if (acl_check_host(sctx->get_host()->ptr(), sctx->get_ip()->ptr()))
+  if (acl_check_host(sctx->host, sctx->ip))
     goto err;
 
   /* construct a COM_CHANGE_USER packet */

@@ -159,9 +159,10 @@ bool Rpl_info_table_access::close_table(THD *thd, TABLE* table,
       /*
         To make the commit not to block with global read lock set
         "ignore_global_read_lock" flag to true.
-       */
-      ha_commit_trans(thd, FALSE, TRUE);
+      */
+      ha_commit_trans(thd, FALSE, FALSE, TRUE);
     }
+
     if (saved_current_thd != current_thd)
     {
       if (error)
@@ -171,8 +172,8 @@ bool Rpl_info_table_access::close_table(THD *thd, TABLE* table,
         /*
           To make the commit not to block with global read lock set
           "ignore_global_read_lock" flag to true.
-         */
-        ha_commit_trans(thd, TRUE, TRUE);
+        */
+        ha_commit_trans(thd, TRUE, FALSE, TRUE);
       }
     }
     /*

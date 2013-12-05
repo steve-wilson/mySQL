@@ -808,7 +808,6 @@ Events::init(my_bool opt_noacl_or_bootstrap)
 {
 
   THD *thd;
-  int err_no;
   bool res= FALSE;
 
   DBUG_ENTER("Events::init");
@@ -889,7 +888,7 @@ Events::init(my_bool opt_noacl_or_bootstrap)
   }
 
   if (event_queue->init_queue(thd) || load_events_from_db(thd) ||
-      (opt_event_scheduler == EVENTS_ON && scheduler->start(&err_no)))
+      (opt_event_scheduler == EVENTS_ON && scheduler->start()))
   {
     sql_print_error("Event Scheduler: Error while loading from disk.");
     res= TRUE; /* fatal error: request unireg_abort */
@@ -1051,9 +1050,9 @@ Events::dump_internal_status()
   DBUG_VOID_RETURN;
 }
 
-bool Events::start(int *err_no)
+bool Events::start()
 {
-  return scheduler->start(err_no);
+  return scheduler->start();
 }
 
 bool Events::stop()

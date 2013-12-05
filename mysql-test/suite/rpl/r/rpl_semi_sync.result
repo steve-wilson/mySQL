@@ -1,7 +1,7 @@
 include/master-slave.inc
 Warnings:
 Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
-Note	####	Storing MySQL user name or password information in the master info repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START SLAVE; see the 'START SLAVE Syntax' in the MySQL Manual for more information.
+Note	####	Storing MySQL user name or password information in the master.info repository is not secure and is therefore not recommended. Please see the MySQL Manual for more about this issue and possible alternatives.
 [connection master]
 #
 # Uninstall semi-sync plugins on master and slave
@@ -88,7 +88,7 @@ Variable_name	Value
 Rpl_semi_sync_master_no_tx	0
 show status like 'Rpl_semi_sync_master_yes_tx';
 Variable_name	Value
-Rpl_semi_sync_master_yes_tx	2
+Rpl_semi_sync_master_yes_tx	1
 select CONNECTIONS_NORMAL_SLAVE - CONNECTIONS_NORMAL_SLAVE as 'Should be 0';
 Should be 0
 0
@@ -102,7 +102,7 @@ Variable_name	Value
 Rpl_semi_sync_master_no_tx	0
 show status like 'Rpl_semi_sync_master_yes_tx';
 Variable_name	Value
-Rpl_semi_sync_master_yes_tx	12
+Rpl_semi_sync_master_yes_tx	11
 [ on slave ]
 [ slave status after replicated inserts ]
 show status like 'Rpl_semi_sync_slave_status';
@@ -142,7 +142,7 @@ SET SESSION AUTOCOMMIT= 1;
 #
 include/stop_slave.inc
 [ on master ]
-[ master status should be ON ]
+[ master status should be ON but number of clients should be 0]
 show status like 'Rpl_semi_sync_master_status';
 Variable_name	Value
 Rpl_semi_sync_master_status	ON
@@ -151,10 +151,10 @@ Variable_name	Value
 Rpl_semi_sync_master_no_tx	0
 show status like 'Rpl_semi_sync_master_yes_tx';
 Variable_name	Value
-Rpl_semi_sync_master_yes_tx	17
+Rpl_semi_sync_master_yes_tx	14
 show status like 'Rpl_semi_sync_master_clients';
 Variable_name	Value
-Rpl_semi_sync_master_clients	1
+Rpl_semi_sync_master_clients	0
 [ semi-sync replication of these transactions will fail ]
 insert into t1 values (500);
 [ master status should be OFF ]
@@ -166,7 +166,7 @@ Variable_name	Value
 Rpl_semi_sync_master_no_tx	1
 show status like 'Rpl_semi_sync_master_yes_tx';
 Variable_name	Value
-Rpl_semi_sync_master_yes_tx	17
+Rpl_semi_sync_master_yes_tx	14
 insert into t1 values (100);
 [ master status should be OFF ]
 show status like 'Rpl_semi_sync_master_status';
@@ -177,7 +177,7 @@ Variable_name	Value
 Rpl_semi_sync_master_no_tx	12
 show status like 'Rpl_semi_sync_master_yes_tx';
 Variable_name	Value
-Rpl_semi_sync_master_yes_tx	17
+Rpl_semi_sync_master_yes_tx	14
 #
 # Test semi-sync status on master will be ON again when slave catches up
 #
@@ -210,7 +210,7 @@ Variable_name	Value
 Rpl_semi_sync_master_no_tx	12
 show status like 'Rpl_semi_sync_master_yes_tx';
 Variable_name	Value
-Rpl_semi_sync_master_yes_tx	17
+Rpl_semi_sync_master_yes_tx	14
 show status like 'Rpl_semi_sync_master_clients';
 Variable_name	Value
 Rpl_semi_sync_master_clients	1
@@ -229,7 +229,7 @@ Variable_name	Value
 Rpl_semi_sync_master_no_tx	12
 SHOW STATUS LIKE 'Rpl_semi_sync_master_yes_tx';
 Variable_name	Value
-Rpl_semi_sync_master_yes_tx	19
+Rpl_semi_sync_master_yes_tx	15
 FLUSH NO_WRITE_TO_BINLOG STATUS;
 [ Semi-sync master status variables after FLUSH STATUS ]
 SHOW STATUS LIKE 'Rpl_semi_sync_master_no_tx';
@@ -308,7 +308,7 @@ Variable_name	Value
 Rpl_semi_sync_master_no_tx	0
 show status like 'Rpl_semi_sync_master_yes_tx';
 Variable_name	Value
-Rpl_semi_sync_master_yes_tx	4
+Rpl_semi_sync_master_yes_tx	3
 #
 # Start semi-sync replication without SUPER privilege
 #
@@ -323,7 +323,7 @@ flush privileges;
 change master to master_user='rpl',master_password='rpl';
 Warnings:
 Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
-Note	####	Storing MySQL user name or password information in the master info repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START SLAVE; see the 'START SLAVE Syntax' in the MySQL Manual for more information.
+Note	####	Storing MySQL user name or password information in the master.info repository is not secure and is therefore not recommended. Please see the MySQL Manual for more about this issue and possible alternatives.
 include/start_slave.inc
 show status like 'Rpl_semi_sync_slave_status';
 Variable_name	Value
@@ -450,7 +450,7 @@ UNINSTALL PLUGIN rpl_semi_sync_master;
 change master to master_user='root',master_password='';
 Warnings:
 Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
-Note	####	Storing MySQL user name or password information in the master info repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START SLAVE; see the 'START SLAVE Syntax' in the MySQL Manual for more information.
+Note	####	Storing MySQL user name or password information in the master.info repository is not secure and is therefore not recommended. Please see the MySQL Manual for more about this issue and possible alternatives.
 include/start_slave.inc
 drop table t1;
 drop user rpl@127.0.0.1;

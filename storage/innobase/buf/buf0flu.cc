@@ -834,6 +834,9 @@ buf_flush_init_for_writing(
 	case SRV_CHECKSUM_ALGORITHM_STRICT_CRC32:
 		checksum = buf_calc_page_crc32(page);
 		break;
+	case SRV_CHECKSUM_ALGORITHM_FACEBOOK:
+		checksum = buf_calc_page_crc32fb(page).crc32cfb;
+		break;
 	case SRV_CHECKSUM_ALGORITHM_INNODB:
 	case SRV_CHECKSUM_ALGORITHM_STRICT_INNODB:
 		checksum = (ib_uint32_t) buf_calc_page_new_checksum(page);
@@ -925,7 +928,8 @@ buf_flush_write_block_low(
 	}
 #else
 	/* Force the log to the disk before writing the modified block */
-	log_write_up_to(bpage->newest_modification, LOG_WAIT_ALL_GROUPS, TRUE);
+	log_write_up_to(bpage->newest_modification, LOG_WAIT_ALL_GROUPS, TRUE,
+			LOG_WRITE_FROM_DIRTY_BUFFER);
 #endif
 	switch (buf_page_get_state(bpage)) {
 	case BUF_BLOCK_POOL_WATCH:
@@ -976,7 +980,7 @@ buf_flush_write_block_low(
 	are working on. */
 	if (sync) {
 		ut_ad(flush_type == BUF_FLUSH_SINGLE_PAGE);
-		fil_flush(buf_page_get_space(bpage));
+		fil_flush(buf_page_get_space(bpage), FLUSH_FROM_OTHER);
 		buf_page_io_complete(bpage);
 	}
 
@@ -1024,6 +1028,7 @@ buf_flush_page(
 	}
 
 	buf_pool->n_flush[flush_type]++;
+	buf_pool->n_flushed[flush_type]++;
 
 	is_uncompressed = (buf_page_get_state(bpage) == BUF_BLOCK_FILE_PAGE);
 	ut_ad(is_uncompressed == (block_mutex != &buf_pool->zip_mutex));
@@ -1131,6 +1136,7 @@ buf_flush_page_try(
 	/* The following call will release the buffer pool and
 	block mutex. */
 	buf_flush_page(buf_pool, &block->page, BUF_FLUSH_SINGLE_PAGE, true);
+	srv_stats.buf_pool_flushed.add(1);
 	return(TRUE);
 }
 # endif /* UNIV_DEBUG || UNIV_IBUF_DEBUG */
@@ -1204,6 +1210,7 @@ buf_flush_try_neighbors(
 	ulint		low;
 	ulint		high;
 	ulint		count = 0;
+	ulint		space_size = 0;
 	buf_pool_t*	buf_pool = buf_pool_get(space, offset);
 
 	ut_ad(flush_type == BUF_FLUSH_LRU || flush_type == BUF_FLUSH_LIST);
@@ -1255,8 +1262,10 @@ buf_flush_try_neighbors(
 
 	/* fprintf(stderr, "Flush area: low %lu high %lu\n", low, high); */
 
-	if (high > fil_space_get_size(space)) {
-		high = fil_space_get_size(space);
+	space_size = fil_space_get_size(space);
+
+	if (high > space_size) {
+		high = space_size;
 	}
 
 	for (i = low; i < high; i++) {
@@ -1332,6 +1341,16 @@ buf_flush_try_neighbors(
 					MONITOR_FLUSH_NEIGHBOR_COUNT,
 					MONITOR_FLUSH_NEIGHBOR_PAGES,
 					(count - 1));
+	}
+
+	if (count > 1) {
+		/* This function should do 1 or more writes. If there are more,
+		count the extra writes by type. */
+		if (flush_type == BUF_FLUSH_LRU) {
+			srv_neighbors_flushed_lru += count - 1;
+		} else if (flush_type == BUF_FLUSH_LIST) {
+			srv_neighbors_flushed_list += count - 1;
+		}
 	}
 
 	return(count);
@@ -1434,9 +1453,13 @@ buf_free_from_unzip_LRU_list_batch(
 	while (block != NULL && count < max
 	       && free_len < srv_LRU_scan_depth
 	       && lru_len > UT_LIST_GET_LEN(buf_pool->LRU) / 10) {
+		ibool	freed;
+		ibool	removed;
 
 		++scanned;
-		if (buf_LRU_free_page(&block->page, false)) {
+		freed = buf_LRU_free_page(&block->page, false, &removed);
+
+		if (freed) {
 			/* Block was freed. buf_pool->mutex potentially
 			released and reacquired */
 			++count;
@@ -1513,7 +1536,12 @@ buf_flush_LRU_list_batch(
 		of the flushed pages then the scan becomes
 		O(n*n). */
 		if (evict) {
-			if (buf_LRU_free_page(bpage, true)) {
+			ibool	freed;
+			ibool	removed;
+
+			freed = buf_LRU_free_page(bpage, true, &removed);
+
+			if (freed) {
 				/* buf_pool->mutex was potentially
 				released and reacquired. */
 				bpage = UT_LIST_GET_LAST(buf_pool->LRU);
@@ -1621,6 +1649,7 @@ buf_do_flush_list_batch(
 	     && bpage->oldest_modification < lsn_limit;
 	     ++scanned) {
 
+		bool DBUG_ONLY	flushed;
 		buf_page_t*	prev;
 
 		ut_a(bpage->oldest_modification > 0);
@@ -1631,10 +1660,7 @@ buf_do_flush_list_batch(
 
 		buf_flush_list_mutex_exit(buf_pool);
 
-#ifdef UNIV_DEBUG
-		bool flushed =
-#endif /* UNIV_DEBUG */
-		buf_flush_page_and_try_neighbors(
+		flushed = buf_flush_page_and_try_neighbors(
 			bpage, BUF_FLUSH_LIST, min_n, &count);
 
 		buf_flush_list_mutex_enter(buf_pool);
@@ -2022,6 +2048,8 @@ buf_flush_single_page_from_LRU(
 	block mutex. */
 	buf_flush_page(buf_pool, bpage, BUF_FLUSH_SINGLE_PAGE, true);
 
+	srv_stats.buf_pool_flushed.add(1);
+
 	/* At this point the page has been written to the disk.
 	As we are not holding buffer pool or block mutex therefore
 	we cannot use the bpage safely. It may have been plucked out
@@ -2055,7 +2083,9 @@ buf_flush_single_page_from_LRU(
 
 	evict_zip = !buf_LRU_evict_from_unzip_LRU(buf_pool);;
 
-	freed = buf_LRU_free_page(bpage, evict_zip);
+	ibool removed;
+
+	freed = buf_LRU_free_page(bpage, evict_zip, &removed);
 	buf_pool_mutex_exit(buf_pool);
 
 	return(freed);
@@ -2310,9 +2340,9 @@ page_cleaner_flush_pages_if_needed(void)
 
 	oldest_lsn = buf_pool_get_oldest_modification();
 
-	ut_ad(oldest_lsn <= log_get_lsn());
+	ut_ad(oldest_lsn <= cur_lsn);
 
-	age = cur_lsn > oldest_lsn ? cur_lsn - oldest_lsn : 0;
+	age = cur_lsn - oldest_lsn;
 
 	pct_for_dirty = af_get_pct_for_dirty();
 	pct_for_lsn = af_get_pct_for_lsn(age);
@@ -2374,7 +2404,7 @@ page_cleaner_sleep_if_needed(
 		/* Get sleep interval in micro seconds. We use
 		ut_min() to avoid long sleep in case of
 		wrap around. */
-		os_thread_sleep(ut_min(1000000,
+		os_thread_sleep(ut_min(srv_page_cleaner_interval_millis * 1000,
 				(next_loop_time - cur_time)
 				 * 1000));
 	}
@@ -2392,7 +2422,7 @@ DECLARE_THREAD(buf_flush_page_cleaner_thread)(
 			/*!< in: a dummy parameter required by
 			os_thread_create */
 {
-	ulint	next_loop_time = ut_time_ms() + 1000;
+	ulint	next_loop_time = ut_time_ms() + srv_page_cleaner_interval_millis;
 	ulint	n_flushed = 0;
 	ulint	last_activity = srv_get_activity_count();
 
@@ -2420,7 +2450,7 @@ DECLARE_THREAD(buf_flush_page_cleaner_thread)(
 			page_cleaner_sleep_if_needed(next_loop_time);
 		}
 
-		next_loop_time = ut_time_ms() + 1000;
+		next_loop_time = ut_time_ms() + srv_page_cleaner_interval_millis;
 
 		if (srv_check_activity(last_activity)) {
 			last_activity = srv_get_activity_count();
@@ -2430,11 +2460,10 @@ DECLARE_THREAD(buf_flush_page_cleaner_thread)(
 
 			/* Flush pages from flush_list if required */
 			n_flushed += page_cleaner_flush_pages_if_needed();
-		} else {
+		} else if (srv_idle_flush_pct) {
 			n_flushed = page_cleaner_do_flush_batch(
-							PCT_IO(100),
-							LSN_MAX);
-
+				PCT_IO(srv_idle_flush_pct),
+				LSN_MAX);
 			if (n_flushed) {
 				MONITOR_INC_VALUE_CUMULATIVE(
 					MONITOR_FLUSH_BACKGROUND_TOTAL_PAGE,

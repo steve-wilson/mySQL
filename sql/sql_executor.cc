@@ -191,6 +191,7 @@ JOIN::exec()
   error= do_select(this);
   /* Accumulate the counts from all join iterations of all join parts. */
   thd->inc_examined_row_count(examined_rows);
+  thd->status_var.rows_examined+= examined_rows;
   DBUG_PRINT("counts", ("thd->examined_row_count: %lu",
                         (ulong) thd->get_examined_row_count()));
 
@@ -225,8 +226,8 @@ JOIN::create_intermediate_table(JOIN_TAB *tab, List<Item> *tmp_table_fields,
                                "");
   if (!table)
     DBUG_RETURN(true);
-  tmp_table_param.using_outer_summary_function=
-    tab->tmp_table_param->using_outer_summary_function;
+  tmp_table_param.using_indirect_summary_function=
+    tab->tmp_table_param->using_indirect_summary_function;
   tab->join= this;
   DBUG_ASSERT(tab > tab->join->join_tab);
   (tab - 1)->next_select= sub_select_op;
@@ -956,7 +957,6 @@ do_select(JOIN *join)
       sort_tab= join_tab + const_tables;
     }
     if (sort_tab->filesort &&
-        join->select_options & OPTION_FOUND_ROWS &&
         sort_tab->filesort->sortorder &&
         sort_tab->filesort->limit != HA_POS_ERROR)
     {
@@ -2813,6 +2813,7 @@ end_send(JOIN *join, JOIN_TAB *join_tab, bool end_of_records)
 	  /* Join over all rows in table;  Return number of found rows */
 	  TABLE *table=jt->table;
 
+	  join->select_options ^= OPTION_FOUND_ROWS;
 	  if (table->sort.record_pointers ||
 	      (table->sort.io_cache && my_b_inited(table->sort.io_cache)))
 	  {
@@ -4258,7 +4259,8 @@ QEP_tmp_table::prepare_tmp_table()
                               &join_tab->tmp_table_param->recinfo,
                               join->select_options,
                               join->thd->variables.big_tables,
-                              &join->thd->opt_trace))
+                              &join->thd->opt_trace,
+                              join->thd))
       return true;
     (void) table->file->extra(HA_EXTRA_WRITE_CACHE);
     empty_record(table);

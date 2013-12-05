@@ -860,9 +860,12 @@ static int get_string_length(rpl_gno gno)
   cmp2= cmp * 100LL;
   if (gno >= cmp2)
     len += 2, cmp = cmp2;
-  cmp2= cmp * 10LL;
-  if (gno >= cmp2)
-    len++;
+  if (cmp < 1000000000000000000LL)
+  {
+    cmp2= cmp * 10LL;
+    if (gno >= cmp2)
+      len++;
+  }
 #ifndef DBUG_OFF
   char buf[22];
   DBUG_ASSERT(snprintf(buf, 22, "%lld", gno) == len);
@@ -1255,6 +1258,26 @@ Gtid_set::intersection(const Gtid_set *other, Gtid_set *result)
   RETURN_OK;
 }
 
+/*
+  Allocates memory and returns the pointer to the memory which
+  contains binary string format of Gtid_set. Stores encoded_length
+  in the argument encoded_size. One must deallocate the memory after
+  calling this funciton.
+*/
+uchar* Gtid_set::encode(uint *encoded_size) const
+{
+  DBUG_ENTER("Gtid_set::encode(uint *)");
+  if (sid_lock != NULL)
+    sid_lock->assert_some_wrlock();
+  uint encoded_length = get_encoded_length();
+  uchar *str = (uchar *)my_malloc(encoded_length, MYF(MY_WME));
+  if (str != NULL)
+  {
+    encode(str);
+  }
+  *encoded_size = encoded_length;
+  DBUG_RETURN(str);
+}
 
 void Gtid_set::encode(uchar *buf) const
 {

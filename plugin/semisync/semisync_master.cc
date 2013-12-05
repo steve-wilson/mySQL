@@ -509,6 +509,9 @@ int ReplSemiSyncMaster::reportReplyBinlog(uint32 server_id,
   int   cmp;
   bool  can_release_threads = false;
   bool  need_copy_send_pos = true;
+  LOG_INFO linfo;
+  char *log_name;
+  my_off_t log_pos;
 
   if (!(getMasterEnabled()))
     return 0;
@@ -521,6 +524,59 @@ int ReplSemiSyncMaster::reportReplyBinlog(uint32 server_id,
   if (!getMasterEnabled())
     goto l_end;
 
+  if (commit_file_name_inited_)
+  {
+    /*
+      It is not possible for a slave reply packet to have coordinates
+      greater than commit_file_name_ and commit_file_pos_.
+      after_flush hook running during the flush phase of ordered_commit
+      sets commit_file_name_ and commit_file_pos_ while holding LOCK_log.
+      dump_thread is allowed to read only events upto commit_file_name_
+      and commit_file_pos_, so it is not possible for any slave to receive
+      any events greater than commit_file_name_ and commit_file_pos_.
+    */
+    log_name = commit_file_name_;
+    log_pos = commit_file_pos_;
+  }
+  else
+  {
+    unlock();
+    /*
+      NOTE: get_current_log() acquires LOCK_log, so unlock() must be done
+      before calling get_current_log().
+      Taking LOCK_log after lock() causes deadlock between this thread
+      and a thread inside Repl_semi_sync::writeTranxInBinlog which also
+      acquires both locks.
+    */
+    mysql_bin_log_->get_current_log(&linfo);
+    log_name = base_name(linfo.log_file_name);
+    log_pos = linfo.pos;
+    lock();
+    /*
+      Need to check semi-sync status again since LOCK_binlog is
+      released and acquired which could have changed the status.
+      If not checked, we may hit assert(active_tranxs_ != NULL);
+      assertion.
+    */
+    if (!getMasterEnabled())
+      goto l_end;
+  }
+
+  /*
+    Sanity check the log and pos from the reply. If it is from the 'future'
+    then the slave is horked in some way or the packet was corrupted
+    on the network. In either case we should ignore the reply.
+  */
+  if (ActiveTranx::compare(log_file_name, log_file_pos,
+                           log_name, log_pos) > 0)
+  {
+    sql_print_error("Bad semi-sync reply received: "
+                    "reply position (%s, %llu), "
+                    "current binlog position (%s, %llu).",
+                    log_file_name, log_file_pos,
+                    log_name, log_pos);
+    goto l_end;
+  }
   if (!is_on())
     /* We check to see whether we can switch semi-sync ON. */
     try_switch_on(server_id, log_file_name, log_file_pos);
@@ -616,6 +672,7 @@ int ReplSemiSyncMaster::commitTrx(const char* trx_wait_binlog_name,
     struct timespec abstime;
     int wait_result;
     PSI_stage_info old_stage;
+    bool first_loop= true;
 
     set_timespec(start_ts, 0);
 
@@ -638,21 +695,6 @@ int ReplSemiSyncMaster::commitTrx(const char* trx_wait_binlog_name,
                             (int)is_on());
     }
 
-    /* Calcuate the waiting period. */
-#ifdef __WIN__
-      abstime.tv.i64 = start_ts.tv.i64 + (__int64)wait_timeout_ * TIME_THOUSAND * 10;
-      abstime.max_timeout_msec= (long)wait_timeout_;
-#else
-      abstime.tv_sec = start_ts.tv_sec + wait_timeout_ / TIME_THOUSAND;
-      abstime.tv_nsec = start_ts.tv_nsec +
-        (wait_timeout_ % TIME_THOUSAND) * TIME_MILLION;
-      if (abstime.tv_nsec >= TIME_BILLION)
-      {
-        abstime.tv_sec++;
-        abstime.tv_nsec -= TIME_BILLION;
-      }
-#endif /* __WIN__ */
-
     while (is_on())
     {
       if (reply_file_name_inited_)
@@ -671,36 +713,55 @@ int ReplSemiSyncMaster::commitTrx(const char* trx_wait_binlog_name,
         }
       }
 
-      /* Let us update the info about the minimum binlog position of waiting
-       * threads.
-       */
-      if (wait_file_name_inited_)
+      if (first_loop)
       {
-        int cmp = ActiveTranx::compare(trx_wait_binlog_name, trx_wait_binlog_pos,
-                                       wait_file_name_, wait_file_pos_);
-        if (cmp <= 0)
-	{
-          /* This thd has a lower position, let's update the minimum info. */
+        first_loop= false;
+        /* Let us update the info about the minimum binlog position of waiting
+         * threads.
+         */
+        if (wait_file_name_inited_)
+        {
+          int cmp = ActiveTranx::compare(trx_wait_binlog_name, trx_wait_binlog_pos,
+                                         wait_file_name_, wait_file_pos_);
+          if (cmp <= 0)
+          {
+            /* This thd has a lower position, let's update the minimum info. */
+            strcpy(wait_file_name_, trx_wait_binlog_name);
+            wait_file_pos_ = trx_wait_binlog_pos;
+
+            rpl_semi_sync_master_wait_pos_backtraverse++;
+            if (trace_level_ & kTraceDetail)
+              sql_print_information("%s: move back wait position (%s, %lu),",
+                                    kWho, wait_file_name_, (unsigned long)wait_file_pos_);
+          }
+        }
+        else
+        {
           strcpy(wait_file_name_, trx_wait_binlog_name);
           wait_file_pos_ = trx_wait_binlog_pos;
+          wait_file_name_inited_ = true;
 
-          rpl_semi_sync_master_wait_pos_backtraverse++;
           if (trace_level_ & kTraceDetail)
-            sql_print_information("%s: move back wait position (%s, %lu),",
+            sql_print_information("%s: init wait position (%s, %lu),",
                                   kWho, wait_file_name_, (unsigned long)wait_file_pos_);
         }
-      }
-      else
-      {
-        strcpy(wait_file_name_, trx_wait_binlog_name);
-        wait_file_pos_ = trx_wait_binlog_pos;
-        wait_file_name_inited_ = true;
 
-        if (trace_level_ & kTraceDetail)
-          sql_print_information("%s: init wait position (%s, %lu),",
-                                kWho, wait_file_name_, (unsigned long)wait_file_pos_);
-      }
+        /* Calcuate the waiting period. */
+#ifdef __WIN__
+        abstime.tv.i64 = start_ts.tv.i64 + (__int64)wait_timeout_ * TIME_THOUSAND * 10;
+        abstime.max_timeout_msec= (long)wait_timeout_;
+#else
+        abstime.tv_sec = start_ts.tv_sec + wait_timeout_ / TIME_THOUSAND;
+        abstime.tv_nsec = start_ts.tv_nsec +
+          (wait_timeout_ % TIME_THOUSAND) * TIME_MILLION;
 
+        if (abstime.tv_nsec >= TIME_BILLION)
+        {
+          abstime.tv_sec++;
+          abstime.tv_nsec -= TIME_BILLION;
+        }
+#endif /* __WIN__ */
+      }
       /* In semi-synchronous replication, we wait until the binlog-dump
        * thread has received the reply on the relevant binlog segment from the
        * replication slave.
@@ -760,8 +821,9 @@ int ReplSemiSyncMaster::commitTrx(const char* trx_wait_binlog_name,
       At this point, the binlog file and position of this transaction
       must have been removed from ActiveTranx.
     */
-    assert(!active_tranxs_->is_tranx_end_pos(trx_wait_binlog_name,
-                                             trx_wait_binlog_pos));
+    if (active_tranxs_ != NULL)
+      assert(!active_tranxs_->is_tranx_end_pos(trx_wait_binlog_name,
+                                               trx_wait_binlog_pos));
     
     /* Update the status counter. */
     if (is_on())
@@ -798,14 +860,16 @@ int ReplSemiSyncMaster::commitTrx(const char* trx_wait_binlog_name,
 int ReplSemiSyncMaster::switch_off()
 {
   const char *kWho = "ReplSemiSyncMaster::switch_off";
-  int result;
+  int result = 0;
 
   function_enter(kWho);
   state_ = false;
 
-  /* Clear the active transaction list. */
-  assert(active_tranxs_ != NULL);
-  result = active_tranxs_->clear_active_tranx_nodes(NULL, 0);
+  if (active_tranxs_ != NULL)
+  {
+    /* Clear the active transaction list. */
+    result = active_tranxs_->clear_active_tranx_nodes(NULL, 0);
+  }
 
   rpl_semi_sync_master_off_times++;
   wait_file_name_inited_   = false;
@@ -863,28 +927,22 @@ int ReplSemiSyncMaster::reserveSyncHeader(unsigned char *header,
   function_enter(kWho);
 
   int hlen=0;
-  if (!is_semi_sync_slave())
+  DBUG_ASSERT(is_semi_sync_slave());
+  /* No enough space for the extra header, disable semi-sync master */
+  if (sizeof(kSyncHeader) > size)
   {
-    hlen= 0;
+    sql_print_warning("No enough space in the packet "
+                      "for semi-sync extra header, "
+                      "semi-sync replication disabled");
+    disableMaster();
+    return 0;
   }
-  else
-  {
-    /* No enough space for the extra header, disable semi-sync master */
-    if (sizeof(kSyncHeader) > size)
-    {
-      sql_print_warning("No enough space in the packet "
-                        "for semi-sync extra header, "
-                        "semi-sync replication disabled");
-      disableMaster();
-      return 0;
-    }
-    
-    /* Set the magic number and the sync status.  By default, no sync
-     * is required.
-     */
-    memcpy(header, kSyncHeader, sizeof(kSyncHeader));
-    hlen= sizeof(kSyncHeader);
-  }
+
+  /* Set the magic number and the sync status.  By default, no sync
+   * is required.
+   */
+  memcpy(header, kSyncHeader, sizeof(kSyncHeader));
+  hlen= sizeof(kSyncHeader);
   return function_exit(kWho, hlen);
 }
 
@@ -900,7 +958,8 @@ int ReplSemiSyncMaster::updateSyncHeader(unsigned char *packet,
   /* If the semi-sync master is not enabled, or the slave is not a semi-sync
    * target, do not request replies from the slave.
    */
-  if (!getMasterEnabled() || !is_semi_sync_slave())
+  DBUG_ASSERT(is_semi_sync_slave());
+  if (!getMasterEnabled())
   {
     sync = false;
     return 0;

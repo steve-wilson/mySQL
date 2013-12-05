@@ -1,4 +1,4 @@
-/* Copyright (c) 2002, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2009, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -803,14 +803,13 @@ public:
           const char *substitute=0,
           int parse_flag= PARSE_NORMAL)
     : sys_var(&all_sys_vars, name_arg, comment, flag_args, off, getopt.id,
-              getopt.arg_type, SHOW_DOUBLE,
-              (longlong) getopt_double2ulonglong(def_val),
+              getopt.arg_type, SHOW_DOUBLE, (longlong) double2ulonglong(def_val),
               lock, binlog_status_arg, on_check_func, on_update_func,
               substitute, parse_flag)
   {
     option.var_type= GET_DOUBLE;
-    option.min_value= (longlong) getopt_double2ulonglong(min_val);
-    option.max_value= (longlong) getopt_double2ulonglong(max_val);
+    option.min_value= (longlong) double2ulonglong(min_val);
+    option.max_value= (longlong) double2ulonglong(max_val);
     global_var(double)= (double)option.def_value;
     DBUG_ASSERT(min_val <= max_val);
     DBUG_ASSERT(min_val <= def_val);
@@ -842,7 +841,7 @@ public:
   void session_save_default(THD *thd, set_var *var)
   { var->save_result.double_value= global_var(double); }
   void global_save_default(THD *thd, set_var *var)
-  { var->save_result.double_value= getopt_ulonglong2double(option.def_value); }
+  { var->save_result.double_value= (double)option.def_value; }
 };
 
 /**

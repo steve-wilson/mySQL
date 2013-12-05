@@ -518,6 +518,7 @@ else
 fi
 plugin_dir="${plugin_dir}${PLUGIN_VARIANT}"
 
+
 # Determine what logging facility to use
 
 # Ensure that 'logger' exists, if it's requested
@@ -541,7 +542,6 @@ then
 
     # mysqld does not add ".err" to "--log-error=foo."; it considers a
     # trailing "." as an extension
-    
     if expr "$err_log" : '.*\.[^/]*$' > /dev/null
     then
         :

@@ -1,7 +1,7 @@
 include/master-slave.inc
 Warnings:
 Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
-Note	####	Storing MySQL user name or password information in the master info repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START SLAVE; see the 'START SLAVE Syntax' in the MySQL Manual for more information.
+Note	####	Storing MySQL user name or password information in the master.info repository is not secure and is therefore not recommended. Please see the MySQL Manual for more about this issue and possible alternatives.
 [connection master]
 create view coord_wait_list as
 SELECT id from Information_Schema.processlist
@@ -28,6 +28,12 @@ commit;
 *** Coordinator must be waiting for Workers have released pending events mem ***
 rollback;
 set @@global.slave_pending_jobs_size_max= @save_slave_pending_jobs_size_max;
+set global debug = "d,slave_worker_queue_size";
+include/stop_slave.inc
+include/start_slave.inc
+begin;
+commit;
+set global debug = '';
 drop database d0;
 drop view coord_wait_list;
 drop view worker_wait_list;

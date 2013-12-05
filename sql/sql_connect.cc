@@ -21,6 +21,7 @@
 
 #include "my_global.h"
 #include "sql_priv.h"
+#include "sql_base.h"
 #include "sql_audit.h"
 #include "sql_connect.h"
 #include "my_global.h"
@@ -34,7 +35,7 @@
                       // reset_host_errors
 #include "sql_acl.h"  // acl_getroot, NO_ACCESS, SUPER_ACL
 #include "sql_callback.h"
-
+#include "sql_show.h" // schema_table_store_record
 #include <algorithm>
 
 using std::min;
@@ -64,6 +65,27 @@ using std::max;
 
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
 static HASH hash_user_connections;
+
+/** Undo the work done by get_or_create_user_conn and increment the failed
+    connection counters.
+*/
+void fix_user_conn(THD *thd, bool global_max)
+{
+  USER_STATS *us = thd_get_user_stats(thd);
+  DBUG_ASSERT(us->magic == USER_STATS_MAGIC);
+
+  mysql_mutex_lock(&LOCK_user_conn);
+  thd->decrement_user_connections_counter();
+  us->connections_total--;
+
+  if (global_max)
+    us->connections_denied_max_global++;
+  else
+    us->connections_denied_max_user++;
+
+  thd->set_user_connect(NULL);
+  mysql_mutex_unlock(&LOCK_user_conn);
+}
 
 int get_or_create_user_conn(THD *thd, const char *user,
                             const char *host,
@@ -106,9 +128,11 @@ int get_or_create_user_conn(THD *thd, const char *user,
       return_val= 1;
       goto end;
     }
+    init_user_stats(&(uc->user_stats));
   }
   thd->set_user_connect(uc);
   thd->increment_user_connections_counter();
+  uc->user_stats.connections_total++;
 end:
   mysql_mutex_unlock(&LOCK_user_conn);
   return return_val;
@@ -133,11 +157,13 @@ end:
     1 error
 */
 
-int check_for_max_user_connections(THD *thd, const USER_CONN *uc)
+int check_for_max_user_connections(THD *thd, USER_CONN *uc, bool *global_max)
 {
   int error=0;
   Host_errors errors;
   DBUG_ENTER("check_for_max_user_connections");
+
+  *global_max= false;
 
   mysql_mutex_lock(&LOCK_user_conn);
   if (global_system_variables.max_user_connections &&
@@ -145,6 +171,7 @@ int check_for_max_user_connections(THD *thd, const USER_CONN *uc)
       global_system_variables.max_user_connections < (uint) uc->connections)
   {
     my_error(ER_TOO_MANY_USER_CONNECTIONS, MYF(0), uc->user);
+    *global_max = true;
     error=1;
     errors.m_max_user_connection= 1;
     goto end;
@@ -173,20 +200,10 @@ int check_for_max_user_connections(THD *thd, const USER_CONN *uc)
   thd->increment_con_per_hour_counter();
 
 end:
-  if (error)
-  {
-    thd->decrement_user_connections_counter();
-    /*
-      The thread may returned back to the pool and assigned to a user
-      that doesn't have a limit. Ensure the user is not using resources
-      of someone else.
-    */
-    thd->set_user_connect(NULL);
-  }
   mysql_mutex_unlock(&LOCK_user_conn);
   if (error)
   {
-    inc_host_errors(thd->main_security_ctx.get_ip()->ptr(), &errors);
+    inc_host_errors(thd->main_security_ctx.ip, &errors);
   }
   DBUG_RETURN(error);
 }
@@ -215,11 +232,8 @@ void decrease_user_connections(USER_CONN *uc)
   DBUG_ENTER("decrease_user_connections");
   mysql_mutex_lock(&LOCK_user_conn);
   DBUG_ASSERT(uc->connections);
-  if (!--uc->connections && !mqh_used)
-  {
-    /* Last connection for user; Delete it */
-    (void) my_hash_delete(&hash_user_connections,(uchar*) uc);
-  }
+  uc->connections--;
+  /* To preserve data in uc->user_stats, delete is no longer done */
   mysql_mutex_unlock(&LOCK_user_conn);
   DBUG_VOID_RETURN;
 }
@@ -242,11 +256,7 @@ void release_user_connection(THD *thd)
     mysql_mutex_lock(&LOCK_user_conn);
     DBUG_ASSERT(uc->connections > 0);
     thd->decrement_user_connections_counter();
-    if (!uc->connections && !mqh_used)
-    {
-      /* Last connection for user; Delete it */
-      (void) my_hash_delete(&hash_user_connections,(uchar*) uc);
-    }
+    /* To preserve data in uc->user_stats, delete is no longer done */
     mysql_mutex_unlock(&LOCK_user_conn);
     thd->set_user_connect(NULL);
   }
@@ -513,7 +523,7 @@ static int check_connection(THD *thd)
   thd->set_active_vio(net->vio);
 #endif
 
-  if (!thd->main_security_ctx.get_host()->length())     // If TCP/IP connection
+  if (!thd->main_security_ctx.host)         // If TCP/IP connection
   {
     my_bool peer_rc;
     char ip[NI_MAXHOST];
@@ -593,8 +603,7 @@ static int check_connection(THD *thd)
       my_error(ER_BAD_HOST_ERROR, MYF(0));
       return 1;
     }
-    thd->main_security_ctx.set_ip(my_strdup(ip, MYF(MY_WME)));
-    if (!(thd->main_security_ctx.get_ip()->length()))
+    if (!(thd->main_security_ctx.ip= my_strdup(ip,MYF(MY_WME))))
     {
       /*
         No error accounting per IP in host_cache,
@@ -604,26 +613,23 @@ static int check_connection(THD *thd)
       statistic_increment(connection_errors_internal, &LOCK_status);
       return 1; /* The error is set by my_strdup(). */
     }
-    thd->main_security_ctx.host_or_ip= thd->main_security_ctx.get_ip()->ptr();
+    thd->main_security_ctx.host_or_ip= thd->main_security_ctx.ip;
     if (!(specialflag & SPECIAL_NO_RESOLVE))
     {
       int rc;
-      char *host= (char *) thd->main_security_ctx.get_host()->ptr();
 
       rc= ip_to_hostname(&net->vio->remote,
-                         thd->main_security_ctx.get_ip()->ptr(),
-                         &host, &connect_errors);
+                         thd->main_security_ctx.ip,
+                         &thd->main_security_ctx.host,
+                         &connect_errors);
 
-      thd->main_security_ctx.set_host(host);
       /* Cut very long hostnames to avoid possible overflows */
-      if (thd->main_security_ctx.get_host()->length())
+      if (thd->main_security_ctx.host)
       {
-        if (thd->main_security_ctx.get_host()->ptr() != my_localhost)
-          thd->main_security_ctx.set_host(thd->main_security_ctx.get_host()->ptr(),
-                               min<size_t>(thd->main_security_ctx.get_host()->length(),
-                               HOSTNAME_LENGTH));
-        thd->main_security_ctx.host_or_ip=
-                        thd->main_security_ctx.get_host()->ptr();
+        if (thd->main_security_ctx.host != my_localhost)
+          thd->main_security_ctx.host[min<size_t>(strlen(thd->main_security_ctx.host),
+                                                  HOSTNAME_LENGTH)]= 0;
+        thd->main_security_ctx.host_or_ip= thd->main_security_ctx.host;
       }
 
       if (rc == RC_BLOCKED_HOST)
@@ -634,12 +640,11 @@ static int check_connection(THD *thd)
       }
     }
     DBUG_PRINT("info",("Host: %s  ip: %s",
-           (thd->main_security_ctx.get_host()->length() ?
-                 thd->main_security_ctx.get_host()->ptr() : "unknown host"),
-           (thd->main_security_ctx.get_ip()->length() ?
-                 thd->main_security_ctx.get_ip()->ptr() : "unknown ip")));
-    if (acl_check_host(thd->main_security_ctx.get_host()->ptr(),
-                       thd->main_security_ctx.get_ip()->ptr()))
+           (thd->main_security_ctx.host ?
+                        thd->main_security_ctx.host : "unknown host"),
+           (thd->main_security_ctx.ip ?
+                        thd->main_security_ctx.ip : "unknown ip")));
+    if (acl_check_host(thd->main_security_ctx.host, thd->main_security_ctx.ip))
     {
       /* HOST_CACHE stats updated by acl_check_host(). */
       my_error(ER_HOST_NOT_PRIVILEGED, MYF(0),
@@ -649,9 +654,9 @@ static int check_connection(THD *thd)
   }
   else /* Hostname given means that the connection was on a socket */
   {
-    DBUG_PRINT("info",("Host: %s", thd->main_security_ctx.get_host()->ptr()));
-    thd->main_security_ctx.host_or_ip= thd->main_security_ctx.get_host()->ptr();
-    thd->main_security_ctx.set_ip("");
+    DBUG_PRINT("info",("Host: %s", thd->main_security_ctx.host));
+    thd->main_security_ctx.host_or_ip= thd->main_security_ctx.host;
+    thd->main_security_ctx.ip= 0;
     /* Reset sin_addr */
     memset(&net->vio->remote, 0, sizeof(net->vio->remote));
   }
@@ -682,7 +687,7 @@ static int check_connection(THD *thd)
       after some previous failures.
       Reset the connection error counter.
     */
-    reset_host_connect_errors(thd->main_security_ctx.get_ip()->ptr());
+    reset_host_connect_errors(thd->main_security_ctx.ip);
   }
 
   return auth_rc;
@@ -740,8 +745,8 @@ bool login_connection(THD *thd)
                       thd->thread_id));
 
   /* Use "connect_timeout" value during connection phase */
-  my_net_set_read_timeout(net, connect_timeout);
-  my_net_set_write_timeout(net, connect_timeout);
+  my_net_set_read_timeout(net, timeout_from_seconds(connect_timeout));
+  my_net_set_write_timeout(net, timeout_from_seconds(connect_timeout));
 
   error= check_connection(thd);
   thd->protocol->end_statement();
@@ -756,8 +761,10 @@ bool login_connection(THD *thd)
     DBUG_RETURN(1);
   }
   /* Connect completed, set read/write timeouts back to default */
-  my_net_set_read_timeout(net, thd->variables.net_read_timeout);
-  my_net_set_write_timeout(net, thd->variables.net_write_timeout);
+  my_net_set_read_timeout(
+    net, timeout_from_seconds(thd->variables.net_read_timeout_seconds));
+  my_net_set_write_timeout(
+    net, timeout_from_seconds(thd->variables.net_write_timeout_seconds));
   DBUG_RETURN(0);
 }
 
@@ -774,14 +781,25 @@ void end_connection(THD *thd)
   NET *net= &thd->net;
   plugin_thdvar_cleanup(thd);
 
-  /*
-    The thread may returned back to the pool and assigned to a user
-    that doesn't have a limit. Ensure the user is not using resources
-    of someone else.
-  */
-  release_user_connection(thd);
+  bool end_on_error= thd->killed || (net->error && net->vio != 0);
+  USER_CONN *uc = const_cast<USER_CONN*>(thd->get_user_connect());
+  if (uc)
+  {
+    DBUG_ASSERT(uc->user_stats.magic == USER_STATS_MAGIC);
 
-  if (thd->killed || (net->error && net->vio != 0))
+    if (end_on_error)
+    {
+      uc->user_stats.connections_lost++;
+    }
+    /*
+      The thread may returned back to the pool and assigned to a user
+      that doesn't have a limit. Ensure the user is not using resources
+      of someone else.
+    */
+    release_user_connection(thd);
+  }
+
+  if (end_on_error)
   {
     statistic_increment(aborted_threads,&LOCK_status);
   }
@@ -842,7 +860,8 @@ void prepare_new_connection_state(THD* thd)
       sql_print_warning("%s", thd->get_stmt_da()->message());
 
       thd->lex->current_select= 0;
-      my_net_set_read_timeout(net, thd->variables.net_wait_timeout);
+      my_net_set_read_timeout(
+        net, timeout_from_seconds(thd->variables.net_wait_timeout_seconds));
       thd->clear_error();
       net_new_transaction(net);
       packet_length= my_net_read(net);
@@ -861,7 +880,7 @@ void prepare_new_connection_state(THD* thd)
       thd->protocol->end_statement();
       thd->killed = THD::KILL_CONNECTION;
       errors.m_init_connect= 1;
-      inc_host_errors(thd->main_security_ctx.get_ip()->ptr(), &errors);
+      inc_host_errors(thd->main_security_ctx.ip, &errors);
       return;
     }
 
@@ -998,4 +1017,302 @@ end_thread:
     thd->thread_stack= (char*) &thd;
   }
 }
+
+/* This is a BSD license and covers the changes to the end of the file */
+/* Copyright (C) 2009 Google, Inc.
+   Copyright (C) 2010 Facebook, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of Google nor the
+      names of its contributors may be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY Google ''AS IS'' AND ANY
+EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL Google BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+/** Resets user statistics.
+
+    Returns 0 on success;
+*/
+
+void reset_global_user_stats()
+{
+  DBUG_ENTER("reset_global_user_stats");
+
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+  mysql_mutex_lock(&LOCK_user_conn);
+
+  for (uint i = 0; i < hash_user_connections.records; ++i)
+  {
+    USER_CONN *uc = (USER_CONN*)my_hash_element(&hash_user_connections, i);
+
+    init_user_stats(&(uc->user_stats));
+  }
+  init_user_stats(&slave_user_stats);
+  init_user_stats(&other_user_stats);
+
+  mysql_mutex_unlock(&LOCK_user_conn);
+#endif
+  DBUG_VOID_RETURN;
+}
+
+void init_user_stats(USER_STATS *user_stats)
+{
+  DBUG_ENTER("init_user_stats");
+
+  my_io_perf_init(&(user_stats->io_perf_read));
+  my_io_perf_init(&(user_stats->io_perf_read_blob));
+  my_io_perf_init(&(user_stats->io_perf_read_primary));
+  my_io_perf_init(&(user_stats->io_perf_read_secondary));
+
+  user_stats->binlog_bytes_written= 0;
+  user_stats->bytes_received= 0;
+  user_stats->bytes_sent= 0;
+  user_stats->commands_ddl= 0;
+  user_stats->commands_delete= 0;
+  user_stats->commands_handler= 0;
+  user_stats->commands_insert= 0;
+  user_stats->commands_other= 0;
+  user_stats->commands_select= 0;
+  user_stats->commands_transaction= 0;
+  user_stats->commands_update= 0;
+  user_stats->connections_denied_max_global= 0;
+  user_stats->connections_denied_max_user= 0;
+  user_stats->connections_lost= 0;
+  user_stats->connections_total= 0;
+  user_stats->errors_access_denied= 0;
+  user_stats->errors_total= 0;
+  user_stats->microseconds_wall= 0;
+  user_stats->microseconds_ddl= 0;
+  user_stats->microseconds_delete= 0;
+  user_stats->microseconds_handler= 0;
+  user_stats->microseconds_insert= 0;
+  user_stats->microseconds_other= 0;
+  user_stats->microseconds_select= 0;
+  user_stats->microseconds_transaction= 0;
+  user_stats->microseconds_update= 0;
+  user_stats->queries_empty= 0;
+  user_stats->query_comment_bytes= 0;
+  user_stats->relay_log_bytes_written= 0;
+  user_stats->rows_deleted= 0;
+  user_stats->rows_fetched= 0;
+  user_stats->rows_inserted= 0;
+  user_stats->rows_read= 0;
+  user_stats->rows_updated= 0;
+  user_stats->rows_index_first= 0;
+  user_stats->rows_index_next= 0;
+  user_stats->transactions_commit= 0;
+  user_stats->transactions_rollback= 0;
+  user_stats->n_gtid_unsafe_create_select= 0;
+  user_stats->n_gtid_unsafe_create_drop_temporary_table_in_transaction= 0;
+  user_stats->n_gtid_unsafe_non_transactional_table= 0;
+  user_stats->magic = USER_STATS_MAGIC;
+  DBUG_VOID_RETURN;
+}
+
+void
+update_user_stats_after_statement(USER_STATS *us,
+                                  THD *thd,
+                                  ulonglong wall_time,
+                                  bool is_other_command,
+                                  bool is_xid_event,
+                                  my_io_perf_t *start_perf_read,
+                                  my_io_perf_t *start_perf_read_blob,
+                                  my_io_perf_t *start_perf_read_primary,
+                                  my_io_perf_t *start_perf_read_secondary)
+{
+  my_io_perf_t diff_io_perf, diff_io_perf_blob;
+  my_io_perf_t diff_io_perf_primary, diff_io_perf_secondary;
+  ulonglong wall_microsecs= my_timer_to_microseconds(wall_time);
+
+  my_atomic_add64((longlong*)&(us->microseconds_wall), wall_microsecs);
+
+  /* COM_QUERY is counted in mysql_execute_command */
+  if (is_other_command)
+  {
+    my_atomic_add64((longlong*)&(us->commands_other), 1);
+    my_atomic_add64((longlong*)&(us->microseconds_other), wall_microsecs);
+  }
+
+  if (!is_xid_event)
+  {
+    my_atomic_add64((longlong*)&(us->query_comment_bytes), thd->count_comment_bytes);
+    my_atomic_add64((longlong*)&(us->rows_updated), thd->rows_updated);
+    my_atomic_add64((longlong*)&(us->rows_deleted), thd->rows_deleted);
+    my_atomic_add64((longlong*)&(us->rows_inserted), thd->rows_inserted);
+    my_atomic_add64((longlong*)&(us->rows_read), thd->rows_read);
+
+    my_atomic_add64((longlong*)&(us->rows_index_first), thd->rows_index_first);
+    my_atomic_add64((longlong*)&(us->rows_index_next), thd->rows_index_next);
+
+    my_io_perf_diff(&diff_io_perf, &thd->io_perf_read, start_perf_read);
+    my_io_perf_diff(&diff_io_perf_blob, &thd->io_perf_read_blob,
+                    start_perf_read_blob);
+    my_io_perf_diff(&diff_io_perf_primary, &thd->io_perf_read_primary,
+                    start_perf_read_primary);
+    my_io_perf_diff(&diff_io_perf_secondary, &thd->io_perf_read_secondary,
+                    start_perf_read_secondary);
+
+    my_io_perf_sum_atomic_helper(&(us->io_perf_read), &diff_io_perf);
+    my_io_perf_sum_atomic_helper(&(us->io_perf_read_blob), &diff_io_perf_blob);
+    my_io_perf_sum_atomic_helper(&(us->io_perf_read_primary),
+                                 &diff_io_perf_primary);
+    my_io_perf_sum_atomic_helper(&(us->io_perf_read_secondary),
+                                 &diff_io_perf_secondary);
+  }
+  else
+  {
+    my_atomic_add64((longlong*)&(us->commands_transaction), 1);
+    my_atomic_add64((longlong*)&(us->microseconds_transaction), wall_microsecs);
+  }
+}
+
+static void
+fill_one_user_stats(TABLE *table, USER_CONN *uc, USER_STATS* us,
+                    const char* username, uint connections)
+{
+  DBUG_ENTER("fill_one_user_stats");
+  int f= 0; /* field offset */
+
+  restore_record(table, s->default_values);
+
+  table->field[f++]->store(username, strlen(username), system_charset_info);
+
+  table->field[f++]->store(us->binlog_bytes_written, TRUE);
+  table->field[f++]->store(us->bytes_received, TRUE);
+  table->field[f++]->store(us->bytes_sent, TRUE);
+  table->field[f++]->store(us->commands_ddl, TRUE);
+  table->field[f++]->store(us->commands_delete, TRUE);
+  table->field[f++]->store(us->commands_handler, TRUE);
+  table->field[f++]->store(us->commands_insert, TRUE);
+  table->field[f++]->store(us->commands_other, TRUE);
+  table->field[f++]->store(us->commands_select, TRUE);
+  table->field[f++]->store(us->commands_transaction, TRUE);
+  table->field[f++]->store(us->commands_update, TRUE);
+  /* concurrent connections for this user */
+  table->field[f++]->store(connections, TRUE);
+  table->field[f++]->store(us->connections_denied_max_global, TRUE);
+  table->field[f++]->store(us->connections_denied_max_user, TRUE);
+  table->field[f++]->store(us->connections_lost, TRUE);
+  table->field[f++]->store(us->connections_total, TRUE);
+  table->field[f++]->store(us->io_perf_read.bytes, TRUE);
+  table->field[f++]->store(us->io_perf_read.requests, TRUE);
+  table->field[f++]->store((ulonglong)my_timer_to_microseconds(
+                             us->io_perf_read.svc_time),
+                           TRUE);
+  table->field[f++]->store((ulonglong)my_timer_to_microseconds(
+                             us->io_perf_read.wait_time),
+                           TRUE);
+  table->field[f++]->store(us->io_perf_read_blob.bytes, TRUE);
+  table->field[f++]->store(us->io_perf_read_blob.requests, TRUE);
+  table->field[f++]->store((ulonglong)my_timer_to_microseconds(
+                             us->io_perf_read_blob.svc_time),
+                           TRUE);
+  table->field[f++]->store((ulonglong)my_timer_to_microseconds(
+                             us->io_perf_read_blob.wait_time),
+                           TRUE);
+  table->field[f++]->store(us->io_perf_read_primary.bytes, TRUE);
+  table->field[f++]->store(us->io_perf_read_primary.requests, TRUE);
+  table->field[f++]->store((ulonglong)my_timer_to_microseconds(
+                             us->io_perf_read_primary.svc_time), TRUE);
+  table->field[f++]->store((ulonglong)my_timer_to_microseconds(
+                             us->io_perf_read_primary.wait_time),
+                           TRUE);
+  table->field[f++]->store(us->io_perf_read_secondary.bytes, TRUE);
+  table->field[f++]->store(us->io_perf_read_secondary.requests, TRUE);
+  table->field[f++]->store((ulonglong)my_timer_to_microseconds(
+                             us->io_perf_read_secondary.svc_time),
+                           TRUE);
+  table->field[f++]->store((ulonglong)my_timer_to_microseconds(
+                             us->io_perf_read_secondary.wait_time),
+                           TRUE);
+  table->field[f++]->store(us->errors_access_denied, TRUE);
+  table->field[f++]->store(us->errors_total, TRUE);
+  table->field[f++]->store(us->microseconds_wall, TRUE);
+  table->field[f++]->store(us->microseconds_ddl, TRUE);
+  table->field[f++]->store(us->microseconds_delete, TRUE);
+  table->field[f++]->store(us->microseconds_handler, TRUE);
+  table->field[f++]->store(us->microseconds_insert, TRUE);
+  table->field[f++]->store(us->microseconds_other, TRUE);
+  table->field[f++]->store(us->microseconds_select, TRUE);
+  table->field[f++]->store(us->microseconds_transaction, TRUE);
+  table->field[f++]->store(us->microseconds_update, TRUE);
+  table->field[f++]->store(us->queries_empty, TRUE);
+  table->field[f++]->store(us->query_comment_bytes, TRUE);
+  table->field[f++]->store(us->relay_log_bytes_written, TRUE);
+  table->field[f++]->store(us->rows_deleted, TRUE);
+  table->field[f++]->store(us->rows_fetched, TRUE);
+  table->field[f++]->store(us->rows_inserted, TRUE);
+  table->field[f++]->store(us->rows_read, TRUE);
+  table->field[f++]->store(us->rows_updated, TRUE);
+  table->field[f++]->store(us->rows_index_first, TRUE);
+  table->field[f++]->store(us->rows_index_next, TRUE);
+  table->field[f++]->store(us->transactions_commit, TRUE);
+  table->field[f++]->store(us->transactions_rollback, TRUE);
+  table->field[f++]->store(us->n_gtid_unsafe_create_select, TRUE);
+  table->field[f++]->store(us->n_gtid_unsafe_create_drop_temporary_table_in_transaction, TRUE);
+  table->field[f++]->store(us->n_gtid_unsafe_non_transactional_table, TRUE);
+  DBUG_VOID_RETURN;
+}
+
+int fill_user_stats(THD *thd, TABLE_LIST *tables, Item *cond)
+{
+  DBUG_ENTER("fill_user_stats");
+  TABLE* table= tables->table;
+
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+  mysql_mutex_lock(&LOCK_user_conn);
+
+  for (uint idx=0;idx < hash_user_connections.records; idx++)
+  {
+    USER_CONN *user_conn= (struct user_conn *)
+      my_hash_element(&hash_user_connections, idx);
+    USER_STATS *us = &(user_conn->user_stats);
+
+    fill_one_user_stats(table, user_conn, us, user_conn->user,
+                        user_conn->connections);
+
+    if (schema_table_store_record(thd, table))
+    {
+      mysql_mutex_unlock(&LOCK_user_conn);
+      DBUG_RETURN(-1);
+    }
+  }
+
+  fill_one_user_stats(table, NULL, &slave_user_stats, "sys:slave", 0);
+  if (schema_table_store_record(thd, table))
+  {
+    mysql_mutex_unlock(&LOCK_user_conn);
+    DBUG_RETURN(-1);
+  }
+
+  fill_one_user_stats(table, NULL, &other_user_stats, "sys:other", 0);
+  if (schema_table_store_record(thd, table))
+  {
+    mysql_mutex_unlock(&LOCK_user_conn);
+    DBUG_RETURN(-1);
+  }
+
+  mysql_mutex_unlock(&LOCK_user_conn);
+#endif /* NO_EMBEDDED_ACCESS_CHECKS */
+
+  DBUG_RETURN(0);
+}
+
 #endif /* EMBEDDED_LIBRARY */

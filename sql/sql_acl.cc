@@ -83,7 +83,7 @@ TABLE_FIELD_TYPE mysql_db_table_fields[MYSQL_DB_FIELD_COUNT] = {
   }, 
   {
     { C_STRING_WITH_LEN("User") },
-    { C_STRING_WITH_LEN("char(16)") },
+    { C_STRING_WITH_LEN("char(32)") },
     {NULL, 0}
   },
   {
@@ -192,7 +192,7 @@ TABLE_FIELD_TYPE mysql_user_table_fields[MYSQL_USER_FIELD_COUNT] = {
   },
   {
     { C_STRING_WITH_LEN("User") },            
-    { C_STRING_WITH_LEN("char(16)") },
+    { C_STRING_WITH_LEN("char(32)") },
     { NULL, 0 }
   },
   {
@@ -1164,7 +1164,7 @@ static my_bool acl_load(THD *thd, TABLE_LIST *tables)
           user.user_resource.user_conn= ptr ? atoi(ptr) : 0;
         }
 
-        if (table->s->fields >= 41)
+        if (table->s->fields >= 43) // Not 41, For Facebook Admission Control
         {
           /* We may have plugin & auth_String fields */
           char *tmpstr= get_field(&global_acl_memory,
@@ -1476,27 +1476,15 @@ void acl_free(bool end)
 
   @note We assume that we have only read from the tables so commit
         can't fail. @sa close_mysql_tables().
-
-  @note This function also rollbacks the transaction if rollback was
-        requested (e.g. as result of deadlock).
 */
 
 void close_acl_tables(THD *thd)
 {
-  /* Transaction rollback request by SE is unlikely. Still we handle it. */
-  if (thd->transaction_rollback_request)
-  {
-    trans_rollback_stmt(thd);
-    trans_rollback_implicit(thd);
-  }
-  else
-  {
 #ifndef DBUG_OFF
-    bool res=
+  bool res=
 #endif
-      trans_commit_stmt(thd);
-    DBUG_ASSERT(res == false);
-  }
+    trans_commit_stmt(thd);
+  DBUG_ASSERT(res == false);
 
   close_mysql_tables(thd);
 }
@@ -1517,7 +1505,6 @@ void close_acl_tables(THD *thd)
 static bool acl_trans_commit_and_close_tables(THD *thd)
 {
   bool result;
-  bool rollback= false;
 
   /*
     Try to commit a transaction even if we had some failures.
@@ -1536,25 +1523,12 @@ static bool acl_trans_commit_and_close_tables(THD *thd)
   */
   DBUG_ASSERT(stmt_causes_implicit_commit(thd, CF_IMPLICIT_COMMIT_END));
 
-  if (thd->transaction_rollback_request)
-  {
-    /*
-      Transaction rollback request by SE is unlikely. Still let us
-      handle it and also do ACL reload if it happens.
-    */
-    result= trans_rollback_stmt(thd);
-    result|= trans_rollback_implicit(thd);
-    rollback= true;
-  }
-  else
-  {
-    result= trans_commit_stmt(thd);
-    result|= trans_commit_implicit(thd);
-  }
+  result= trans_commit_stmt(thd);
+  result|= trans_commit_implicit(thd);
   close_thread_tables(thd);
   thd->mdl_context.release_transactional_locks();
 
-  if (result || rollback)
+  if (result)
   {
     /*
       Try to bring in-memory structures back in sync with on-disk data if we
@@ -1783,8 +1757,8 @@ bool acl_getroot(Security_context *sctx, char *user, char *host,
                        (host ? host : "(NULL)"), (ip ? ip : "(NULL)"),
                        user, (db ? db : "(NULL)")));
   sctx->user= user;
-  sctx->set_host(host);
-  sctx->set_ip(ip);
+  sctx->host= host;
+  sctx->ip= ip;
   sctx->host_or_ip= host ? host : (ip ? ip : "");
 
   if (!initialized)
@@ -2303,48 +2277,6 @@ int check_change_password(THD *thd, const char *host, const char *user,
 
 
 /**
-  Update the security context when updating the user
-
-  Helper function.
-  Update only if the security context is pointing to the same user.
-  And return true if the update happens (i.e. we're operating on the
-  user account of the current user).
-  Normalize the names for a safe compare.
-
-  @param sctx           The security context to update
-  @param acl_user_ptr   User account being updated
-  @param expired        new value of the expiration flag
-  @return               did the update happen ?
- */
-static bool
-update_sctx_cache(Security_context *sctx, ACL_USER *acl_user_ptr, bool expired)
-{
-  const char *acl_host= acl_user_ptr->host.get_host();
-  const char *acl_user= acl_user_ptr->user;
-  const char *sctx_user= sctx->priv_user;
-  const char *sctx_host= sctx->priv_host;
-
-  if (!acl_host)
-    acl_host= "";
-  if(!acl_user)
-    acl_user= "";
-  if (!sctx_host)
-    sctx_host= "";
-  if (!sctx_user)
-    sctx_user= "";
-
-  if (!strcmp(acl_user, sctx_user) && !strcmp(acl_host, sctx_host))
-  {
-    sctx->password_expired= expired;
-    return true;
-  }
-
-  return false;
-}
-
-
-
-/**
   Change a password hash for a user.
 
   @param thd Thread handle
@@ -2409,13 +2341,6 @@ bool change_password(THD *thd, const char *host, const char *user,
 #endif
   if (!(table= open_ltable(thd, &tables, TL_WRITE, MYSQL_LOCK_IGNORE_TIMEOUT)))
     DBUG_RETURN(1);
-
-  if (!table->key_info)
-  {
-    my_error(ER_TABLE_CORRUPT, MYF(0), table->s->db.str,
-             table->s->table_name.str);
-    DBUG_RETURN(1);
-  }
 
   /*
     This statement will be replicated as a statement, even when using
@@ -2496,26 +2421,17 @@ bool change_password(THD *thd, const char *host, const char *user,
       password_field= MYSQL_USER_FIELD_AUTHENTICATION_STRING;
       if (new_password_len < CRYPT_MAX_PASSWORD_SIZE + 1)
       {
-        /*
-          Since we're changing the password for the user we need to reset the
-          expiration flag.
-        */
-        if (!update_sctx_cache(thd->security_ctx, acl_user, false) &&
-            thd->security_ctx->password_expired)
-        {
-          /* the current user is not the same as the user we operate on */
-          my_error(ER_MUST_CHANGE_PASSWORD, MYF(0));
-          result= 1;
-          mysql_mutex_unlock(&acl_cache->lock);
-          goto end;
-        }
-
-        acl_user->password_expired= false;
         /* copy string including \0 */
         acl_user->auth_string.str= (char *) memdup_root(&global_acl_memory,
                                                        new_password,
                                                        new_password_len + 1);
         acl_user->auth_string.length= new_password_len;
+        /*
+          Since we're changing the password for the user we need to reset the
+          expiration flag.
+        */
+        acl_user->password_expired= false;
+        thd->security_ctx->password_expired= false;
       }
     } else
     {
@@ -2595,16 +2511,9 @@ bool change_password(THD *thd, const char *host, const char *user,
       my_error(ER_PASSWORD_FORMAT, MYF(0));
       result= 1;
       mysql_mutex_unlock(&acl_cache->lock);
-      goto end;
+      goto end;  
     }
-    if (!update_sctx_cache(thd->security_ctx, acl_user, false) &&
-        thd->security_ctx->password_expired)
-    {
-      my_error(ER_MUST_CHANGE_PASSWORD, MYF(0));
-      result= 1;
-      mysql_mutex_unlock(&acl_cache->lock);
-      goto end;
-    }
+    thd->security_ctx->password_expired= false;
   }
   else
   {
@@ -2907,7 +2816,7 @@ static bool test_if_create_new_users(THD *thd)
                       C_STRING_WITH_LEN("user"), "user", TL_WRITE);
     create_new_users= 1;
 
-    db_access=acl_get(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
+    db_access=acl_get(sctx->host, sctx->ip,
 		      sctx->priv_user, tl.db, 0);
     if (!(db_access & INSERT_ACL))
     {
@@ -2957,13 +2866,6 @@ static int replace_user_table(THD *thd, TABLE *table, LEX_USER *combo,
   DBUG_ENTER("replace_user_table");
 
   mysql_mutex_assert_owner(&acl_cache->lock);
-  
-  if (!table->key_info)
-  {
-    my_error(ER_TABLE_CORRUPT, MYF(0), table->s->db.str,
-             table->s->table_name.str);
-    goto end;
-  }
  
   table->use_all_columns();
   DBUG_ASSERT(combo->host.str != '\0');
@@ -3370,7 +3272,7 @@ static int replace_user_table(THD *thd, TABLE *table, LEX_USER *combo,
     next_field+= 4;
     if (combo->plugin.length > 0 && !old_row_exists)
     {
-      if (table->s->fields >= 41)
+      if (table->s->fields >= 43) // Not 41, For Facebook Admission Control
       {
         table->field[MYSQL_USER_FIELD_PLUGIN]->
           store(combo->plugin.str, combo->plugin.length, system_charset_info);
@@ -4026,16 +3928,8 @@ static int replace_column_table(GRANT_TABLE *g_t,
   int result=0;
   uchar key[MAX_KEY_LENGTH];
   uint key_prefix_length;
-  DBUG_ENTER("replace_column_table");
-
-  if (!table->key_info)
-  {
-    my_error(ER_TABLE_CORRUPT, MYF(0), table->s->db.str,
-             table->s->table_name.str);
-    DBUG_RETURN(-1);
-  }
-
   KEY_PART_INFO *key_part= table->key_info->key_part;
+  DBUG_ENTER("replace_column_table");
 
   table->use_all_columns();
   table->field[0]->store(combo.host.str,combo.host.length,
@@ -5543,6 +5437,7 @@ static my_bool grant_reload_procs_priv(THD *thd)
   }
   mysql_rwlock_unlock(&LOCK_grant);
 
+  close_acl_tables(thd);
   DBUG_RETURN(return_val);
 }
 
@@ -5627,7 +5522,6 @@ my_bool grant_reload(THD *thd)
   mysql_rwlock_unlock(&LOCK_grant);
 
 end:
-  close_acl_tables(thd);
   DBUG_RETURN(return_val);
 }
 
@@ -5771,8 +5665,7 @@ bool check_grant(THD *thd, ulong want_access, TABLE_LIST *tables,
       continue;
     }
 
-    GRANT_TABLE *grant_table= table_hash_search(sctx->get_host()->ptr(),
-                                                sctx->get_ip()->ptr(),
+    GRANT_TABLE *grant_table= table_hash_search(sctx->host, sctx->ip,
                                                 tl->get_db_name(),
                                                 sctx->priv_user,
                                                 tl->get_table_name(),
@@ -5862,10 +5755,10 @@ bool check_grant_column(THD *thd, GRANT_INFO *grant,
   if (grant->version != grant_version)
   {
     grant->grant_table=
-      table_hash_search(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
-                        db_name, sctx->priv_user,
+      table_hash_search(sctx->host, sctx->ip, db_name,
+			sctx->priv_user,
 			table_name, 0);         /* purecov: inspected */
-    grant->version= grant_version;	        /* purecov: inspected */
+    grant->version= grant_version;		/* purecov: inspected */
   }
   if (!(grant_table= grant->grant_table))
     goto err;					/* purecov: deadcode */
@@ -6012,8 +5905,8 @@ bool check_grant_all_columns(THD *thd, ulong want_access_arg,
         if (grant->version != grant_version)
         {
           grant->grant_table=
-            table_hash_search(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
-                              db_name, sctx->priv_user,
+            table_hash_search(sctx->host, sctx->ip, db_name,
+                              sctx->priv_user,
                               table_name, 0);	/* purecov: inspected */
           grant->version= grant_version;	/* purecov: inspected */
         }
@@ -6071,8 +5964,7 @@ static bool check_grant_db_routine(THD *thd, const char *db, HASH *hash)
 
     if (strcmp(item->user, sctx->priv_user) == 0 &&
         strcmp(item->db, db) == 0 &&
-        item->host.compare_hostname(sctx->get_host()->ptr(),
-                                    sctx->get_ip()->ptr()))
+        item->host.compare_hostname(sctx->host, sctx->ip))
     {
       return FALSE;
     }
@@ -6116,8 +6008,7 @@ bool check_grant_db(THD *thd,const char *db)
                       idx);
     if (len < grant_table->key_length &&
 	!memcmp(grant_table->hash_key,helping,len) &&
-        grant_table->host.compare_hostname(sctx->get_host()->ptr(),
-                                           sctx->get_ip()->ptr()))
+        grant_table->host.compare_hostname(sctx->host, sctx->ip))
     {
       error= FALSE; /* Found match. */
       break;
@@ -6168,8 +6059,8 @@ bool check_grant_routine(THD *thd, ulong want_access,
   for (table= procs; table; table= table->next_global)
   {
     GRANT_NAME *grant_proc;
-    if ((grant_proc= routine_hash_search(host, sctx->get_ip()->ptr(), table->db,
-                                         user, table->table_name, is_proc, 0)))
+    if ((grant_proc= routine_hash_search(host, sctx->ip, table->db, user,
+					 table->table_name, is_proc, 0)))
       table->grant.privilege|= grant_proc->privs;
 
     if (want_access & ~table->grant.privilege)
@@ -6224,7 +6115,7 @@ bool check_routine_level_acl(THD *thd, const char *db, const char *name,
   Security_context *sctx= thd->security_ctx;
   mysql_rwlock_rdlock(&LOCK_grant);
   if ((grant_proc= routine_hash_search(sctx->priv_host,
-                                       sctx->get_ip()->ptr(), db,
+                                       sctx->ip, db,
                                        sctx->priv_user,
                                        name, is_proc, 0)))
     no_routine_acl= !(grant_proc->privs & SHOW_PROC_ACLS);
@@ -6248,8 +6139,8 @@ ulong get_table_grant(THD *thd, TABLE_LIST *table)
 #ifdef EMBEDDED_LIBRARY
   grant_table= NULL;
 #else
-  grant_table= table_hash_search(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
-                                 db, sctx->priv_user, table->table_name, 0);
+  grant_table= table_hash_search(sctx->host, sctx->ip, db, sctx->priv_user,
+				 table->table_name, 0);
 #endif
   table->grant.grant_table=grant_table; // Remember for column test
   table->grant.version=grant_version;
@@ -6293,7 +6184,7 @@ ulong get_column_grant(THD *thd, GRANT_INFO *grant,
   {
     Security_context *sctx= thd->security_ctx;
     grant->grant_table=
-      table_hash_search(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
+      table_hash_search(sctx->host, sctx->ip,
                         db_name, sctx->priv_user,
 			table_name, 0);	        /* purecov: inspected */
     grant->version= grant_version;              /* purecov: inspected */
@@ -7080,13 +6971,6 @@ static int handle_grant_table(TABLE_LIST *tables, uint table_no, bool drop,
     host_field->store(host_str, user_from->host.length, system_charset_info);
     user_field->store(user_str, user_from->user.length, system_charset_info);
 
-    if (!table->key_info)
-    {
-      my_error(ER_TABLE_CORRUPT, MYF(0), table->s->db.str,
-               table->s->table_name.str);
-      DBUG_RETURN(-1);
-    }
-     
     key_prefix_length= (table->key_info->key_part[0].store_length +
                         table->key_info->key_part[1].store_length);
     key_copy(user_key, table->record[0], table->key_info, key_prefix_length);
@@ -8070,13 +7954,6 @@ bool mysql_user_password_expire(THD *thd, List <LEX_USER> &list)
   if (!(table= open_ltable(thd, &tables, TL_WRITE, MYSQL_LOCK_IGNORE_TIMEOUT)))
     DBUG_RETURN(true);
 
-  if (!table->key_info)
-  {
-    my_error(ER_TABLE_CORRUPT, MYF(0), table->s->db.str,
-             table->s->table_name.str);
-    DBUG_RETURN(true);
-  }
-
   /*
     This statement will be replicated as a statement, even when using
     row-based replication.  The flag will be reset at the end of the
@@ -8561,11 +8438,9 @@ bool sp_grant_privileges(THD *thd, const char *sp_db, const char *sp_name,
 
   if ((au= find_acl_user(combo->host.str=(char*)sctx->host_or_ip,combo->user.str,FALSE)))
     goto found_acl;
-  if ((au= find_acl_user(combo->host.str=(char*)sctx->get_host()->ptr(),
-                         combo->user.str,FALSE)))
+  if ((au= find_acl_user(combo->host.str=(char*)sctx->host, combo->user.str,FALSE)))
     goto found_acl;
-  if ((au= find_acl_user(combo->host.str=(char*)sctx->get_ip()->ptr(),
-                         combo->user.str,FALSE)))
+  if ((au= find_acl_user(combo->host.str=(char*)sctx->ip, combo->user.str,FALSE)))
     goto found_acl;
   if((au= find_acl_user(combo->host.str=(char*)"%", combo->user.str, FALSE)))
     goto found_acl;
@@ -8702,9 +8577,9 @@ acl_check_proxy_grant_access(THD *thd, const char *host, const char *user,
   {
     ACL_PROXY_USER *proxy= dynamic_element(&acl_proxy_users, i, 
                                            ACL_PROXY_USER *);
-    if (proxy->matches(thd->security_ctx->get_host()->ptr(),
+    if (proxy->matches(thd->security_ctx->host,
                        thd->security_ctx->user,
-                       thd->security_ctx->get_ip()->ptr(),
+                       thd->security_ctx->ip,
                        user) &&
         proxy->get_with_grant())
     {
@@ -9157,8 +9032,7 @@ void fill_effective_table_privileges(THD *thd, GRANT_INFO *grant,
   Security_context *sctx= thd->security_ctx;
   DBUG_ENTER("fill_effective_table_privileges");
   DBUG_PRINT("enter", ("Host: '%s', Ip: '%s', User: '%s', table: `%s`.`%s`",
-                       sctx->priv_host, (sctx->get_ip()->length() ?
-                       sctx->get_ip()->ptr() : "(NULL)"),
+                       sctx->priv_host, (sctx->ip ? sctx->ip : "(NULL)"),
                        (sctx->priv_user ? sctx->priv_user : "(NULL)"),
                        db, table));
   /* --skip-grants */
@@ -9180,15 +9054,14 @@ void fill_effective_table_privileges(THD *thd, GRANT_INFO *grant,
   }
 
   /* db privileges */
-  grant->privilege|= acl_get(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
-                             sctx->priv_user, db, 0);
+  grant->privilege|= acl_get(sctx->host, sctx->ip, sctx->priv_user, db, 0);
 
   /* table privileges */
   mysql_rwlock_rdlock(&LOCK_grant);
   if (grant->version != grant_version)
   {
     grant->grant_table=
-      table_hash_search(sctx->get_host()->ptr(), sctx->get_ip()->ptr(), db,
+      table_hash_search(sctx->host, sctx->ip, db,
 			sctx->priv_user,
 			table, 0);              /* purecov: inspected */
     grant->version= grant_version;              /* purecov: inspected */
@@ -9672,6 +9545,7 @@ static bool secure_auth(MPVIO_EXT *mpvio)
     my_error(ER_NOT_SUPPORTED_AUTH_MODE, MYF(0));
     general_log_print(thd, COM_CONNECT, ER(ER_NOT_SUPPORTED_AUTH_MODE));
   }
+  // TODO(mcallaghan): count this per user name
   return 1;
 }
 
@@ -10346,7 +10220,8 @@ skip_to_ssl:
       return packet_error;
 
     DBUG_PRINT("info", ("IO layer change in progress..."));
-    if (sslaccept(ssl_acceptor_fd, net->vio, net->read_timeout, &errptr))
+    if (sslaccept(ssl_acceptor_fd, net->vio,
+                  timeout_to_seconds(net->read_timeout), &errptr))
     {
       DBUG_PRINT("error", ("Failed to accept new SSL connection"));
       return packet_error;
@@ -10994,8 +10869,8 @@ server_mpvio_initialize(THD *thd, MPVIO_EXT *mpvio,
   mpvio->thread_id= thd->thread_id;
   mpvio->server_status= &thd->server_status;
   mpvio->net= &thd->net;
-  mpvio->ip= (char *) thd->security_ctx->get_ip()->ptr();
-  mpvio->host= (char *) thd->security_ctx->get_host()->ptr();
+  mpvio->ip= thd->security_ctx->ip;
+  mpvio->host= thd->security_ctx->host;
   mpvio->charset_adapter= charset_adapter;
 }
 
@@ -11006,7 +10881,8 @@ server_mpvio_update_thd(THD *thd, MPVIO_EXT *mpvio)
   thd->client_capabilities= mpvio->client_capabilities;
   thd->max_client_packet_length= mpvio->max_client_packet_length;
   if (mpvio->client_capabilities & CLIENT_INTERACTIVE)
-    thd->variables.net_wait_timeout= thd->variables.net_interactive_timeout;
+    thd->variables.net_wait_timeout_seconds =
+      thd->variables.net_interactive_timeout_seconds;
   thd->security_ctx->user= mpvio->auth_info.user_name;
   if (thd->client_capabilities & CLIENT_IGNORE_SPACE)
     thd->variables.sql_mode|= MODE_IGNORE_SPACE;
@@ -11169,10 +11045,9 @@ acl_authenticate(THD *thd, uint com_change_user_pkt_len)
     const char *auth_user = acl_user->user ? acl_user->user : "";
     ACL_PROXY_USER *proxy_user;
     /* check if the user is allowed to proxy as another user */
-    proxy_user= acl_find_proxy_user(auth_user, sctx->get_host()->ptr(),
-                                    sctx->get_ip()->ptr(),
+    proxy_user= acl_find_proxy_user(auth_user, sctx->host, sctx->ip,
                                     mpvio.auth_info.authenticated_as,
-                                    &is_proxy_user);
+                                          &is_proxy_user);
     if (is_proxy_user)
     {
       ACL_USER *acl_proxy_user;
@@ -11261,12 +11136,8 @@ acl_authenticate(THD *thd, uint com_change_user_pkt_len)
       DBUG_RETURN(1);
     }
 
-    /* Don't allow the user to connect if he has done too many queries */
-    if ((acl_user->user_resource.questions || acl_user->user_resource.updates ||
-         acl_user->user_resource.conn_per_hour ||
-         acl_user->user_resource.user_conn || 
-         global_system_variables.max_user_connections) &&
-        get_or_create_user_conn(thd,
+    /* Always get USER_CONN as it stores USER_STATS. */
+    if (get_or_create_user_conn(thd,
           (opt_old_style_user_limits ? sctx->user : sctx->priv_user),
           (opt_old_style_user_limits ? sctx->host_or_ip : sctx->priv_host),
           &acl_user->user_resource))
@@ -11277,15 +11148,6 @@ acl_authenticate(THD *thd, uint com_change_user_pkt_len)
   }
   else
     sctx->skip_grants();
-
-  const USER_CONN *uc;
-  if ((uc= thd->get_user_connect()) &&
-      (uc->user_resources.conn_per_hour || uc->user_resources.user_conn ||
-       global_system_variables.max_user_connections) &&
-       check_for_max_user_connections(thd, uc))
-  {
-    DBUG_RETURN(1); // The error is set in check_for_max_user_connections()
-  }
 
   DBUG_PRINT("info",
              ("Capabilities: %lu  packet_length: %ld  Host: '%s'  "
@@ -11304,12 +11166,34 @@ acl_authenticate(THD *thd, uint com_change_user_pkt_len)
     mysql_mutex_unlock(&LOCK_connection_count);
     if (!count_ok)
     {                                         // too many connections
-      release_user_connection(thd);
       statistic_increment(connection_errors_max_connection, &LOCK_status);
       my_error(ER_CON_COUNT_ERROR, MYF(0));
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+      fix_user_conn(thd, true); // Undo work by get_or_create_user_conn
+#endif
       DBUG_RETURN(1);
     }
   }
+
+  USER_CONN *uc = const_cast<USER_CONN*>(thd->get_user_connect());
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+  bool global_max = false;
+  if (uc &&
+      (uc->user_resources.conn_per_hour || uc->user_resources.user_conn ||
+       global_system_variables.max_user_connections) &&
+      check_for_max_user_connections(thd, uc, &global_max))
+  {
+    fix_user_conn(thd, global_max); // Undo work by get_or_create_user_conn
+    DBUG_RETURN(1); // The error is set in check_for_max_user_connections()
+  }
+#else
+  if (uc &&
+      (uc->user_resources.conn_per_hour || uc->user_resources.user_conn ||
+       global_system_variables.max_user_connections))
+  {
+    DBUG_RETURN(1); // The error is set in check_for_max_user_connections()
+  }
+#endif
 
   /*
     This is the default access rights for the current database.  It's
@@ -11324,7 +11208,12 @@ acl_authenticate(THD *thd, uint com_change_user_pkt_len)
     if (mysql_change_db(thd, &mpvio.db, FALSE))
     {
       /* mysql_change_db() has pushed the error message. */
-      release_user_connection(thd);
+      USER_CONN* uc = const_cast<USER_CONN*>(thd->get_user_connect());
+      if (uc)
+      {
+        decrease_user_connections(uc);
+        uc->user_stats.errors_access_denied++;
+      }
       Host_errors errors;
       errors.m_default_database= 1;
       inc_host_errors(mpvio.ip, &errors);
@@ -11333,7 +11222,7 @@ acl_authenticate(THD *thd, uint com_change_user_pkt_len)
   }
 
   if (mpvio.auth_info.external_user[0])
-    sctx->set_external_user(my_strdup(mpvio.auth_info.external_user, MYF(0)));
+    sctx->external_user= my_strdup(mpvio.auth_info.external_user, MYF(0));
 
 
   if (res == CR_OK_HANDSHAKE_COMPLETE)
@@ -11601,13 +11490,6 @@ private:
         ERR_error_string_n(ERR_get_error(), error_buf, MYSQL_ERRMSG_SIZE);
         sql_print_error("Failure to parse RSA %s key (file exists): %s:"
                         " %s", key_type, key_file_path.c_ptr(), error_buf);
-
-        /*
-          Call ERR_clear_error() just in case there are more than 1 entry in the
-          OpenSSL thread's error queue.
-        */
-        ERR_clear_error();
-
         return true;
       }
 
@@ -11619,7 +11501,12 @@ private:
         filesize= ftell(key_file);
         fseek(key_file, 0, SEEK_SET);
         *key_text_buffer= new char[filesize+1];
-        (void) fread(*key_text_buffer, filesize, 1, key_file);
+        if(fread(*key_text_buffer, filesize, 1, key_file) != 1)
+        {
+          sql_print_error("Failure in fread() of key_text_buffer.");
+          fclose(key_file);
+          return true;
+        }
         (*key_text_buffer)[filesize]= '\0';
       }
       fclose(key_file);

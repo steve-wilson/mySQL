@@ -39,6 +39,15 @@ Created 3/26/1996 Heikki Tuuri
 #include "trx0xa.h"
 #include "ut0vec.h"
 #include "fts0fts.h"
+#include "os0file.h"
+#include "btr0types.h"
+
+#ifdef TARGET_OS_LINUX
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include "flashcache_ioctl.h"
+extern my_bool cachedev_enabled;
+#endif /* TARGET_OS_LINUX */
 
 /** Dummy session used currently in MySQL interface */
 extern sess_t*	trx_dummy_sess;
@@ -96,6 +105,14 @@ void
 trx_free_for_background(
 /*====================*/
 	trx_t*	trx);	/*!< in, own: trx object */
+#ifdef UNIV_DEBUG_VALGRIND
+/********************************************************************//**
+Frees trx_t pool */
+UNIV_INTERN
+void
+trx_free_trx_pool();
+/*==============*/
+#endif
 /********************************************************************//**
 At shutdown, frees a transaction object that is in the PREPARED state. */
 UNIV_INTERN
@@ -133,7 +150,27 @@ trx_lists_init_at_db_start(void);
 #define trx_start_if_not_started_xa(t)				\
 	trx_start_if_not_started_xa_low((t))
 #endif /* UNIV_DEBUG */
-
+/*************************************************************//**
+Creates or frees data structures related to logical-read-ahead.
+based on the value of lra_size. */
+UNIV_INTERN
+void
+trx_lra_reset(
+	trx_t* trx, /*!< in: transaction */
+	ulint lra_size, /*!< in: lra_size in MB.
+				       If 0, the fields that are releated
+				       to logical-read-ahead will be free'd
+				       if they were initialized. */
+	ulint lra_n_node_recs_before_sleep,
+					/*!< in: lra_n_node_recs_before_sleep
+					is the number of node pointer records
+					traversed while holding the index lock
+					before releasing the index lock and
+					sleeping for a short period of time so
+					that the other threads get a chance to
+					x-latch the index lock. */
+	ulint lra_sleep);		/* lra_sleep is the sleep time in
+					milliseconds. */
 /*************************************************************//**
 Starts the transaction if it is not yet started. */
 UNIV_INTERN
@@ -190,7 +227,8 @@ UNIV_INTERN
 void
 trx_commit(
 /*=======*/
-	trx_t*	trx)	/*!< in/out: transaction */
+	trx_t*	trx,		/*!< in/out: transaction */
+	ibool	for_commit)	/*!< in: for rollback when FALSE */
 	__attribute__((nonnull));
 /****************************************************************//**
 Commits a transaction and a mini-transaction. */
@@ -199,8 +237,9 @@ void
 trx_commit_low(
 /*===========*/
 	trx_t*	trx,	/*!< in/out: transaction */
-	mtr_t*	mtr)	/*!< in/out: mini-transaction (will be committed),
+	mtr_t*	mtr,	/*!< in/out: mini-transaction (will be committed),
 			or NULL if trx made no modifications */
+	ibool	for_commit)	/*!< in: for rollback when FALSE */
 	__attribute__((nonnull(1)));
 /****************************************************************//**
 Cleans up a transaction at database startup. The cleanup is needed if
@@ -225,7 +264,8 @@ UNIV_INTERN
 void
 trx_prepare_for_mysql(
 /*==================*/
-	trx_t*	trx);	/*!< in/out: trx handle */
+	trx_t*	trx,	/*!< in/out: trx handle */
+	ibool async);	/*!< in: TRUE - don't sync log */
 /**********************************************************************//**
 This function is used to find number of prepared transactions and
 their transaction objects for a recovery.
@@ -254,7 +294,8 @@ UNIV_INTERN
 void
 trx_commit_complete_for_mysql(
 /*==========================*/
-	trx_t*	trx)	/*!< in/out: transaction */
+	trx_t*	trx,	/*!< in: trx handle */
+	ibool async)	/*!< in: TRUE - don't sync log */
 	__attribute__((nonnull));
 /**********************************************************************//**
 Marks the latest SQL statement ended. */
@@ -629,6 +670,16 @@ struct trx_lock_t {
 };
 
 #define TRX_MAGIC_N	91118598
+#define TRX_FREE_MAGIC_N	8675309
+
+/*******************************************************************//**
+Helper data structure to store page numbers in an internally-linked hash
+table. */
+typedef struct page_no_holder_struct page_no_holder_t;
+struct page_no_holder_struct {
+        ulint	page_no;
+        page_no_holder_t* hash;
+};
 
 /** The transaction handle
 
@@ -783,6 +834,66 @@ struct trx_t{
 					FALSE, one can save CPU time and about
 					150 bytes in the undo log size as then
 					we skip XA steps */
+	ulint		fake_changes;
+	ulint		lra_size;	/* Total size (in MBs) of the
+					pages that will be prefetched by
+					logical read ahead. */
+	ulint		lra_n_pages;	/* Number of pages that lra prefetches
+					every time. This is computed using
+					lra_size and the currently scanned
+					table's block size */
+	ulint		lra_space_id;	/* The last space id that the scanning
+					transaction accessed. If the scanning
+					trx accesses multiple tables, we need
+					to reset the data structures that lra
+					uses. */
+	ulint		lra_page_no;	/* The last page that was visited
+					by the trx. Used by the
+					logical-read-ahead algorithm to
+					determine if a new prefetch should be
+					performed. */
+	hash_table_t*	lra_ht1;
+	hash_table_t*	lra_ht2;	/* Hash tables store the leaf page
+					numbers for the already prefetched
+					pages. Each hash table will typically
+					have lra_n_pages pages and when the
+					scanning trx visits all lra_n_pages
+					pages in one of them, we will empty
+					that one and prefetch another batch of
+					lra_n_pages pages. */
+	hash_table_t*	lra_ht;		/* lra_ht points to lra_ht1 and lra_ht2
+					alternatingly. */
+	ulint		lra_n_pages_since;/* number of leaf pages visited since
+					the last prefetch operation. We require
+					that no prefetch be done until the
+					scanning trx scans lra_n_pages pages.
+					*/
+	ulint*		lra_sort_arr;	/* Array used for sorting the page
+					numbers before issuing the read
+					requests */
+	page_no_holder_t* lra_arr1;	/* Pre-allocated array of
+					page_no_holder objects which are used
+					by the logical-read-ahead algorithm for
+					lra_ht1. */
+	page_no_holder_t* lra_arr2;	/* Pre-allocated array of
+					page_no_holder objects which are used
+					by the logical-read-ahead algorithm for
+					lra_ht2. */
+	btr_pcur_t*	lra_cur;	/* The persistent cursor that points
+					to the first node pointer record for
+					which the associated leaf page is not
+					prefetched by LRA. */
+	ulint		lra_n_node_recs_before_sleep;
+					/* lra_n_node_recs_before_sleep
+					is the number of node pointer records
+					traversed while holding the index lock
+					before releasing the index lock and
+					sleeping for a short period of time so
+					that the other threads get a chance to
+					x-latch the index lock. */
+	ulint		lra_sleep;	/* lra_sleep is the sleep time in
+					milliseconds. */
+	ulint		lra_tree_height;
 	ulint		flush_log_later;/* In 2PC, we hold the
 					prepare_commit mutex across
 					both phases. In that case, we
@@ -810,6 +921,9 @@ struct trx_t{
 					to reduce contention on the search
 					latch */
 	trx_dict_op_t	dict_operation;	/**< @see enum trx_dict_op */
+	ulint		always_enter_innodb;/*!< thread always enters innodb
+					without considering ticket limit;
+					only used for replication sql thread.*/
 
 	/* Fields protected by the srv_conc_mutex. */
 	ulint		declared_to_be_inside_innodb;
@@ -836,6 +950,9 @@ struct trx_t{
 					when trx->in_rw_trx_list. Initially
 					set to TRX_ID_MAX. */
 
+trx_t* next_free_trx; /*  Next transaction free (see trx_create
+														for details); NULL if transaction is in use */
+
 	time_t		start_time;	/*!< time the trx object was created
 					or the state last time became
 					TRX_STATE_ACTIVE */
@@ -854,6 +971,11 @@ struct trx_t{
 					contains a pointer to the latest file
 					name; this is NULL if binlog is not
 					used */
+	const char*	mysql_gtid;
+					/*!< if MySQL binlog is used, this field
+					contains a pointer to the latest GTID;
+					this is NULL if binlog or gtids is not
+					used*/
 	ib_int64_t	mysql_log_offset;
 					/*!< if MySQL binlog is used, this
 					field contains the end offset of the
@@ -998,6 +1120,7 @@ struct trx_t{
 	const char*	start_file;	/*!< Filename where it was started */
 #endif /* UNIV_DEBUG */
 
+	os_io_table_perf_t	table_io_perf;/*!< per table io perf counters */
 	/*------------------------------*/
 	char detailed_error[256];	/*!< detailed error message for last
 					error, or empty. */

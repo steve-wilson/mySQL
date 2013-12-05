@@ -194,10 +194,6 @@ CHECK_CXX_COMPILER_FLAG("-Wno-null-dereference" HAVE_NO_NULL)
 IF(HAVE_NO_NULL)
   SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-null-dereference")
 ENDIF()
-CHECK_CXX_COMPILER_FLAG("-Wno-unused-local-typedefs" HAVE_NO_UNUSED_TYPEDEFS)
-IF(HAVE_NO_UNUSED_TYPEDEFS)
-  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-local-typedefs")
-ENDIF()
 
 # main-wrapper libraries (with tap-compatible option).
 ADD_LIBRARY(gunit_small STATIC
@@ -244,7 +240,6 @@ SET(TESTS
   sql_plist
   sql_string
   stdcxx
-  strtoll
   thread_utils
   )
 
@@ -261,7 +256,6 @@ SET(SERVER_TESTS
   item_func_now_local
   item_timefunc
   join_tab_sort
-  log_throttle
   make_sortkey
   my_decimal
   opt_range

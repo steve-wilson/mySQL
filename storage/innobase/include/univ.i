@@ -220,8 +220,6 @@ operations (very slow); also UNIV_DEBUG must be defined */
 						in sync0sync.cc */
 #define UNIV_BTR_PRINT				/* enable functions for
 						printing B-trees */
-#define UNIV_ZIP_DEBUG				/* extensive consistency checks
-						for compressed pages */
 #define UNIV_ZIP_COPY				/* call page_zip_copy_recs()
 						more often */
 #define UNIV_AIO_DEBUG				/* prints info about
@@ -440,10 +438,10 @@ typedef unsigned __int64 ib_uint64_t;
 typedef unsigned __int32 ib_uint32_t;
 #else
 /* Use the integer types and formatting strings defined in the C99 standard. */
-# define UINT32PF	"%"PRIu32
-# define INT64PF	"%"PRId64
-# define UINT64PF	"%"PRIu64
-# define UINT64PFx	"%016"PRIx64
+# define UINT32PF	"%" PRIu32
+# define INT64PF	"%" PRId64
+# define UINT64PF	"%" PRIu64
+# define UINT64PFx	"%016" PRIx64
 # define DBUG_LSN_PF    UINT64PF
 typedef int64_t ib_int64_t;
 typedef uint64_t ib_uint64_t;

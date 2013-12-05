@@ -404,7 +404,6 @@ void lex_start(THD *thd)
   /* 'parent_lex' is used in init_query() so it must be before it. */
   lex->select_lex.parent_lex= lex;
   lex->select_lex.init_query();
-  lex->load_set_str_list.empty();
   lex->value_list.empty();
   lex->update_list.empty();
   lex->set_var_list.empty();
@@ -429,6 +428,8 @@ void lex_start(THD *thd)
   lex->describe= DESCRIBE_NONE;
   lex->subqueries= FALSE;
   lex->context_analysis_only= 0;
+  lex->disable_flashcache= FALSE;
+  lex->async_commit = FALSE;
   lex->derived_tables= 0;
   lex->safe_to_cache_query= 1;
   lex->leaf_tables_insert= 0;
@@ -487,6 +488,7 @@ void lex_start(THD *thd)
   lex->is_change_password= false;
   lex->is_set_password_sql= false;
   lex->mark_broken(false);
+  thd->count_comment_bytes= 0;
   DBUG_VOID_RETURN;
 }
 
@@ -863,19 +865,23 @@ static inline uint int_token(const char *str,uint length)
 
   @retval  Whether EOF reached before comment is closed.
 */
-bool consume_comment(Lex_input_stream *lip, int remaining_recursions_permitted)
+bool consume_comment(Lex_input_stream *lip, int remaining_recursions_permitted,
+                                                ulonglong *count_comment_bytes)
 {
   reg1 uchar c;
   while (! lip->eof())
   {
     c= lip->yyGet();
 
+    ++ (*count_comment_bytes);
     if (remaining_recursions_permitted > 0)
     {
       if ((c == '/') && (lip->yyPeek() == '*'))
       {
         lip->yySkip(); /* Eat asterisk */
-        consume_comment(lip, remaining_recursions_permitted-1);
+        ++ (*count_comment_bytes); /* Counting the asterisk */
+        consume_comment(lip, remaining_recursions_permitted-1,
+                        count_comment_bytes);
         continue;
       }
     }
@@ -885,6 +891,7 @@ bool consume_comment(Lex_input_stream *lip, int remaining_recursions_permitted)
       if (lip->yyPeek() == '/')
       {
         lip->yySkip(); /* Eat slash */
+        ++ (*count_comment_bytes);
         return FALSE;
       }
     }
@@ -1019,6 +1026,7 @@ int lex_one_token(void *arg, void *yythd)
            my_iscntrl(cs,lip->yyPeekn(1))))
       {
         state=MY_LEX_COMMENT;
+        thd->count_comment_bytes+= 1;
         break;
       }
 
@@ -1445,7 +1453,10 @@ int lex_one_token(void *arg, void *yythd)
 
     case MY_LEX_COMMENT:			//  Comment
       lex->select_lex.options|= OPTION_FOUND_COMMENT;
-      while ((c = lip->yyGet()) != '\n' && c) ;
+      if (c == '#')
+        thd->count_comment_bytes+= 1;
+      while ((c = lip->yyGet()) != '\n' && c)
+        ++ thd->count_comment_bytes;
       lip->yyUnget();                   // Safety against eof
       state = MY_LEX_START;		// Try again
       break;
@@ -1469,6 +1480,7 @@ int lex_one_token(void *arg, void *yythd)
         lip->yySkip();
         lip->yySkip();
         lip->yySkip();
+        thd->count_comment_bytes+= 3;
 
         /*
           The special comment format is very strict:
@@ -1502,6 +1514,7 @@ int lex_one_token(void *arg, void *yythd)
             /* Expand the content of the special comment as real code */
             lip->set_echo(TRUE);
             state=MY_LEX_START;
+            thd->count_comment_bytes-= 3;
             break;  /* Do not treat contents as a comment.  */
           }
           else
@@ -1511,7 +1524,9 @@ int lex_one_token(void *arg, void *yythd)
               being propagated infinitely (eg. to a slave).
             */
             char *pcom= lip->yyUnput(' ');
-            comment_closed= ! consume_comment(lip, 1);
+            thd->count_comment_bytes-= 1;
+            comment_closed= ! consume_comment(lip, 1,
+                                              &(thd->count_comment_bytes));
             if (! comment_closed)
             {
               *pcom= '!';
@@ -1532,7 +1547,8 @@ int lex_one_token(void *arg, void *yythd)
         lip->in_comment= PRESERVE_COMMENT;
         lip->yySkip();                  // Accept /
         lip->yySkip();                  // Accept *
-        comment_closed= ! consume_comment(lip, 0);
+        thd->count_comment_bytes+= 2;   // Counting / and *
+        comment_closed= ! consume_comment(lip, 0,&(thd->count_comment_bytes));
         /* regular comments can have zero comments inside. */
       }
       /*
@@ -1940,34 +1956,17 @@ void st_select_lex_node::exclude()
 */
 void st_select_lex_unit::exclude_level()
 {
-  SELECT_LEX_UNIT *units= NULL;
-  SELECT_LEX_UNIT **units_last= &units;
-  SELECT_LEX *sl= first_select();
-  while (sl)
+  SELECT_LEX_UNIT *units= 0, **units_last= &units;
+  for (SELECT_LEX *sl= first_select(); sl; sl= sl->next_select())
   {
-    SELECT_LEX *next_select= sl->next_select();
-
     // unlink current level from global SELECTs list
     if (sl->link_prev && (*sl->link_prev= sl->link_next))
       sl->link_next->link_prev= sl->link_prev;
 
     // bring up underlay levels
-    SELECT_LEX_UNIT **last= NULL;
+    SELECT_LEX_UNIT **last= 0;
     for (SELECT_LEX_UNIT *u= sl->first_inner_unit(); u; u= u->next_unit())
     {
-      /*
-        We are excluding a SELECT_LEX from the hierarchy of
-        SELECT_LEX_UNITs and SELECT_LEXes. Since this level is
-        removed, we must also exclude the Name_resolution_context
-        belonging to this level. Do this by looping through inner
-        subqueries and changing their contexts' outer context pointers
-        to point to the outer context of the removed SELECT_LEX.
-      */
-      for (SELECT_LEX *s= u->first_select(); s; s= s->next_select())
-      {
-        if (s->context.outer_context == &sl->context)
-          s->context.outer_context= sl->context.outer_context;
-      }
       u->master= master;
       last= (SELECT_LEX_UNIT**)&(u->next);
     }
@@ -1976,12 +1975,6 @@ void st_select_lex_unit::exclude_level()
       (*units_last)= sl->first_inner_unit();
       units_last= last;
     }
-
-    // clean up and destroy join
-    sl->cleanup_level();
-
-    sl->invalidate();
-    sl= next_select;
   }
   if (units)
   {
@@ -1995,16 +1988,10 @@ void st_select_lex_unit::exclude_level()
   else
   {
     // exclude currect unit from list of nodes
-    if (prev)
-      (*prev)= next;
+    (*prev)= next;
     if (next)
       next->prev= prev;
   }
-
-  // clean up fake_select_lex and global_parameters
-  cleanup_level();
-
-  invalidate();
 }
 
 
@@ -2016,11 +2003,8 @@ void st_select_lex_unit::exclude_level()
 */
 void st_select_lex_unit::exclude_tree()
 {
-  SELECT_LEX *sl= first_select();
-  while (sl)
+  for (SELECT_LEX *sl= first_select(); sl; sl= sl->next_select())
   {
-    SELECT_LEX *next_select= sl->next_select();
-
     // unlink current level from global SELECTs list
     if (sl->link_prev && (*sl->link_prev= sl->link_next))
       sl->link_next->link_prev= sl->link_prev;
@@ -2030,38 +2014,11 @@ void st_select_lex_unit::exclude_tree()
     {
       u->exclude_level();
     }
-
-    // clean up and destroy join
-    sl->cleanup();
-
-    sl->invalidate();
-    sl= next_select;
   }
   // exclude currect unit from list of nodes
-  if (prev)
-    (*prev)= next;
+  (*prev)= next;
   if (next)
     next->prev= prev;
-
-  // clean up fake_select_lex and global_parameters
-  cleanup();
-
-  invalidate();
-}
-
-
-/**
-  Invalidate by nulling out pointers to other st_select_lex_units and
-  st_select_lexes.
-*/
-void st_select_lex_unit::invalidate()
-{
-  next= NULL;
-  prev= NULL;
-  master= NULL;
-  slave= NULL;
-  link_next= NULL;
-  link_prev= NULL;  
 }
 
 
@@ -2193,21 +2150,6 @@ st_select_lex_unit* st_select_lex::master_unit()
 st_select_lex* st_select_lex::outer_select()
 {
   return (st_select_lex*) master->get_master();
-}
-
-
-/**
-  Invalidate by nulling out pointers to other st_select_lex_units and
-  st_select_lexes.
-*/
-void st_select_lex::invalidate()
-{
-  next= NULL;
-  prev= NULL;
-  master= NULL;
-  slave= NULL;
-  link_next= NULL;
-  link_prev= NULL;  
 }
 
 
@@ -3732,14 +3674,6 @@ void st_select_lex::fix_prepare_information(THD *thd, Item **conds,
       /*
         In "WHERE outer_field", *conds may be an Item_outer_ref allocated in
         the execution memroot.
-        @todo change this line in WL#7082. Currently, when we execute a SP,
-        containing "SELECT (SELECT ... WHERE t1.col) FROM t1",
-        resolution may make *conds equal to an Item_outer_ref, then below
-        *conds becomes Item_field, which then goes straight on to execution,
-        undoing the effects of putting Item_outer_ref in the first place...
-        With a PS the problem is not as severe, as after the code below we
-        don't go to execution: a next execution will do a new name resolution
-        which will create Item_outer_ref again.
       */
       prep_where= (*conds)->real_item();
       *conds= where= prep_where->copy_andor_structure(thd);

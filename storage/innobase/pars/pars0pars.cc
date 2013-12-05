@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2012, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 51 Franklin St,
-Fifth Floor, Boston, MA 02110-1301 USA
+this program; if not, write to the Free Software Foundation, Inc., 59 Temple
+Place, Suite 330, Boston, MA 02111-1307 USA
 
 *****************************************************************************/
 
@@ -1232,7 +1232,8 @@ pars_process_assign_list(
 		col_sym = assign_node->col;
 
 		upd_field_set_field_no(upd_field, dict_index_get_nth_col_pos(
-					       clust_index, col_sym->col_no),
+						clust_index, col_sym->col_no,
+						NULL),
 				       clust_index, NULL);
 		upd_field->exp = assign_node->val;
 

@@ -168,6 +168,21 @@ public:
   */
   bool is_relay_log_recovery;
 
+  DYNAMIC_ARRAY gtid_infos;
+  // global hash to store the slave gtid_info repositories mapped by db names.
+  HASH map_db_to_gtid_info;
+  /**
+    Reader writer lock to protect map_db_to_gtid_info. The hash
+    is updated only by coordinator thread. slave worker threads only
+    search in this hash.
+  */
+  mysql_rwlock_t gtid_info_hash_lock;
+  // Last gtid seen by coordinator thread.
+  char last_gtid[Gtid::MAX_TEXT_LENGTH + 1];
+  bool gtid_info_hash_inited;
+  bool part_event;  // true if the current event contains partition event.
+  bool ends_group;
+
   /* The following variables are safe to read any time */
 
   /*
@@ -240,8 +255,12 @@ protected:
 
 private:
   Gtid_set gtid_set;
+  /* Last gtid retrieved by IO thread */
+  Gtid last_retrieved_gtid;
 
 public:
+  Gtid *get_last_retrieved_gtid() { return &last_retrieved_gtid; }
+  void set_last_retrieved_gtid(Gtid gtid) { last_retrieved_gtid = gtid; }
   int add_logged_gtid(rpl_sidno sidno, rpl_gno gno)
   {
     int ret= 0;
@@ -276,6 +295,14 @@ public:
   bool sql_force_rotate_relay;
 
   time_t last_master_timestamp;
+
+#define PEAK_LAG_MAX_SECS 512
+  time_t peak_lag_last[PEAK_LAG_MAX_SECS];
+  ulong events_since_last_sample;
+
+  void update_peak_lag(time_t when_master);
+
+  time_t peak_lag(time_t now);
 
   void clear_until_condition();
 
@@ -327,6 +354,12 @@ public:
     after applying the gtid.
   */
   Gtid_set until_sql_gtids;
+  /*
+    On START SLAVE UNTIL SQL_AFTER_GTIDS this set contains the
+    intersection between logged gtids set and gtids scheduled on MTS
+    worker queues.
+  */
+  Gtid_set until_sql_gtids_seen;
   /*
     True if the current event is the first gtid event to be processed
     after executing START SLAVE UNTIL SQL_*_GTIDS.
@@ -537,6 +570,7 @@ public:
   */
   MEM_ROOT mts_coor_mem_root;
 
+  MEM_ROOT gtid_info_mem_root;
   /*
     While distibuting events basing on their properties MTS
     Coordinator changes its mts group status.
@@ -593,6 +627,23 @@ public:
   /* counterpart of the init */
   void deinit_workers();
 
+  void init_gtid_infos();
+
+  void deinit_gtid_infos();
+
+  inline void gtid_info_hash_rdlock()
+  {
+    mysql_rwlock_rdlock(&gtid_info_hash_lock);
+  }
+  inline void gtid_info_hash_wrlock()
+  {
+    mysql_rwlock_wrlock(&gtid_info_hash_lock);
+  }
+  inline void gtid_info_hash_unlock()
+  {
+    mysql_rwlock_unlock(&gtid_info_hash_lock);
+  }
+  int flush_gtid_infos(bool force);
   /**
      returns true if there is any gap-group of events to execute
                   at slave starting phase.
@@ -956,6 +1007,9 @@ private:
     SLAVE must be executed and the problem fixed manually.
    */
   bool error_on_rli_init_info;
+
+public:
+  Log_event *rollback_ev;
 };
 
 bool mysql_show_relaylog_events(THD* thd);

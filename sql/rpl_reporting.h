@@ -59,7 +59,7 @@ public:
   */
   virtual void report(loglevel level, int err_code, const char *msg, ...) const
     ATTRIBUTE_FORMAT(printf, 4, 5);
-  void va_report(loglevel level, int err_code, const char *prefix_msg,
+  void va_report(loglevel level, int err_code,
                  const char *msg, va_list v_args) const;
 
   /**
@@ -69,6 +69,7 @@ public:
   void clear_error() {
     mysql_mutex_lock(&err_lock);
     m_last_error.clear();
+    is_fatal_error = false;
     mysql_mutex_unlock(&err_lock);
   }
 
@@ -128,6 +129,7 @@ public:
 
   Error const& last_error() const { return m_last_error; }
   bool is_error() const { return last_error().number != 0; }
+  void set_fatal_error() {is_fatal_error = true; }
 
   virtual ~Slave_reporting_capability()= 0;
 
@@ -136,7 +138,7 @@ protected:
   virtual void do_report(loglevel level, int err_code,
                  const char *msg, va_list v_args) const
   {
-    va_report(level, err_code, NULL, msg, v_args);
+    va_report(level, err_code, msg, v_args);
   }
 
 private:
@@ -144,6 +146,7 @@ private:
      Last error produced by the I/O or SQL thread respectively.
    */
   mutable Error m_last_error;
+  bool is_fatal_error;
 
   char const *const m_thread_name;
 

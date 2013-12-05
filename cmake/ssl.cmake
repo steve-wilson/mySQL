@@ -74,6 +74,8 @@ ENDMACRO()
 # Provides the following configure options:
 # WITH_SSL=[yes|bundled|system|<path/to/custom/installation>]
 MACRO (MYSQL_CHECK_SSL)
+  # Add custom krb.
+  MYSQL_CHECK_KRB()
   IF(NOT WITH_SSL)
    IF(WIN32)
      CHANGE_SSL_SETTINGS("bundled")
@@ -187,22 +189,6 @@ MACRO (MYSQL_CHECK_SSL)
     # to get LOCATION and do correct dependency analysis.
     SET(MY_CRYPTO_LIBRARY "${CRYPTO_LIBRARY}")
     SET(MY_OPENSSL_LIBRARY "${OPENSSL_LIBRARY}")
-    IF (WITH_SSL_PATH)
-      GET_FILENAME_COMPONENT(CRYPTO_EXT "${CRYPTO_LIBRARY}" EXT)
-      GET_FILENAME_COMPONENT(OPENSSL_EXT "${OPENSSL_LIBRARY}" EXT)
-      IF (CRYPTO_EXT STREQUAL ".a")
-        SET(MY_CRYPTO_LIBRARY imported_crypto)
-        ADD_LIBRARY(imported_crypto STATIC IMPORTED)
-        SET_TARGET_PROPERTIES(imported_crypto
-          PROPERTIES IMPORTED_LOCATION "${CRYPTO_LIBRARY}")
-      ENDIF()
-      IF (OPENSSL_EXT STREQUAL ".a")
-        SET(MY_OPENSSL_LIBRARY imported_openssl)
-        ADD_LIBRARY(imported_openssl STATIC IMPORTED)
-        SET_TARGET_PROPERTIES(imported_openssl
-          PROPERTIES IMPORTED_LOCATION "${OPENSSL_LIBRARY}")
-      ENDIF()
-    ENDIF()
 
     MESSAGE(STATUS "OPENSSL_INCLUDE_DIR = ${OPENSSL_INCLUDE_DIR}")
     MESSAGE(STATUS "OPENSSL_LIBRARY = ${OPENSSL_LIBRARY}")
@@ -222,8 +208,9 @@ MACRO (MYSQL_CHECK_SSL)
       IF(CMAKE_SYSTEM_NAME MATCHES "Linux")
         SET(SSL_LIBRARIES ${SSL_LIBRARIES} ${LIBDL})
       ENDIF()
+      SET(SSL_LIBRARIES ${KRB_LIBRARIES} ${SSL_LIBRARIES})
       MESSAGE(STATUS "SSL_LIBRARIES = ${SSL_LIBRARIES}")
-      SET(SSL_INCLUDE_DIRS ${OPENSSL_INCLUDE_DIR})
+      SET(SSL_INCLUDE_DIRS ${OPENSSL_INCLUDE_DIR} ${KRB_INCLUDE_DIRS})
       SET(SSL_INTERNAL_INCLUDE_DIRS "")
       SET(SSL_DEFINES "-DHAVE_OPENSSL")
     ELSE()
@@ -262,5 +249,43 @@ MACRO (COPY_OPENSSL_DLLS target_name)
         )
       ADD_CUSTOM_TARGET(${target_name} ALL)
     ENDIF()
+  ENDIF()
+ENDMACRO()
+
+MACRO (MYSQL_CHECK_KRB)
+  MYSQL_CHECK_RESOLV()
+  # See if WITH_KRB is of the form </path/to/custom/installation>
+  FILE(GLOB WITH_KRB_HEADER ${WITH_KRB}/include/krb5.h)
+  IF (WITH_KRB_HEADER)
+    SET(WITH_KRB_PATH ${WITH_KRB} CACHE PATH "path to custom KRB installation")
+    # Search in KRB_PATH.
+    FIND_PATH(KRB_ROOT_DIR
+      NAMES include/krb5.h
+      NO_CMAKE_PATH
+      NO_CMAKE_ENVIRONMENT_PATH
+      HINTS ${WITH_KRB_PATH}
+    )
+    # Then search in standard places (if not found above).
+    FIND_PATH(KRB_ROOT_DIR
+      NAMES include/krb5.h
+    )
+
+    IF(KRB_ROOT_DIR)
+      SET(KRB_LIBRARIES ${RESOLV_LIBRARY} ${KRB_ROOT_DIR}/lib/libkrb5support.so ${KRB_ROOT_DIR}/lib/libk5crypto.so ${KRB_ROOT_DIR}/lib/libkrb5.so)
+      SET(KRB_INCLUDE_DIRS "${KRB_ROOT_DIR}/include")
+    ENDIF()
+  ENDIF()
+ENDMACRO()
+
+MACRO (MYSQL_CHECK_RESOLV)
+  FILE(GLOB NAMESER_HEADER ${WITH_GLIBC}/include/arpa/nameser.h)
+  IF (NAMESER_HEADER)
+    SET(WITH_GLIBC_PATH ${WITH_GLIBC} CACHE PATH "path to custom glibc installation")
+    # Search in GLIBC_PATH.
+    FIND_LIBRARY(RESOLV_LIBRARY
+                 NAMES resolv
+                 NO_CMAKE_PATH
+                 NO_CMAKE_ENVIRONMENT_PATH
+                 HINTS ${WITH_GLIBC_PATH}/lib)
   ENDIF()
 ENDMACRO()

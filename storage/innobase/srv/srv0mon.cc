@@ -41,8 +41,8 @@ Created 12/9/2009 Jimmy Yang
 /* Macro to standardize the counter names for counters in the
 "monitor_buf_page" module as they have very structured defines */
 #define	MONITOR_BUF_PAGE(name, description, code, op, op_code)	\
-	{"buffer_page_"op"_"name, "buffer_page_io",		\
-	 "Number of "description" Pages "op,			\
+	{"buffer_page_" op "_" name, "buffer_page_io",		\
+	 "Number of " description " Pages " op,			\
 	 MONITOR_GROUP_MODULE, MONITOR_DEFAULT_START,		\
 	 MONITOR_##code##_##op_code}
 
@@ -1428,8 +1428,10 @@ srv_mon_process_existing_counter(
 	buf_pool_stat_t		stat;
 	buf_pools_list_size_t	buf_pools_list_size;
 	ulint			LRU_len;
+	ulint			old_LRU_len;
 	ulint			free_len;
 	ulint			flush_list_len;
+	ulint			unzip_LRU_len;
 
 	monitor_info = srv_mon_get_info(monitor_id);
 
@@ -1485,13 +1487,17 @@ srv_mon_process_existing_counter(
 
 	/* innodb_buffer_pool_pages_misc */
 	case MONITOR_OVLD_BUF_POOL_PAGE_MISC:
-		buf_get_total_list_len(&LRU_len, &free_len, &flush_list_len);
+		buf_get_total_list_len(
+			&LRU_len, &old_LRU_len, &free_len, &flush_list_len,
+			&unzip_LRU_len);
 		value = buf_pool_get_n_pages() - LRU_len - free_len;
 		break;
 
 	/* innodb_buffer_pool_pages_data */
 	case MONITOR_OVLD_BUF_POOL_PAGES_DATA:
-		buf_get_total_list_len(&LRU_len, &free_len, &flush_list_len);
+		buf_get_total_list_len(
+			&LRU_len, &old_LRU_len, &free_len, &flush_list_len,
+			&unzip_LRU_len);
 		value = LRU_len;
 		break;
 
@@ -1504,7 +1510,9 @@ srv_mon_process_existing_counter(
 
 	/* innodb_buffer_pool_pages_dirty */
 	case MONITOR_OVLD_BUF_POOL_PAGES_DIRTY:
-		buf_get_total_list_len(&LRU_len, &free_len, &flush_list_len);
+		buf_get_total_list_len(
+			&LRU_len, &old_LRU_len, &free_len, &flush_list_len,
+			&unzip_LRU_len);
 		value = flush_list_len;
 		break;
 
@@ -1516,7 +1524,9 @@ srv_mon_process_existing_counter(
 
 	/* innodb_buffer_pool_pages_free */
 	case MONITOR_OVLD_BUF_POOL_PAGES_FREE:
-		buf_get_total_list_len(&LRU_len, &free_len, &flush_list_len);
+		buf_get_total_list_len(
+			&LRU_len, &old_LRU_len, &free_len, &flush_list_len,
+			&unzip_LRU_len);
 		value = free_len;
 		break;
 
@@ -1620,7 +1630,7 @@ srv_mon_process_existing_counter(
 		break;
 
 	case MONITOR_OVLD_RWLOCK_X_SPIN_WAITS:
-		value = rw_lock_stats.rw_x_spin_wait_count;
+		value = rw_lock_stats.rw_x_os_wait_count;
 		break;
 
 	case MONITOR_OVLD_RWLOCK_S_SPIN_ROUNDS:

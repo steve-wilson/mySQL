@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -24,6 +24,11 @@
 #include "mysql/psi/mysql_file.h"          /* MYSQL_FILE */
 #include "sql_list.h"                      /* I_List */
 #include "sql_cmd.h"                       /* SQLCOM_END */
+#include "my_rdtsc.h"                      /* my_timer* */
+#include "sql_priv.h"                      /* enum_var_type */
+// for unix sockets
+#include <sys/socket.h>
+#include <sys/un.h>
 
 class THD;
 struct handlerton;
@@ -104,6 +109,7 @@ extern ulonglong log_output_options;
 extern ulong log_backup_output_options;
 extern my_bool opt_log_queries_not_using_indexes;
 extern ulong opt_log_throttle_queries_not_using_indexes;
+extern my_bool opt_disable_working_set_size;
 extern bool opt_disable_networking, opt_skip_show_db;
 extern bool opt_skip_name_resolve;
 extern bool opt_ignore_builtin_innodb;
@@ -117,7 +123,10 @@ extern my_bool opt_safe_show_db, opt_local_infile, opt_myisam_use_mmap;
 extern my_bool opt_slave_compressed_protocol, use_temp_pool;
 extern ulong slave_exec_mode_options;
 extern ulonglong slave_type_conversions_options;
-extern my_bool read_only, opt_readonly;
+extern my_bool read_only, opt_readonly, super_read_only, opt_super_readonly;
+extern my_bool block_create_myisam;
+extern my_bool block_ftwrl;
+extern my_bool block_uninstall_semisync;
 extern my_bool lower_case_file_system;
 extern ulonglong slave_rows_search_algorithms_options;
 #ifndef DBUG_OFF
@@ -166,10 +175,177 @@ extern const char *log_output_str;
 extern const char *log_backup_output_str;
 extern char *mysql_home_ptr, *pidfile_name_ptr;
 extern char *my_bind_addr_str;
+extern char *binlog_file_basedir_ptr, *binlog_index_basedir_ptr;
 extern char glob_hostname[FN_REFLEN], mysql_home[FN_REFLEN];
 extern char pidfile_name[FN_REFLEN], system_time_zone[30], *opt_init_file;
 extern char default_logfile_name[FN_REFLEN];
 extern char log_error_file[FN_REFLEN], *opt_tc_log_file;
+
+extern int32 thread_binlog_client;
+
+extern my_bool opt_log_slow_extra;
+extern ulonglong binlog_fsync_count;
+
+extern uint net_compression_level;
+
+extern ulong relay_io_connected;
+
+extern ulong opt_peak_lag_time;
+extern ulong opt_peak_lag_sample_rate;
+
+extern ulong relay_io_events, relay_sql_events;
+extern ulonglong relay_io_bytes, relay_sql_bytes;
+extern ulonglong relay_sql_wait_time;
+
+/* SHOW STATS var: Name of current timer */
+extern const char *timer_in_use;
+/* Current timer stats */
+extern struct my_timer_unit_info my_timer;
+/* Get current time */
+extern ulonglong (*my_timer_now)(void);
+/* Get time passed since "then" */
+inline ulonglong my_timer_since(ulonglong then)
+{
+  return (my_timer_now() - then) - my_timer.overhead;
+}
+/* Get time passed since "then", and update then to now */
+inline ulonglong my_timer_since_and_update(ulonglong *then)
+{
+  ulonglong now = my_timer_now();
+  ulonglong ret = (now - (*then)) - my_timer.overhead;
+  *then = now;
+  return ret;
+}
+/* Convert native timer units in a ulonglong into seconds in a double */
+inline double my_timer_to_seconds(ulonglong when)
+{
+  double ret = (double)(when);
+  ret /= (double)(my_timer.frequency);
+  return ret;
+}
+/* Convert native timer units in a ulonglong into milliseconds in a double */
+inline double my_timer_to_milliseconds(ulonglong when)
+{
+  double ret = (double)(when);
+  ret *= 1000.0;
+  ret /= (double)(my_timer.frequency);
+  return ret;
+}
+/* Convert native timer units in a ulonglong into microseconds in a double */
+inline double my_timer_to_microseconds(ulonglong when)
+{
+  double ret = (double)(when);
+  ret *= 1000000.0;
+  ret /= (double)(my_timer.frequency);
+  return ret;
+}
+
+/** Compression statistics for a fil_space */
+struct comp_stat_struct {
+  /** Size of the compressed data on the page */
+  int page_size;
+  /** Current padding for compression */
+  int padding;
+  /** Number of page compressions */
+  ulonglong compressed;
+  /** Number of successful page compressions */
+  ulonglong compressed_ok;
+  /** Number of compressions in primary index */
+  ulonglong compressed_primary;
+  /** Number of successful compressions in primary index */
+  ulonglong compressed_primary_ok;
+  /** Number of page decompressions */
+  ulonglong decompressed;
+  /** Duration of page compressions */
+  ulonglong compressed_time;
+  /** Duration of succesful page compressions */
+  ulonglong compressed_ok_time;
+  /** Duration of page decompressions */
+  ulonglong decompressed_time;
+  /** Duration of primary index page compressions */
+  ulonglong compressed_primary_time;
+  /** Duration of successful primary index page compressions */
+  ulonglong compressed_primary_ok_time;
+};
+
+/** Compression statistics */
+typedef struct comp_stat_struct comp_stat_t;
+
+/* Struct used for IO performance counters */
+struct my_io_perf_struct {
+  volatile ulonglong bytes;
+  volatile ulonglong requests;
+  volatile ulonglong svc_time; /*!< time to do read or write operation */
+  volatile ulonglong svc_time_max;
+  volatile ulonglong wait_time; /*!< total time in the request array */
+  volatile ulonglong wait_time_max;
+  volatile ulonglong slow_ios; /*!< requests that take too long */
+};
+typedef struct my_io_perf_struct my_io_perf_t;
+
+/* struct used in per page type stats in IS.table_stats */
+struct page_stats_struct {
+  ulong n_pages_read; /*!< number read operations of all pages at given space*/
+  ulong n_pages_read_index; /*!< number read operations of FIL_PAGE_INDEX pages at given space*/
+  ulong n_pages_read_blob; /*!< number read operations FIL_PAGE_TYPE_BLOB and FIL_PAGE_TYPE_ZBLOB and FIL_PAGE_TYPE_ZBLOB2 pages at given space*/
+  ulong n_pages_written;/*!< number write operations of all pages at given space*/
+  ulong n_pages_written_index;/*!< number write operations of FIL_PAGE_INDEX pages at given space*/
+  ulong n_pages_written_blob; /*!< number write operations FIL_PAGE_TYPE_BLOB and FIL_PAGE_TYPE_ZBLOB and FIL_PAGE_TYPE_ZBLOB2 pages at given space*/
+};
+typedef struct page_stats_struct page_stats_t;
+/* Per-table operation and IO statistics */
+
+/***************************************************************************
+Initialize an my_io_perf_t struct. */
+static inline void my_io_perf_init(my_io_perf_t* perf) {
+  memset(perf, 0, sizeof(*perf));
+}
+
+/* Accumulate per-table compression stats helper function */
+void my_comp_stat_sum(comp_stat_t* sum, comp_stat_t* comp_stat);
+
+/* Accumulate per-table page stats helper function */
+void my_page_stats_sum(page_stats_t* sum, page_stats_t* page_stats);
+
+/* Returns a - b in diff */
+void my_io_perf_diff(my_io_perf_t* diff,
+                     const my_io_perf_t* a, const my_io_perf_t* b);
+/* Accumulates io perf values */
+void my_io_perf_sum(my_io_perf_t* sum, const my_io_perf_t* perf);
+
+/* Accumulates io perf values using atomic operations */
+void my_io_perf_sum_atomic(
+  my_io_perf_t* sum,
+  ulonglong bytes,
+  ulonglong requests,
+  ulonglong svc_time,
+  ulonglong wait_time,
+  ulonglong slow_ios);
+
+/* Accumulates io perf values using atomic operations */
+static inline void my_io_perf_sum_atomic_helper(
+  my_io_perf_t* sum,
+  const my_io_perf_t* perf)
+{
+  my_io_perf_sum_atomic(
+    sum,
+    perf->bytes,
+    perf->requests,
+    perf->svc_time,
+    perf->wait_time,
+    perf->slow_ios);
+}
+
+/* Fetches table stats for a given table */
+struct TABLE;
+struct st_table_stats* get_table_stats(TABLE *table,
+                                       struct handlerton *engine_type);
+
+unsigned char get_db_stats_index(const char* db);
+void update_global_db_stats_access(unsigned char db_stats_index,
+                                   uint64 space,
+                                   uint64 offset);
+
 /*Move UUID_LENGTH from item_strfunc.h*/
 #define UUID_LENGTH (8+1+4+1+4+1+4+1+12)
 extern char server_uuid[UUID_LENGTH+1];
@@ -180,6 +356,8 @@ extern ulonglong thd_startup_options;
 extern ulong thread_id;
 extern ulong binlog_cache_use, binlog_cache_disk_use;
 extern ulong binlog_stmt_cache_use, binlog_stmt_cache_disk_use;
+extern ulonglong binlog_bytes_written;
+extern ulonglong relay_log_bytes_written;
 extern ulong aborted_threads,aborted_connects;
 extern ulong delayed_insert_timeout;
 extern ulong delayed_insert_limit, delayed_queue_size;
@@ -200,7 +378,6 @@ extern uint  slave_net_timeout;
 extern ulong opt_mts_slave_parallel_workers;
 extern ulonglong opt_mts_pending_jobs_size_max;
 extern uint max_user_connections;
-extern ulong rpl_stop_slave_timeout;
 extern my_bool log_bin_use_v1_row_events;
 extern ulong what_to_log,flush_time;
 extern ulong max_prepared_stmt_count, prepared_stmt_count;
@@ -216,6 +393,8 @@ extern const char *binlog_checksum_type_names[];
 extern my_bool opt_master_verify_checksum;
 extern my_bool opt_slave_sql_verify_checksum;
 extern my_bool enforce_gtid_consistency;
+extern ulong sql_slave_skip_counter_usage;
+
 enum enum_gtid_mode
 {
   /// Support only anonymous groups, not GTIDs.
@@ -228,6 +407,7 @@ enum enum_gtid_mode
   GTID_MODE_ON= 3
 };
 extern ulong gtid_mode;
+extern bool enable_gtid_mode_on_new_slave_with_old_master;
 extern const char *gtid_mode_names[];
 extern TYPELIB gtid_mode_typelib;
 
@@ -265,7 +445,7 @@ extern const char *load_default_groups[];
 extern struct my_option my_long_options[];
 extern struct my_option my_long_early_options[];
 int handle_early_options();
-void adjust_related_options(ulong *requested_open_files);
+void adjust_related_options();
 extern int mysqld_server_started;
 extern "C" MYSQL_PLUGIN_IMPORT int orig_argc;
 extern "C" MYSQL_PLUGIN_IMPORT char **orig_argv;
@@ -284,7 +464,13 @@ extern ulong connection_errors_internal;
 extern ulong connection_errors_max_connection;
 extern ulong connection_errors_peer_addr;
 extern ulong log_warnings;
-void init_sql_statement_names();
+/* Enable logging queries to a unix local datagram socket */
+extern my_bool log_datagram;
+extern ulong log_datagram_usecs;
+extern int log_datagram_sock;
+
+/* flashcache */
+extern int cachedev_fd;
 
 /*
   THR_MALLOC is a key which will be used to set/get MEM_ROOT** for a thread,
@@ -304,6 +490,8 @@ extern PSI_mutex_key key_LOCK_des_key_file;
 
 extern PSI_mutex_key key_BINLOG_LOCK_commit;
 extern PSI_mutex_key key_BINLOG_LOCK_commit_queue;
+extern PSI_mutex_key key_BINLOG_LOCK_semisync;
+extern PSI_mutex_key key_BINLOG_LOCK_semisync_queue;
 extern PSI_mutex_key key_BINLOG_LOCK_done;
 extern PSI_mutex_key key_BINLOG_LOCK_flush_queue;
 extern PSI_mutex_key key_BINLOG_LOCK_index;
@@ -311,6 +499,7 @@ extern PSI_mutex_key key_BINLOG_LOCK_log;
 extern PSI_mutex_key key_BINLOG_LOCK_sync;
 extern PSI_mutex_key key_BINLOG_LOCK_sync_queue;
 extern PSI_mutex_key key_BINLOG_LOCK_xids;
+extern PSI_mutex_key key_BINLOG_LOCK_binlog_end_pos;
 extern PSI_mutex_key
   key_delayed_insert_mutex, key_hash_filo_lock, key_LOCK_active_mi,
   key_LOCK_connection_count, key_LOCK_crypt, key_LOCK_delayed_create,
@@ -332,9 +521,15 @@ extern PSI_mutex_key
   key_mutex_slave_parallel_worker,
   key_structure_guard_mutex, key_TABLE_SHARE_LOCK_ha_data,
   key_LOCK_error_messages, key_LOCK_thread_count,
-  key_LOCK_log_throttle_qni;
+  key_LOCK_global_table_stats,
+  key_LOCK_log_throttle_qni,
+  key_gtid_info_run_lock,
+  key_gtid_info_data_lock,
+  key_gtid_info_sleep_lock;
 extern PSI_mutex_key key_RELAYLOG_LOCK_commit;
 extern PSI_mutex_key key_RELAYLOG_LOCK_commit_queue;
+extern PSI_mutex_key key_RELAYLOG_LOCK_semisync;
+extern PSI_mutex_key key_RELAYLOG_LOCK_semisync_queue;
 extern PSI_mutex_key key_RELAYLOG_LOCK_done;
 extern PSI_mutex_key key_RELAYLOG_LOCK_flush_queue;
 extern PSI_mutex_key key_RELAYLOG_LOCK_index;
@@ -342,6 +537,7 @@ extern PSI_mutex_key key_RELAYLOG_LOCK_log;
 extern PSI_mutex_key key_RELAYLOG_LOCK_sync;
 extern PSI_mutex_key key_RELAYLOG_LOCK_sync_queue;
 extern PSI_mutex_key key_RELAYLOG_LOCK_xids;
+extern PSI_mutex_key key_RELAYLOG_LOCK_binlog_end_pos;
 extern PSI_mutex_key key_LOCK_sql_rand;
 extern PSI_mutex_key key_gtid_ensure_index_mutex;
 extern PSI_mutex_key key_LOCK_thread_created;
@@ -367,7 +563,9 @@ extern PSI_cond_key key_BINLOG_update_cond,
   key_relay_log_info_sleep_cond, key_cond_slave_parallel_pend_jobs,
   key_cond_slave_parallel_worker,
   key_TABLE_SHARE_cond, key_user_level_lock_cond,
-  key_COND_thread_count, key_COND_thread_cache, key_COND_flush_thread_cache;
+  key_COND_thread_count, key_COND_thread_cache, key_COND_flush_thread_cache,
+  key_gtid_info_data_cond, key_gtid_info_start_cond, key_gtid_info_stop_cond,
+  key_gtid_info_sleep_cond;
 extern PSI_cond_key key_BINLOG_COND_done;
 extern PSI_cond_key key_RELAYLOG_COND_done;
 extern PSI_cond_key key_RELAYLOG_update_cond;
@@ -396,6 +594,7 @@ extern PSI_socket_key key_socket_tcpip, key_socket_unix, key_socket_client_conne
 
 void init_server_psi_keys();
 #endif /* HAVE_PSI_INTERFACE */
+bool setup_datagram_socket(sys_var *self, THD *thd, enum_var_type type);
 
 /*
   MAINTAINER: Please keep this list in order, to limit merge collisions.
@@ -517,11 +716,6 @@ extern PSI_statement_info sql_statement_info[(uint) SQLCOM_END + 1];
 */
 extern PSI_statement_info com_statement_info[(uint) COM_END + 1];
 
-/**
-  Statement instrumentation key for replication.
-*/
-extern PSI_statement_info stmt_info_rpl;
-
 void init_sql_statement_info();
 void init_com_statement_info();
 #endif /* HAVE_PSI_STATEMENT_INTERFACE */
@@ -559,6 +753,9 @@ extern char default_logfile_name[FN_REFLEN];
 
 #define mysql_tmpdir (my_tmpdir(&mysql_tmpdir_list))
 
+/* Time handling client commands for replication */
+extern ulonglong command_slave_seconds;
+
 extern MYSQL_PLUGIN_IMPORT const key_map key_map_empty;
 extern MYSQL_PLUGIN_IMPORT key_map key_map_full;          /* Should be threaded as const */
 
@@ -581,7 +778,7 @@ extern mysql_cond_t COND_server_started;
 extern mysql_rwlock_t LOCK_grant, LOCK_sys_init_connect, LOCK_sys_init_slave;
 extern mysql_rwlock_t LOCK_system_variables_hash;
 extern mysql_cond_t COND_manager;
-extern int32 thread_running;
+extern int32 num_thread_running;
 extern my_atomic_rwlock_t thread_running_lock;
 extern my_atomic_rwlock_t slave_open_temp_tables_lock;
 extern my_atomic_rwlock_t opt_binlog_max_flush_queue_time_lock;
@@ -608,6 +805,7 @@ enum options_mysqld
   OPT_CONSOLE,
   OPT_DEBUG_SYNC_TIMEOUT,
   OPT_DELAY_KEY_WRITE_ALL,
+  OPT_DISABLE_WORKING_SET_SIZE,
   OPT_ISAM_LOG,
   OPT_IGNORE_DB_DIRECTORY,
   OPT_KEY_BUFFER_SIZE,
@@ -653,7 +851,9 @@ enum options_mysqld
   OPT_SECURE_AUTH,
   OPT_THREAD_CACHE_SIZE,
   OPT_HOST_CACHE_SIZE,
-  OPT_TABLE_DEFINITION_CACHE
+  OPT_TABLE_DEFINITION_CACHE,
+  OPT_LOG_SLOW_EXTRA,
+  OPT_PROCESS_CAN_DISABLE_BIN_LOG,
 };
 
 
@@ -750,5 +950,12 @@ inline THD *_current_thd(void)
 #define current_thd _current_thd()
 
 extern const char *MY_BIND_ALL_ADDRESSES;
+
+/*
+  Implementation of a Substitution Box (S-Box) hash using 256 values
+  Ideal for use in generating uniform hashes (CRC32 is very unsuitable
+  for use as a uniform hash)
+*/
+uint32 my_sbox_hash(const uchar* data, ulong length);
 
 #endif /* MYSQLD_INCLUDED */

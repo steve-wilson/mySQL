@@ -250,8 +250,6 @@ private:
   Partition_share *part_share;
   /** Temporary storage for new partitions Handler_shares during ALTER */
   List<Parts_share_refs> m_new_partitions_share_refs;
-  /** Sorted array of partition ids in descending order of number of rows. */
-  uint32 *m_part_ids_sorted_by_num_of_records;
   /* Compare function for my_qsort2, for reversed order. */
   static int compare_number_of_records(ha_partition *me,
                                        const uint32 *a,
@@ -347,7 +345,7 @@ private:
     delete_table and rename_table uses very similar logic which
     is packed into this routine.
   */
-  int del_ren_table(const char *from, const char *to);
+  uint del_ren_table(const char *from, const char *to);
   /*
     One method to create the table_name.par file containing the names of the
     underlying partitions, their engine and the number of partitions.
@@ -467,7 +465,7 @@ public:
   virtual int write_row(uchar * buf);
   virtual int update_row(const uchar * old_data, uchar * new_data);
   virtual int delete_row(const uchar * buf);
-  virtual int delete_all_rows(void);
+  virtual int delete_all_rows(ha_rows* nrows = NULL);
   virtual int truncate();
   virtual void start_bulk_insert(ha_rows rows);
   virtual int end_bulk_insert();
@@ -684,7 +682,6 @@ public:
 private:
   /* Helper functions for optimizer hints. */
   ha_rows min_rows_for_estimate();
-  uint get_biggest_used_partition(uint *part_index);
 public:
 
   /*

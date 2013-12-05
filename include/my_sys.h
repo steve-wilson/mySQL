@@ -799,6 +799,7 @@ extern my_bool init_dynamic_array2(DYNAMIC_ARRAY *array, uint element_size,
 extern my_bool init_dynamic_array(DYNAMIC_ARRAY *array, uint element_size,
                                   uint init_alloc, uint alloc_increment);
 extern my_bool insert_dynamic(DYNAMIC_ARRAY *array, const void *element);
+extern my_bool insert_dynamic_set(DYNAMIC_ARRAY *array, const void *element);
 extern void *alloc_dynamic(DYNAMIC_ARRAY *array);
 extern void *pop_dynamic(DYNAMIC_ARRAY*);
 extern my_bool set_dynamic(DYNAMIC_ARRAY *array, const void *element,
@@ -851,10 +852,10 @@ static inline char *safe_strdup_root(MEM_ROOT *root, const char *str)
 }
 extern char *strmake_root(MEM_ROOT *root,const char *str,size_t len);
 extern void *memdup_root(MEM_ROOT *root,const void *str, size_t len);
-extern my_bool my_compress(uchar *, size_t *, size_t *);
+extern my_bool my_compress(uchar *, size_t *, size_t *, uint level);
 extern my_bool my_uncompress(uchar *, size_t , size_t *);
 extern uchar *my_compress_alloc(const uchar *packet, size_t *len,
-                                size_t *complen);
+                                size_t *complen, uint level);
 extern int packfrm(uchar *, size_t, uchar **, size_t *);
 extern int unpackfrm(uchar **, size_t *, const uchar *);
 

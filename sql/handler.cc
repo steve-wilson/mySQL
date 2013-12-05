@@ -49,6 +49,10 @@ using std::min;
 using std::max;
 using std::list;
 
+// Called to keep table stats in sync with table cache after rename/delete.
+void table_stats_delete(const char *old_name);
+void table_stats_rename(const char *old_name, const char *new_name);
+
 // This is a temporary backporting fix.
 #ifndef HAVE_LOG2
 /*
@@ -417,7 +421,6 @@ handlerton *ha_checktype(THD *thd, enum legacy_db_type database_type,
     return NULL;
   }
 
-  (void) RUN_HOOK(transaction, after_rollback, (thd, FALSE));
 
   switch (database_type) {
   case DB_TYPE_MRG_ISAM:
@@ -554,7 +557,8 @@ int ha_init_errors(void)
   SETMSG(HA_FTS_INVALID_DOCID,          "Invalid InnoDB FTS Doc ID");
   SETMSG(HA_ERR_TABLE_IN_FK_CHECK,	ER_DEFAULT(ER_TABLE_IN_FK_CHECK));
   SETMSG(HA_ERR_TABLESPACE_EXISTS,      "Tablespace already exists");
-  SETMSG(HA_ERR_FTS_EXCEED_RESULT_CACHE_LIMIT,  "FTS query exceeds result cache limit");
+  SETMSG(HA_ERR_TMP_TABLE_MAX_FILE_SIZE_EXCEEDED,
+         ER_DEFAULT(ER_TMP_TABLE_MAX_FILE_SIZE_EXCEEDED));
 
   /* Register the error messages for use with my_error(). */
   return my_error_register(get_handler_errmsgs, HA_ERR_FIRST, HA_ERR_LAST);
@@ -827,6 +831,40 @@ void ha_drop_database(char* path)
   plugin_foreach(NULL, dropdb_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN, path);
 }
 
+
+static my_bool get_table_stats_handlerton(THD *unused, plugin_ref plugin,
+                                          void *cb)
+{
+  handlerton *hton= plugin_data(plugin, handlerton *);
+
+  if (hton->state == SHOW_OPTION_YES && hton->update_table_stats)
+    hton->update_table_stats((table_stats_cb) cb);
+
+  return FALSE;
+}
+
+void ha_get_table_stats(table_stats_cb cb)
+{
+  plugin_foreach(NULL, get_table_stats_handlerton,
+                 MYSQL_STORAGE_ENGINE_PLUGIN, (void*) cb);
+}
+
+static my_bool get_index_stats_handlerton(THD* unused, plugin_ref plugin,
+                                          void* table_stats)
+{
+  handlerton *hton= plugin_data(plugin, handlerton *);
+
+  if (hton->state == SHOW_OPTION_YES && hton->update_index_stats)
+    hton->update_index_stats((TABLE_STATS*)table_stats);
+
+  return FALSE;
+}
+
+void ha_get_index_stats(void* table_stats)
+{
+  plugin_foreach(NULL, get_index_stats_handlerton,
+                 MYSQL_STORAGE_ENGINE_PLUGIN, table_stats);
+}
 
 static my_bool closecon_handlerton(THD *thd, plugin_ref plugin,
                                    void *unused)
@@ -1215,7 +1253,7 @@ int ha_prepare(THD *thd)
       status_var_increment(thd->status_var.ha_prepare_count);
       if (ht->prepare)
       {
-        if ((err= ht->prepare(ht, thd, all)))
+        if ((err= ht->prepare(ht, thd, all, FALSE)))
         {
           my_error(ER_ERROR_DURING_COMMIT, MYF(0), err);
           ha_rollback_trans(thd, all);
@@ -1267,6 +1305,18 @@ ha_check_and_coalesce_trx_read_only(THD *thd, Ha_trx_info *ha_list,
   {
     if (ha_info->is_trx_read_write())
       ++rw_ha_count;
+    else
+    {
+      /*
+        If we have any fake changes handlertons, they will not be marked as
+        read-write, potentially skipping 2PC and causing the fake transaction
+        to be binlogged.  Force using 2PC in this case by bumping rw_ha_count
+        for each fake changes handlerton.
+      */
+      handlerton *ht= ha_info->ht();
+      if (unlikely(ht->is_fake_change && ht->is_fake_change(ht, thd)))
+        ++rw_ha_count;
+    }
 
     if (! all)
     {
@@ -1301,7 +1351,6 @@ ha_check_and_coalesce_trx_read_only(THD *thd, Ha_trx_info *ha_list,
                                        global read lock is active. This can be
                                        used to allow changes to internal tables
                                        (e.g. slave status tables).
-
   @retval
     0   ok
   @retval
@@ -1315,8 +1364,7 @@ ha_check_and_coalesce_trx_read_only(THD *thd, Ha_trx_info *ha_list,
     stored functions or triggers. So we simply do nothing now.
     TODO: This should be fixed in later ( >= 5.1) releases.
 */
-
-int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock)
+int ha_commit_trans(THD *thd, bool all, bool async, bool ignore_global_read_lock)
 {
   int error= 0;
   /*
@@ -1411,21 +1459,31 @@ int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock)
       DEBUG_SYNC(thd, "ha_commit_trans_after_acquire_commit_lock");
     }
 
+    bool enforce_ro = true;
+    if (!opt_super_readonly)
+      enforce_ro = !(thd->security_ctx->master_access & SUPER_ACL);
     if (rw_trans &&
         opt_readonly &&
-        !(thd->security_ctx->master_access & SUPER_ACL) &&
+        enforce_ro &&
         !thd->slave_thread)
     {
-      my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--read-only");
+      if (opt_super_readonly)
+      {
+        my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--read-only (super)");
+      }
+      else
+      {
+        my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--read-only");
+      }
       ha_rollback_trans(thd, all);
       error= 1;
       goto end;
     }
 
     if (!trans->no_2pc && (rw_ha_count > 1))
-      error= tc_log->prepare(thd, all);
+      error= tc_log->prepare(thd, all, async);
   }
-  if (error || (error= tc_log->commit(thd, all)))
+  if (error || (error= tc_log->commit(thd, all, async)))
   {
     ha_rollback_trans(thd, all);
     error= 1;
@@ -1464,16 +1522,14 @@ end:
                    issued by DDL. Is not set when called
                    at the end of statement, even if
                    autocommit=1.
-  @param[in]  run_after_commit
-                   True by default, otherwise, does not execute
-                   the after_commit hook in the function.
 */
 
-int ha_commit_low(THD *thd, bool all, bool run_after_commit)
+int ha_commit_low(THD *thd, bool all, bool async)
 {
   int error=0;
   THD_TRANS *trans=all ? &thd->transaction.all : &thd->transaction.stmt;
   Ha_trx_info *ha_info= trans->ha_list, *ha_info_next;
+  bool is_real_trans= all || thd->transaction.all.ha_list == 0;
   DBUG_ENTER("ha_commit_low");
 
   if (ha_info)
@@ -1482,12 +1538,17 @@ int ha_commit_low(THD *thd, bool all, bool run_after_commit)
     {
       int err;
       handlerton *ht= ha_info->ht();
-      if ((err= ht->commit(ht, thd, all)))
+      if ((err= ht->commit(ht, thd, all, async)))
       {
         my_error(ER_ERROR_DURING_COMMIT, MYF(0), err);
         error=1;
       }
       status_var_increment(thd->status_var.ha_commit_count);
+      if (is_real_trans)
+      {
+        USER_STATS *us= thd_get_user_stats(thd);
+        my_atomic_add64((longlong*)&(us->transactions_commit), 1);
+      }
       ha_info_next= ha_info->next();
       ha_info->reset(); /* keep it conveniently zero-filled */
     }
@@ -1511,13 +1572,6 @@ int ha_commit_low(THD *thd, bool all, bool run_after_commit)
     was called.
   */
   thd->transaction.flags.commit_low= false;
-  if (run_after_commit)
-  {
-    /* If commit succeeded, we call the after_commit hook */
-    if (!error)
-      (void) RUN_HOOK(transaction, after_commit, (thd, all));
-    thd->transaction.flags.run_hooks= false;
-  }
   DBUG_RETURN(error);
 }
 
@@ -1544,23 +1598,19 @@ int ha_rollback_low(THD *thd, bool all)
         error= 1;
       }
       status_var_increment(thd->status_var.ha_rollback_count);
+      USER_STATS *us= thd_get_user_stats(thd);
+      my_atomic_add64((longlong*)&(us->transactions_rollback), 1);
       ha_info_next= ha_info->next();
       ha_info->reset(); /* keep it conveniently zero-filled */
     }
     trans->ha_list= 0;
     trans->no_2pc=0;
     trans->rw_ha_count= 0;
+    if (all && thd->transaction_rollback_request &&
+        thd->transaction.xid_state.xa_state != XA_NOTR)
+      thd->transaction.xid_state.rm_error= thd->get_stmt_da()->sql_errno();
   }
 
-  /*
-    Thanks to possibility of MDL deadlock rollback request can come even if
-    transaction hasn't been started in any transactional storage engine.
-  */
-  if (all && thd->transaction_rollback_request &&
-      thd->transaction.xid_state.xa_state != XA_NOTR)
-    thd->transaction.xid_state.rm_error= thd->get_stmt_da()->sql_errno();
-
-  (void) RUN_HOOK(transaction, after_rollback, (thd, all));
   return error;
 }
 
@@ -1689,7 +1739,6 @@ int ha_commit_or_rollback_by_xid(THD *thd, XID *xid, bool commit)
 }
 
 
-#ifndef DBUG_OFF
 /**
   @note
     This does not need to be multi-byte safe or anything
@@ -1743,7 +1792,6 @@ static char* xid_to_str(char *buf, XID *xid)
   *s=0;
   return buf;
 }
-#endif
 
 /**
   recover() step of xa.
@@ -1767,6 +1815,8 @@ struct xarecover_st
   XID *list;
   HASH *commit_list;
   bool dry_run;
+  char *binlog_file;
+  my_off_t *binlog_pos;
 };
 
 static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
@@ -1778,7 +1828,8 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
 
   if (hton->state == SHOW_OPTION_YES && hton->recover)
   {
-    while ((got= hton->recover(hton, info->list, info->len)) > 0 )
+    while ((got= hton->recover(hton, info->list, info->len,
+                               info->binlog_file, info->binlog_pos)) > 0)
     {
       sql_print_information("Found %d prepared transaction(s) in %s",
                             got, ha_resolve_storage_engine_name(hton));
@@ -1787,10 +1838,8 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
         my_xid x=info->list[i].get_my_xid();
         if (!x) // not "mine" - that is generated by external TM
         {
-#ifndef DBUG_OFF
           char buf[XIDDATASIZE*4+6]; // see xid_to_str
           sql_print_information("ignore xid %s", xid_to_str(buf, info->list+i));
-#endif
           xid_cache_insert(info->list+i, XA_PREPARED);
           info->found_foreign_xids++;
           continue;
@@ -1805,19 +1854,15 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
             my_hash_search(info->commit_list, (uchar *)&x, sizeof(x)) != 0 :
             tc_heuristic_recover == TC_HEURISTIC_RECOVER_COMMIT)
         {
-#ifndef DBUG_OFF
           char buf[XIDDATASIZE*4+6]; // see xid_to_str
           sql_print_information("commit xid %s", xid_to_str(buf, info->list+i));
-#endif
           hton->commit_by_xid(hton, info->list+i);
         }
         else
         {
-#ifndef DBUG_OFF
           char buf[XIDDATASIZE*4+6]; // see xid_to_str
           sql_print_information("rollback xid %s",
                                 xid_to_str(buf, info->list+i));
-#endif
           hton->rollback_by_xid(hton, info->list+i);
         }
       }
@@ -1828,7 +1873,7 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
   return FALSE;
 }
 
-int ha_recover(HASH *commit_list)
+int ha_recover(HASH *commit_list, char *binlog_file, my_off_t *binlog_pos)
 {
   struct xarecover_st info;
   DBUG_ENTER("ha_recover");
@@ -1836,6 +1881,8 @@ int ha_recover(HASH *commit_list)
   info.commit_list= commit_list;
   info.dry_run= (info.commit_list==0 && tc_heuristic_recover==0);
   info.list= NULL;
+  info.binlog_file = binlog_file;
+  info.binlog_pos = binlog_pos;
 
   /* commit_list and tc_heuristic_recover cannot be set both */
   DBUG_ASSERT(info.commit_list==0 || tc_heuristic_recover==0);
@@ -2025,6 +2072,8 @@ int ha_rollback_to_savepoint(THD *thd, SAVEPOINT *sv)
       error=1;
     }
     status_var_increment(thd->status_var.ha_rollback_count);
+    USER_STATS *us= thd_get_user_stats(thd);
+    my_atomic_add64((longlong*)&(us->transactions_rollback), 1);
     ha_info_next= ha_info->next();
     ha_info->reset(); /* keep it conveniently zero-filled */
   }
@@ -2032,7 +2081,7 @@ int ha_rollback_to_savepoint(THD *thd, SAVEPOINT *sv)
   DBUG_RETURN(error);
 }
 
-int ha_prepare_low(THD *thd, bool all)
+int ha_prepare_low(THD *thd, bool all, bool async)
 {
   int error= 0;
   THD_TRANS *trans=all ? &thd->transaction.all : &thd->transaction.stmt;
@@ -2050,9 +2099,16 @@ int ha_prepare_low(THD *thd, bool all)
         transaction is read-only. This allows for simpler
         implementation in engines that are always read-only.
       */
-      if (!ha_info->is_trx_read_write())
+      /*
+        But do call two-phase commit if the handlerton has fake changes
+        enabled even if it's not marked as read-write.  This will ensure that
+        the fake changes handlerton prepare will fail, preventing binlogging
+        and committing the transaction in other engines.
+      */
+      if (!ha_info->is_trx_read_write()
+          && likely(!(ht->is_fake_change && ht->is_fake_change(ht, thd))))
         continue;
-      if ((err= ht->prepare(ht, thd, all)))
+      if ((err= ht->prepare(ht, thd, all, async)))
       {
         my_error(ER_ERROR_DURING_COMMIT, MYF(0), err);
         error= 1;
@@ -2131,34 +2187,63 @@ int ha_release_savepoint(THD *thd, SAVEPOINT *sv)
 }
 
 
+struct snapshot_handlerton_st
+{
+  bool error;
+  char *binlog_file;
+  ulonglong* binlog_pos;
+  char **gtid_executed;
+  int *gtid_executed_length;
+};
+
 static my_bool snapshot_handlerton(THD *thd, plugin_ref plugin,
                                    void *arg)
 {
+  snapshot_handlerton_st* info = (snapshot_handlerton_st*)(arg);
+
   handlerton *hton= plugin_data(plugin, handlerton *);
   if (hton->state == SHOW_OPTION_YES &&
       hton->start_consistent_snapshot)
   {
-    hton->start_consistent_snapshot(hton, thd);
-    *((bool *)arg)= false;
+    info->error = false;
+
+    if (hton->start_consistent_snapshot(hton, thd, info->binlog_file,
+                                        info->binlog_pos,
+                                        info->gtid_executed,
+                                        info->gtid_executed_length)) {
+      my_printf_error(ER_UNKNOWN_ERROR,
+                      "Cannot start InnoDB transaction or binlog disabled",
+                      MYF(0));
+      return TRUE;
+    }
   }
   return FALSE;
 }
 
-int ha_start_consistent_snapshot(THD *thd)
+int ha_start_consistent_snapshot(THD *thd, char *binlog_file,
+                                 ulonglong* binlog_pos,
+                                 char** gtid_executed,
+                                 int* gtid_executed_length)
 {
-  bool warn= true;
+  snapshot_handlerton_st info;
+  info.binlog_file = binlog_file;
+  info.binlog_pos = binlog_pos;
+  info.gtid_executed = gtid_executed;
+  info.gtid_executed_length = gtid_executed_length;
+  info.error = true;
 
-  plugin_foreach(thd, snapshot_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN, &warn);
+  if (plugin_foreach(thd, snapshot_handlerton,
+                     MYSQL_STORAGE_ENGINE_PLUGIN, &info)) {
+    return TRUE;
+  }
 
   /*
     Same idea as when one wants to CREATE TABLE in one engine which does not
     exist:
   */
-  if (warn)
-    push_warning(thd, Sql_condition::WARN_LEVEL_WARN, ER_UNKNOWN_ERROR,
-                 "This MySQL server does not support any "
-                 "consistent-read capable storage engine");
-  return 0;
+  if (info.error)
+    my_printf_error(ER_UNKNOWN_ERROR, "InnoDB disabled", MYF(0));
+  return info.error;
 }
 
 
@@ -2499,9 +2584,34 @@ int handler::ha_open(TABLE *table_arg, const char *name, int mode,
       dup_ref=ref+ALIGN_SIZE(ref_length);
     cached_table_flags= table_flags();
   }
+  stats.reset_table_stats();
+  table_stats = NULL;
   DBUG_RETURN(error);
 }
 
+void ha_statistics::reset_table_stats()
+{
+  rows_inserted = rows_updated = rows_deleted = 0;
+  rows_read = rows_requested = index_inserts = 0;
+  rows_index_first = rows_index_next = 0;
+  my_io_perf_init(&table_io_perf_read);
+  my_io_perf_init(&table_io_perf_write);
+  my_io_perf_init(&table_io_perf_read_blob);
+  my_io_perf_init(&table_io_perf_read_primary);
+  my_io_perf_init(&table_io_perf_read_secondary);
+}
+
+
+bool ha_statistics::has_table_stats()
+{
+  return (rows_read || rows_requested || index_inserts ||
+          rows_inserted || rows_updated || rows_deleted ||
+          table_io_perf_read.requests ||
+          table_io_perf_write.requests ||
+          table_io_perf_read_blob.requests ||
+          table_io_perf_read_primary.requests ||
+          table_io_perf_read_secondary.requests);
+}
 
 /**
   Close handler.
@@ -3702,8 +3812,8 @@ void handler::print_error(int error, myf errflag)
   case HA_ERR_TOO_MANY_FIELDS:
     textno= ER_TOO_MANY_FIELDS;
     break;
-  case HA_ERR_INNODB_READ_ONLY:
-    textno= ER_INNODB_READ_ONLY;
+  case HA_ERR_TMP_TABLE_MAX_FILE_SIZE_EXCEEDED:
+    textno= ER_TMP_TABLE_MAX_FILE_SIZE_EXCEEDED;
     break;
   default:
     {
@@ -4148,13 +4258,13 @@ handler::ha_bulk_update_row(const uchar *old_data, uchar *new_data,
 */
 
 int
-handler::ha_delete_all_rows()
+handler::ha_delete_all_rows(ha_rows* nrows)
 {
   DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE ||
               m_lock_type == F_WRLCK);
   mark_trx_read_write();
 
-  return delete_all_rows();
+  return delete_all_rows(nrows);
 }
 
 
@@ -4314,12 +4424,14 @@ bool handler::ha_commit_inplace_alter_table(TABLE *altered_table,
      The exception is if we're about to roll back changes (commit= false).
      In this case, we might be rolling back after a failed lock upgrade,
      so we could be holding the same lock level as for inplace_alter_table().
+     TABLE::mdl_ticket is 0 for temporary tables.
    */
-   DBUG_ASSERT(ha_thd()->mdl_context.is_lock_owner(MDL_key::TABLE,
+   DBUG_ASSERT((table->s->tmp_table != NO_TMP_TABLE && !table->mdl_ticket) ||
+               (ha_thd()->mdl_context.is_lock_owner(MDL_key::TABLE,
                                                    table->s->db.str,
                                                    table->s->table_name.str,
                                                    MDL_EXCLUSIVE) ||
-               !commit);
+               !commit));
 
    return commit_inplace_alter_table(altered_table, ha_alter_info, commit);
 }
@@ -4411,7 +4523,12 @@ handler::ha_rename_table(const char *from, const char *to)
   DBUG_ASSERT(m_lock_type == F_UNLCK);
   mark_trx_read_write();
 
-  return rename_table(from, to);
+  int error = rename_table(from, to);
+  if (!error)
+  {
+    table_stats_rename(from, to);
+  }
+  return error;
 }
 
 
@@ -4427,7 +4544,11 @@ handler::ha_delete_table(const char *name)
   DBUG_ASSERT(m_lock_type == F_UNLCK);
   mark_trx_read_write();
 
-  return delete_table(name);
+  int error = delete_table(name);
+  if (!error) {
+    table_stats_delete(name);
+    }
+  return error;
 }
 
 
@@ -4444,6 +4565,21 @@ handler::ha_drop_table(const char *name)
   mark_trx_read_write();
 
   return drop_table(name);
+}
+
+/**
+  Defragment table in the engine: public interface.
+
+  @sa handler::defragment_table()
+*/
+
+int
+handler::ha_defragment_table(const char *name, const char *index, bool async)
+{
+  DBUG_ASSERT(m_lock_type == F_UNLCK);
+  mark_trx_read_write();
+
+  return defragment_table(name, index, async);
 }
 
 
@@ -4568,7 +4704,7 @@ int ha_enable_transaction(THD *thd, bool on)
       is an optimization hint that storage engine is free to ignore.
       So, let's commit an open transaction (if any) now.
     */
-    if (!(error= ha_commit_trans(thd, 0)))
+    if (!(error= ha_commit_trans(thd, 0, FALSE)))
       error= trans_commit_implicit(thd);
   }
   DBUG_RETURN(error);
@@ -6209,7 +6345,7 @@ end:
 ha_rows DsMrr_impl::dsmrr_info(uint keyno, uint n_ranges, uint rows,
                                uint *bufsz, uint *flags, Cost_estimate *cost)
 {  
-  ha_rows res;
+  ha_rows DBUG_ONLY res;
   uint def_flags= *flags;
   uint def_bufsz= *bufsz;
 
@@ -6856,6 +6992,111 @@ TYPELIB* ha_known_exts()
   return known_extensions;
 }
 
+/*
+  Updates global per-table counters with work done by this instance
+
+  SYNOPSIS
+    update_global_table_stats
+
+  NOTES
+    Should be called at the end of a statement.
+    TODO(mcallaghan): support more concurrency on update, shard the hash table
+*/
+void handler::update_global_table_stats(THD *thd)
+{
+  if (!stats.has_table_stats())
+    return;
+
+  if (!table_stats)
+    table_stats = get_table_stats(table, ht);
+
+  if (table_stats)
+  {
+    my_atomic_add64((longlong*)&table_stats->queries_used, 1);
+
+    my_atomic_add64((longlong*)&table_stats->rows_inserted, stats.rows_inserted);
+    my_atomic_add64((longlong*)&table_stats->rows_updated, stats.rows_updated);
+    my_atomic_add64((longlong*)&table_stats->rows_deleted, stats.rows_deleted);
+    my_atomic_add64((longlong*)&table_stats->rows_read, stats.rows_read);
+    my_atomic_add64((longlong*)&table_stats->rows_requested, stats.rows_requested);
+    my_atomic_add64((longlong*)&table_stats->index_inserts, stats.index_inserts);
+    my_atomic_add64((longlong*)&table_stats->rows_index_first, stats.rows_index_first);
+    my_atomic_add64((longlong*)&table_stats->rows_index_next, stats.rows_index_next);
+    if (thd != NULL && thd->lex != NULL &&
+        thd->lex->sql_command == SQLCOM_SELECT &&
+        thd->get_sent_row_count() == 0) {
+      my_atomic_add64((longlong*)&table_stats->queries_empty, 1);
+    }
+    if (thd && thd->open_tables)
+    {
+      my_atomic_add64((longlong*)&table_stats->comment_bytes,
+                                  table->count_comment_bytes);
+      table->count_comment_bytes = 0;
+    }
+
+
+    if (table_stats->num_indexes && last_active_index != MAX_KEY)
+    {
+      /*
+       *         Assume all activity was done for the last active index.
+      */
+      uint ix = last_active_index;
+
+      if (ix >= table_stats->num_indexes)
+        ix = table_stats->num_indexes - 1;
+
+      my_atomic_add64((longlong*)&(table_stats->indexes[ix].rows_inserted),
+                                                        stats.rows_inserted);
+      my_atomic_add64((longlong*)&(table_stats->indexes[ix].rows_updated),
+                                                        stats.rows_updated);
+      my_atomic_add64((longlong*)&(table_stats->indexes[ix].rows_deleted),
+                                                        stats.rows_deleted);
+      my_atomic_add64((longlong*)&(table_stats->indexes[ix].rows_read),
+                                                        stats.rows_read);
+      my_atomic_add64((longlong*)&(table_stats->indexes[ix].rows_requested),
+                                                        stats.rows_requested);
+
+      my_io_perf_sum_atomic_helper(&(table_stats->indexes[ix].io_perf_read),
+                                                        &stats.table_io_perf_read);
+
+      my_atomic_add64((longlong*)&(table_stats->indexes[ix].rows_index_first),
+                                                        stats.rows_index_first);
+      my_atomic_add64((longlong*)&(table_stats->indexes[ix].rows_index_next),
+                                                        stats.rows_index_next);
+
+
+       /*         last_active_index is only set by index_init.
+       *          If this instance is used for a table scan next
+       *          then this prevents that work from being counted for an index.
+       */
+      last_active_index = MAX_KEY;
+    }
+
+  }
+
+  if (thd)
+  {
+    my_io_perf_sum(&thd->io_perf_read, &stats.table_io_perf_read);
+    my_io_perf_sum(&thd->io_perf_write, &stats.table_io_perf_write);
+    my_io_perf_sum(&thd->io_perf_read_blob, &stats.table_io_perf_read_blob);
+    my_io_perf_sum(&thd->io_perf_read_primary,
+                   &stats.table_io_perf_read_primary);
+    my_io_perf_sum(&thd->io_perf_read_secondary,
+                   &stats.table_io_perf_read_secondary);
+
+    thd->status_var.read_requests = thd->io_perf_read.requests;
+    thd->status_var.read_time = thd->io_perf_read.svc_time;
+
+    thd->rows_deleted += stats.rows_deleted;
+    thd->rows_updated += stats.rows_updated;
+    thd->rows_inserted += stats.rows_inserted;
+    thd->rows_read += stats.rows_read;
+    thd->rows_index_first += stats.rows_index_first;
+    thd->rows_index_next += stats.rows_index_next;
+  }
+
+  stats.reset_table_stats();
+}
 
 static bool stat_print(THD *thd, const char *type, uint type_len,
                        const char *file, uint file_len,

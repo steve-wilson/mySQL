@@ -370,16 +370,7 @@ C_MODE_END
 */
 #include <assert.h>
 
-/* an assert that works at compile-time. only for constant expression */
-#ifdef _some_old_compiler_that_does_not_understand_the_construct_below_
 #define compile_time_assert(X)  do { } while(0)
-#else
-#define compile_time_assert(X)                                  \
-  do                                                            \
-  {                                                             \
-    typedef char compile_time_assert[(X) ? 1 : -1] __attribute__((unused)); \
-  } while(0)
-#endif
 
 /* Go around some bugs in different OS and compilers */
 #if defined (HPUX11) && defined(_LARGEFILE_SOURCE)
@@ -569,10 +560,22 @@ typedef SOCKET_SIZE_TYPE size_socket;
 #define FN_HEADLEN	253	/* Max length of filepart of file name */
 #define FN_EXTLEN	20	/* Max length of extension (part of FN_LEN) */
 #define FN_REFLEN	512	/* Max length of full path-name */
+/*
+  Max length of full path-name followed by length of previous_gtid_set in
+  a binlog file seperated by the delimiter ' '.
+
+  Gtid set length is stored as long int which takes 10 characters in decimal.
+  An extra character is used for '\0'.
+*/
+#define FILE_AND_GTID_SET_LENGTH (FN_REFLEN + 12)
 #define FN_EXTCHAR	'.'
 #define FN_HOMELIB	'~'	/* ~/ is used as abbrev for home dir */
 #define FN_CURLIB	'.'	/* ./ is used as abbrev for current dir */
 #define FN_PARENTDIR	".."	/* Parent directory; Must be a string */
+
+#define FN_LEN_STR	__TO_STR(FN_LEN)	/* FN_LEN as a string */
+#define __TO_STR(s)	__TO_STR2(s)	/* Get a #define's value as a string */
+#define __TO_STR2(s)	#s		/* Support macro for __TO_STR() */
 
 #ifdef _WIN32
 #define FN_LIBCHAR	'\\'
@@ -790,6 +793,11 @@ static inline double my_isinf(double x)
 }
 #else
 /* System-provided isinf() is available and safe to use */
+#if defined(__APPLE__) && defined(__cplusplus)
+#include <cmath>
+using std::isinf;
+using std::isnan;
+#endif
 #define my_isinf(X) isinf(X)
 #endif
 #else /* !HAVE_ISINF */
@@ -947,7 +955,7 @@ typedef unsigned long my_off_t;
   TODO Convert these to use Bitmap class.
  */
 typedef ulonglong table_map;          /* Used for table bits in join */
-typedef ulonglong nesting_map;  /* Used for flags of nesting constructs */
+typedef ulong nesting_map;  /* Used for flags of nesting constructs */
 
 #if defined(__WIN__)
 #define socket_errno	WSAGetLastError()

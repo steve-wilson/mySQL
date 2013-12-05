@@ -136,6 +136,7 @@ enum enum_mysql_show_type
   SHOW_LONGLONG,   ///< shown as _unsigned_ longlong
   SHOW_CHAR, SHOW_CHAR_PTR,
   SHOW_ARRAY, SHOW_FUNC, SHOW_DOUBLE,
+  SHOW_TIMER,      ///< stored as uint64 native units, shown as double seconds
   SHOW_always_last
 };
 
@@ -342,6 +343,11 @@ DECLARE_MYSQL_SYSVAR_SIMPLE(name, unsigned long long) = { \
   PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED | ((opt) & PLUGIN_VAR_MASK), \
   #name, comment, check, update, &varname, def, min, max, blk }
 
+#define MYSQL_SYSVAR_DOUBLE(name, varname, opt, comment, check, update, def, min, max, blk) \
+DECLARE_MYSQL_SYSVAR_SIMPLE(name, double) = { \
+  PLUGIN_VAR_DOUBLE | ((opt) & PLUGIN_VAR_MASK), \
+  #name, comment, check, update, &varname, def, min, max, blk }
+
 #define MYSQL_SYSVAR_ENUM(name, varname, opt, comment, check, update, def, typelib) \
 DECLARE_MYSQL_SYSVAR_TYPELIB(name, unsigned long) = { \
   PLUGIN_VAR_ENUM | ((opt) & PLUGIN_VAR_MASK), \
@@ -351,11 +357,6 @@ DECLARE_MYSQL_SYSVAR_TYPELIB(name, unsigned long) = { \
 DECLARE_MYSQL_SYSVAR_TYPELIB(name, unsigned long long) = { \
   PLUGIN_VAR_SET | ((opt) & PLUGIN_VAR_MASK), \
   #name, comment, check, update, &varname, def, typelib }
-
-#define MYSQL_SYSVAR_DOUBLE(name, varname, opt, comment, check, update, def, min, max, blk) \
-DECLARE_MYSQL_SYSVAR_SIMPLE(name, double) = { \
-  PLUGIN_VAR_DOUBLE | ((opt) & PLUGIN_VAR_MASK), \
-  #name, comment, check, update, &varname, def, min, max, blk }
 
 #define MYSQL_THDVAR_BOOL(name, opt, comment, check, update, def) \
 DECLARE_MYSQL_THDVAR_BASIC(name, char) = { \
@@ -406,11 +407,6 @@ DECLARE_MYSQL_THDVAR_TYPELIB(name, unsigned long) = { \
 DECLARE_MYSQL_THDVAR_TYPELIB(name, unsigned long long) = { \
   PLUGIN_VAR_SET | PLUGIN_VAR_THDLOCAL | ((opt) & PLUGIN_VAR_MASK), \
   #name, comment, check, update, -1, def, NULL, typelib }
-
-#define MYSQL_THDVAR_DOUBLE(name, opt, comment, check, update, def, min, max, blk) \
-DECLARE_MYSQL_THDVAR_SIMPLE(name, double) = { \
-  PLUGIN_VAR_DOUBLE | PLUGIN_VAR_THDLOCAL | ((opt) & PLUGIN_VAR_MASK), \
-  #name, comment, check, update, -1, def, min, max, blk, NULL }
 
 /* accessor macros */
 
@@ -549,6 +545,7 @@ struct st_mysql_value
 extern "C" {
 #endif
 
+void thd_reset_diagnostics(MYSQL_THD thd);
 int thd_in_lock_tables(const MYSQL_THD thd);
 int thd_tablespace_op(const MYSQL_THD thd);
 long long thd_test_options(const MYSQL_THD thd, long long test_options);
@@ -605,10 +602,12 @@ int thd_killed(const MYSQL_THD thd);
   @param thd Use thread connection handle
   @param file_var Pointer to variable that will hold the file name.
   @param pos_var Pointer to variable that will hold the file position.
+  @param gtid_var Pointer to variable that will hold the GTID.
  */
 void thd_binlog_pos(const MYSQL_THD thd,
                     const char **file_var,
-                    unsigned long long *pos_var);
+                    unsigned long long *pos_var,
+                    const char **gtid_var);
 
 /**
   Return the thread id of a user thread
@@ -668,6 +667,39 @@ void *thd_get_ha_data(const MYSQL_THD thd, const struct handlerton *hton);
 */
 void thd_set_ha_data(MYSQL_THD thd, const struct handlerton *hton,
                      const void *ha_data);
+
+/**
+  Determine if the bin log is open.
+*/
+char mysql_bin_log_is_open(void);
+
+/**
+  Block MYSQL_BIN_LOG::ordered_commit
+
+  @details
+  Acquires the necessary mysql_bin_log locks in order to block commits so that
+  START TRANSACTION WITH CONSISTENT INNODB SNAPSHOT can return the correct
+  bin log filename and pos.
+*/
+void mysql_bin_log_lock_commits(void);
+
+/**
+  Unblock MYSQL_BIN_LOG::ordered_commit
+
+  @details
+  Releases the mysql_bin_log locks which blocked commits so that
+  START TRANSACTION WITH CONSISTENT INNODB SNAPSHOT can return the correct
+  bin log filename and pos.
+  @param  binlog_file         the filename of the binlog
+  @param  binlog_pos          the pos in the binlog
+  @param gtid_executed        logged gtids in the binlog
+  @param gtid_executed_length the length of gtid_executed string
+*/
+void mysql_bin_log_unlock_commits(char* binlog_file,
+                                  unsigned long long* binlog_pos,
+                                  char** gtid_executed,
+                                  int* gtid_executed_length);
+
 #ifdef __cplusplus
 }
 #endif
