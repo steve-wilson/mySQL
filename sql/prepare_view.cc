@@ -7,51 +7,8 @@
 
 using namespace std;
 
-static const string sub_table_delimiter = "___";
-
-// find highest table number based on current name
-// e.g. if ___table___5 is the newest table, return 5
-static int getHighestTID(THD* thd, string table_name, string db){
-    Ed_connection c(thd);
-    int max_i = 0;
-    string sub_table_name = sub_table_delimiter + table_name + sub_table_delimiter;
-    List<Ed_row> results = executeQuery(c, "SHOW TABLES FROM "+db+" LIKE \"" + sub_table_name + "%\";");
-    List_iterator<Ed_row> it(results);
-    Ed_row* row;
-    if (!results.is_empty()){
-        while((row=it++)){
-            string tbl = row->get_column(0)->str;
-            unsigned int start_pos = sub_table_name.length();
-            unsigned int end_pos = tbl.length();
-            // atoi returns 0 if cannot convert
-            int i = atoi(tbl.substr(start_pos,end_pos).c_str());
-            max_i = (max_i>i) ? max_i:i;
-        }
-    }
-    return max_i;
-}
-
-// generates a delimiter-enclosed string followed by i
-static string getSubTableName(string table_name,int i){
-        stringstream ss;
-        ss << sub_table_delimiter << table_name 
-           << sub_table_delimiter << i;
-        return ss.str();
-}
-
-// do a name swap between the most recent table and the view
-void swapTableWithView(THD* thd, string db, string table_name){
-        int i = getHighestTID(thd, table_name, db);
-        string view_name = getSubTableName(table_name, i);
-        Ed_connection c(thd);
-        string tmp_name = "TEMP_SWAP_TABLE";
-        executeQuery(c, "RENAME TABLE " + db + "." + table_name + " TO " + db + "." + tmp_name);
-        executeQuery(c, "RENAME TABLE " + db + "." + view_name + " TO " + db + "."  + table_name);
-        executeQuery(c, "RENAME TABLE " + db + "." + tmp_name + " TO " + db + "." + view_name);
-}
-
 // TODO: add commands/pseudo-triggers to clean up all of the sub tables used to make views work
-void prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr) {
+void AdaptSchema::prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr) {
     TABLE_LIST* table_list = *table_list_ptr;
 
     string table_name = table_list->table_name;

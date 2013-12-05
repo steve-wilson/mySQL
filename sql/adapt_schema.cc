@@ -50,8 +50,7 @@ string resultToSchema(string db, string table, List<Ed_row> list) {
   return ss.str();
 }
 
-string schema_from_row(string& db, string& table, vector<string>& header, vector<string>& row) {
-  typeManager tm;
+string AdaptSchema::schema_from_row(string& db, string& table, vector<string>& header, vector<string>& row) {
   vector<typeAndMD> types;
   for(unsigned int i=0; i<row.size(); i++) {
     types.push_back(tm.inferType((char*)row[i].c_str(), row[i].size()));
@@ -70,7 +69,15 @@ string schema_from_row(string& db, string& table, vector<string>& header, vector
   return ss.str();
 }
 
-bool update_schema_to_accomodate_data(READER& reader, THD* thd, sql_exchange *ex, TABLE_LIST **table_list_ptr, List<Item>& fields_vars, vector<string>& header, schema_update_method method, string& newSchema){
+AdaptSchema::AdaptSchema(READER* reader_in, THD* thd_in, sql_exchange* ex_in, List<Item>* fields_vars_in, vector<string>* header_in, schema_update_method method_in, bool relaxed_schema_inference_in, unsigned int infer_sample_size_in)
+ : tm(relaxed_schema_inference_in? typeManager::RELAXED_POW2 : typeManager::STRICT), reader(reader_in),
+ thd(thd_in), ex(ex_in), field_list(fields_vars_in), header(header_in), method(method_in),
+ relaxed_schema_inference(relaxed_schema_inference_in), sample_size(infer_sample_size_in)
+{
+  
+}
+
+bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST **table_list_ptr, string& newSchema) {
     /*
         In this function we can make whatever calls are necessary
         in order to update the schema to accomodate the incoming data
@@ -79,6 +86,8 @@ bool update_schema_to_accomodate_data(READER& reader, THD* thd, sql_exchange *ex
 
         Update: ex->file_name is the name of the csv file
     */
+
+    bool is_partial_read = sample_size>0;
 
     Ed_connection c(thd);
     TABLE_LIST * table_list = *table_list_ptr;
@@ -90,20 +99,19 @@ bool update_schema_to_accomodate_data(READER& reader, THD* thd, sql_exchange *ex
     List<Ed_row> it = executeQuery(c, "describe " + db  + "." + table_name); 
     string oldSchema = resultToSchema(table_list->db, table_list->table_name, it);
 
-
-
     // If we cannot read the file, return an error
-    if(reader.error)
+    if(reader->error)
       return 1;
 
-    LoadCSV csv(table_list->db, table_list->table_name, &reader);
+    LoadCSV csv(table_list->db, table_list->table_name, reader, tm);
 
-    if(header.empty())
-      header = csv.getHeader();
+    if(header->empty())
+      (*header) = csv.getHeader();
 
-    reader.set_checkpoint();
+    if(is_partial_read)
+      reader->set_checkpoint();
     if(newSchema.length()==0) {
-      newSchema = csv.calculateSchema(relaxed_schema_inference, infer_sample_size);
+      newSchema = csv.calculateSchema(relaxed_schema_inference, sample_size);
 
       // Printf generated schema to outfile
       std::ofstream outfile;
@@ -112,7 +120,9 @@ bool update_schema_to_accomodate_data(READER& reader, THD* thd, sql_exchange *ex
       outfile << newSchema << std::endl;
       outfile.close();
     }
-    reader.reset_line();
+ 
+    if(is_partial_read) 
+      reader->reset_line();
 
     cout << "existing schema: " << oldSchema << "\n";
     cout << "schema derived from file: " << newSchema << "\n";
@@ -142,17 +152,17 @@ bool update_schema_to_accomodate_data(READER& reader, THD* thd, sql_exchange *ex
       }
     }
 
-    if(fields_vars.elements==0) {
-      for(unsigned int i=0; i<header.size(); i++) {
-        Item_field* f = new (thd->mem_root) Item_field(&thd->lex->select_lex.context, NullS, NullS, header[i].c_str());
-        fields_vars.push_back(f);
+    if(field_list->elements==0) {
+      for(unsigned int i=0; i<header->size(); i++) {
+        Item_field* f = new (thd->mem_root) Item_field(&thd->lex->select_lex.context, NullS, NullS, header->at(i).c_str());
+        field_list->push_back(f);
       }
     }
 
   return 0;
 }
 
-bool finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_method method){
+bool AdaptSchema::finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_method method){
     if (method==SCHEMA_UPDATE_VIEW){
         string table_name = table_list->table_name;
         string db = table_list->db;

@@ -15,12 +15,9 @@ string sanitize_fieldname(string& fn) {
   return fn;
 }
 
-LoadCSV::LoadCSV(string dbs, string tables, READER * r)
-{
-  db = dbs;
-  table = tables;
-  reader = r;
-}
+LoadCSV::LoadCSV(string dbs, string tables, READER * r, typeManager& type_manager)
+ : db(dbs), table(tables), tm(type_manager), reader(r)
+{}
 
 vector<string> LoadCSV::getHeader() {
   if(header.empty()) {
@@ -48,7 +45,7 @@ vector<column> LoadCSV::match(string schema1, string schema2) {
 
 string LoadCSV::calculateSchema(bool relaxed, unsigned int sample_size) {
   vector<string> header = getHeader();
-  vector<typeAndMD> data = calculateColumnTypes(rows);
+  vector<typeAndMD> data = calculateColumnTypes(sample_size);
 
   std::stringstream ss;
   ss << db << "." << table << "(";
@@ -64,6 +61,8 @@ string LoadCSV::calculateSchema(bool relaxed, unsigned int sample_size) {
 }
 
 vector<typeAndMD> LoadCSV::calculateColumnTypes(int rows) {
+  bool is_partial = rows>0;
+
   vector<typeAndMD> typeForRow;
   int numColumns = header.size();
 			
@@ -87,7 +86,7 @@ vector<typeAndMD> LoadCSV::calculateColumnTypes(int rows) {
     }
 
     count++;
-  } while(!reader->next_line() && rows > count);
+  } while(is_partial? (!reader->next_line() && rows > count) : (!reader->next_line_set()));
 
   long duration = time(0) - start;
   cout << "loaded " << count << " rows in " << duration << " seconds\n";

@@ -15,6 +15,8 @@
 #include <map>
 #include <mysql.h>
 #include <hash.h>
+#include "rpl_slave.h"
+#include "rpl_mi.h"
 
 using std::min;
 using std::max;
@@ -38,7 +40,7 @@ public:
     value.append(v);
   }
 };
- 
+
 class READER {
   File        file;
   uchar        *buffer,                        /* Buffer for read text */
@@ -99,6 +101,7 @@ public:
     need_end_io_cache = 0;
   }
 
+  void init_io(bool read_from_client, bool is_fifo);
   /*
     Either this method, or we need to make cache public
     Arg must be set from mysql_load() since constructor does not see

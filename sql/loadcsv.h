@@ -20,7 +20,7 @@ class LoadCSV {
 
   public:
 
-  LoadCSV(string db, string table, READER * reader);
+  LoadCSV(string db, string table, READER * reader, typeManager& type_manager);
 
   vector<string> getHeader();
 

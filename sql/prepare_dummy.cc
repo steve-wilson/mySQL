@@ -283,7 +283,7 @@ string getType(string typeString)
 	return typeString.substr(0, typeString.find(" ")); 
 }
 
-void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr) 
+void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr) 
 {
     Ed_connection c(thd);
     string sqlStatement = "";

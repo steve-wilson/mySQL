@@ -510,8 +510,8 @@ int findOutputM(typeAndMD existingTypeMD, typeAndMD insertTypeMD, string outputT
 	return max(findNewMForTypeMD(existingTypeMD, outputType, outputUnsignedVal), findNewMForTypeMD(insertTypeMD, outputType, outputUnsignedVal));
 }
 
-typeManager::typeManager() 
-  : lcsO()
+    typeManager::typeManager(FitPolicy policy_in) 
+  : lcsO(), policy(policy_in)
 {
     initializeStringsAndEnumsMaps();
 
@@ -553,7 +553,7 @@ inline ParsedType typeManager::match(const char* d, unsigned int length, int & d
   }
 }
 
-typeAndMD typeManager::inferType(char* value, unsigned int length) {
+typeAndMD typeManager::inferType_int(char* value, unsigned int length) {
   if(length==0)
     return (typeAndMD){(TypeWrapper::Type) -1, "NULL",-1,-1,false};
 
@@ -611,6 +611,18 @@ typeAndMD typeManager::inferType(char* value, unsigned int length) {
   }
 
   return (typeAndMD){(TypeWrapper::Type)-1, NULL, -1, -1, false};    
+}
+
+#define round_pow2(v) (v)--;(v) |= (v) >> 1;(v) |= (v) >> 2;(v) |= (v) >> 4; (v) |= (v) >> 8;(v) |= (v) >> 16;(v)++;
+typeAndMD typeManager::inferType(char* value, unsigned int length) {
+  typeAndMD t = inferType_int(value, length);
+
+  if(policy == RELAXED_POW2) {
+    round_pow2(t.m);
+    round_pow2(t.d);
+  }
+
+  return t;
 }
 
 bool changedFromExisting(typeAndMD existingTypeMD, typeAndMD resultTypeMD)

@@ -192,6 +192,15 @@ READER::READER(File file_par, uint tot_length, const CHARSET_INFO *cs,
   }
 }
 
+void READER::init_io(bool get_it_from_net, bool is_fifo){
+  init_io_cache(&cache,(get_it_from_net) ? -1 : file, 0,
+		      (get_it_from_net) ? READ_NET :
+		      (is_fifo ? READ_FIFO : READ_CACHE),0L,1,
+		      MYF(MY_WME));
+  need_end_io_cache = 1;
+  eof = false;
+}
+
 READER::~READER()
 {
   map<int,BufStruct>::iterator it;

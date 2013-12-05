@@ -60,7 +60,7 @@ string makeAlterStatement(string tableName, const vector<column> &matches)
     return alterStatement;
 }
                                                                                       
-void prepareNaive(THD* thd, string oldSchema, string newSchema, vector<column> matches) {
+void AdaptSchema::prepareNaive(THD* thd, string oldSchema, string newSchema, vector<column> matches) {
     Ed_connection c(thd);
 	string sqlStatement = "";
 	

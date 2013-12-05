@@ -23,7 +23,6 @@
 #include "sql_priv.h"
 #include "unireg.h"
 #include "sql_load.h"
-#include "sql_load.h"
 #include "sql_cache.h"                          // query_cache_*
 #include "sql_base.h"          // fill_record_n_invoke_before_triggers
 #include <my_dir.h>
@@ -61,7 +60,7 @@ static int read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                           List<Item> &fields_vars, List<Item> &set_fields,
                           List<Item> &set_values, READER &read_info,
 			  const String &enclosed, ulong skip_lines,
-			  bool ignore_check_option_errors, bool& checkSchema, vector<string>& lastRow, bool halt_on_warning, uint ignore_warning_before);
+			  bool ignore_check_option_errors, bool& checkSchema, vector<string>& lastRow, bool halt_on_warning, uint ignore_warning_before, uint& rownum);
 
 static int read_xml_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                           List<Item> &fields_vars, List<Item> &set_fields,
@@ -79,7 +78,93 @@ static bool write_execute_load_query_log_event(THD *thd, sql_exchange* ex,
                                                bool transactional_table,
                                                int errocode);
 #endif /* EMBEDDED_LIBRARY */
-/*
+
+
+int open_file(THD* thd, char* name, char* tdb, sql_exchange* ex, bool& read_file_from_client, int& file, bool& is_fifo) {
+#ifndef EMBEDDED_LIBRARY
+    if (read_file_from_client)
+    {
+      (void)net_request_file(&thd->net,ex->file_name);
+      file = -1;
+    }
+  else
+#endif
+  {
+#ifdef DONT_ALLOW_FULL_LOAD_DATA_PATHS
+    ex->file_name+=dirname_length(ex->file_name);
+#endif
+    if (!dirname_length(ex->file_name))
+    {
+      strxnmov(name, FN_REFLEN-1, mysql_real_data_home, tdb, NullS);
+      (void) fn_format(name, ex->file_name, name, "",
+		       MY_RELATIVE_PATH | MY_UNPACK_FILENAME);
+    }
+    else
+    {
+      (void) fn_format(name, ex->file_name, mysql_real_data_home, "",
+                       MY_RELATIVE_PATH | MY_UNPACK_FILENAME |
+                       MY_RETURN_REAL_PATH);
+    }
+
+    if (thd->slave_thread)
+    {
+#if defined(HAVE_REPLICATION) && !defined(MYSQL_CLIENT)
+      DBUG_ASSERT(active_mi != NULL);
+      if (strncmp(active_mi->rli->slave_patternload_file, name,
+                  active_mi->rli->slave_patternload_file_size))
+      {
+        /*
+          LOAD DATA INFILE in the slave SQL Thread can only read from 
+          --slave-load-tmpdir". This should never happen. Please, report a bug.
+        */
+
+        sql_print_error("LOAD DATA INFILE in the slave SQL Thread can only read from --slave-load-tmpdir. " \
+                        "Please, report a bug.");
+        my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--slave-load-tmpdir");
+        return 1;
+      }
+#else
+      /*
+        This is impossible and should never happen.
+      */
+      DBUG_ASSERT(FALSE); 
+#endif
+    }
+    else if (!is_secure_file_path(name))
+    {
+      /* Read only allowed from within dir specified by secure_file_priv */
+      my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--secure-file-priv");
+      return 1;
+    }
+
+#if !defined(__WIN__) && ! defined(__NETWARE__)
+    MY_STAT stat_info;
+    if (!my_stat(name, &stat_info, MYF(MY_WME)))
+      return 1;
+
+    // if we are not in slave thread, the file must be:
+    if (!thd->slave_thread &&
+        !((stat_info.st_mode & S_IFLNK) != S_IFLNK &&   // symlink
+          ((stat_info.st_mode & S_IFREG) == S_IFREG ||  // regular file
+           (stat_info.st_mode & S_IFIFO) == S_IFIFO)))  // named pipe
+    {
+      my_error(ER_TEXTFILE_NOT_READABLE, MYF(0), name);
+      return 1;
+    }
+    if ((stat_info.st_mode & S_IFIFO) == S_IFIFO)
+      is_fifo= 1;
+#endif
+
+    if ((file= mysql_file_open(key_file_load,
+                               name, O_RDONLY, MYF(MY_WME))) < 0){
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+  /*
   Execute LOAD DATA query
 
   SYNOPSYS
@@ -135,7 +220,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
   bool checkSchema = false;
   vector<string> lastRow;
 
-  bool is_partial_read = true;
+  bool is_partial_read = infer_sample_size>0 && merge_method != SCHEMA_UPDATE_NONE;
   string newSchema = "";
 
   string db_s = string(db);
@@ -176,85 +261,8 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
                  ER(WARN_NON_ASCII_SEPARATOR_NOT_IMPLEMENTED));
   } 
 
-#ifndef EMBEDDED_LIBRARY
-    if (read_file_from_client)
-    {
-      (void)net_request_file(&thd->net,ex->file_name);
-      file = -1;
-    }
-  else
-#endif
-  {
-#ifdef DONT_ALLOW_FULL_LOAD_DATA_PATHS
-    ex->file_name+=dirname_length(ex->file_name);
-#endif
-    if (!dirname_length(ex->file_name))
-    {
-      strxnmov(name, FN_REFLEN-1, mysql_real_data_home, tdb, NullS);
-      (void) fn_format(name, ex->file_name, name, "",
-		       MY_RELATIVE_PATH | MY_UNPACK_FILENAME);
-    }
-    else
-    {
-      (void) fn_format(name, ex->file_name, mysql_real_data_home, "",
-                       MY_RELATIVE_PATH | MY_UNPACK_FILENAME |
-                       MY_RETURN_REAL_PATH);
-    }
-
-    if (thd->slave_thread)
-    {
-#if defined(HAVE_REPLICATION) && !defined(MYSQL_CLIENT)
-      DBUG_ASSERT(active_mi != NULL);
-      if (strncmp(active_mi->rli->slave_patternload_file, name,
-                  active_mi->rli->slave_patternload_file_size))
-      {
-        /*
-          LOAD DATA INFILE in the slave SQL Thread can only read from 
-          --slave-load-tmpdir". This should never happen. Please, report a bug.
-        */
-
-        sql_print_error("LOAD DATA INFILE in the slave SQL Thread can only read from --slave-load-tmpdir. " \
-                        "Please, report a bug.");
-        my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--slave-load-tmpdir");
-        DBUG_RETURN(TRUE);
-      }
-#else
-      /*
-        This is impossible and should never happen.
-      */
-      DBUG_ASSERT(FALSE); 
-#endif
-    }
-    else if (!is_secure_file_path(name))
-    {
-      /* Read only allowed from within dir specified by secure_file_priv */
-      my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--secure-file-priv");
-      DBUG_RETURN(TRUE);
-    }
-
-#if !defined(__WIN__) && ! defined(__NETWARE__)
-    MY_STAT stat_info;
-    if (!my_stat(name, &stat_info, MYF(MY_WME)))
-      DBUG_RETURN(TRUE);
-
-    // if we are not in slave thread, the file must be:
-    if (!thd->slave_thread &&
-        !((stat_info.st_mode & S_IFLNK) != S_IFLNK &&   // symlink
-          ((stat_info.st_mode & S_IFREG) == S_IFREG ||  // regular file
-           (stat_info.st_mode & S_IFIFO) == S_IFIFO)))  // named pipe
-    {
-      my_error(ER_TEXTFILE_NOT_READABLE, MYF(0), name);
-      DBUG_RETURN(TRUE);
-    }
-    if ((stat_info.st_mode & S_IFIFO) == S_IFIFO)
-      is_fifo= 1;
-#endif
-
-    if ((file= mysql_file_open(key_file_load,
-                               name, O_RDONLY, MYF(MY_WME))) < 0){
-      DBUG_RETURN(TRUE);
-    }
-  }
+  // Open the file (locally or remotely)
+  open_file(thd, name, tdb, ex, read_file_from_client, file, is_fifo);
 
   uint tot_length=0;
   bool use_blobs= 0, use_vars= 0;
@@ -281,13 +289,37 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
   }
 #endif 
   /*!EMBEDDED_LIBRARY*/
+
+  AdaptSchema as(&read_info, thd, ex, &fields_vars, &header, merge_method, 
+              relaxed_schema_inference, infer_sample_size);
   // make changes to schema if desired and required
   if (merge_method !=  SCHEMA_UPDATE_NONE) {
-    if (update_schema_to_accomodate_data(read_info, thd, ex, &table_list, 
-              fields_vars, header, merge_method, newSchema))
+    if (as.update_schema_to_accomodate_data(&table_list, newSchema))
           DBUG_RETURN(TRUE);
+
+    if(!is_partial_read) {
+      read_info.end_io_cache();
+      open_file(thd, name, tdb, ex, read_file_from_client, file, is_fifo);
+      read_info.init_io(read_file_from_client, is_fifo);
+      skip_lines++;
+    }
   }
 
+  /*
+    * LOAD DATA INFILE fff INTO TABLE xxx SET columns2
+    sets all columns, except if file's row lacks some: in that case,
+    defaults are set by read_fixed_length() and read_sep_field(),
+    not by COPY_INFO.
+    * LOAD DATA INFILE fff INTO TABLE xxx (columns1) SET columns2=
+    may need a default for columns other than columns1 and columns2.
+  */
+  const bool manage_defaults= fields_vars.elements != 0;
+  COPY_INFO info(COPY_INFO::INSERT_OPERATION,
+                 &fields_vars, &set_fields,
+                 manage_defaults,
+                 handle_duplicates, ignore, escape_char);
+
+  uint rownum = 0;
 continue_inserting:
   if (open_and_lock_tables(thd, table_list, TRUE, 0))
     DBUG_RETURN(TRUE);
@@ -396,32 +428,12 @@ continue_inserting:
   if (read_file_from_client && handle_duplicates == DUP_ERROR)
     ignore= 1;
 
-  /*
-    * LOAD DATA INFILE fff INTO TABLE xxx SET columns2
-    sets all columns, except if file's row lacks some: in that case,
-    defaults are set by read_fixed_length() and read_sep_field(),
-    not by COPY_INFO.
-    * LOAD DATA INFILE fff INTO TABLE xxx (columns1) SET columns2=
-    may need a default for columns other than columns1 and columns2.
-  */
-  const bool manage_defaults= fields_vars.elements != 0;
-  COPY_INFO info(COPY_INFO::INSERT_OPERATION,
-                 &fields_vars, &set_fields,
-                 manage_defaults,
-                 handle_duplicates, ignore, escape_char);
 
   if (info.add_function_default_columns(table, table->write_set))
     DBUG_RETURN(TRUE);
 
   prepare_triggers_for_insert_stmt(table);
 
-/*
-      std::ofstream outfile;
-      outfile.open("/tmp/update_schema_artifact");
-      outfile << "test123" << "\n";
-      outfile << file << "\n";
-      outfile.close();
-*/
   thd->count_cuted_fields= CHECK_FIELD_WARN;		/* calc cuted fields */
   thd->cuted_fields=0L;
   /* Skip lines if there is a line terminator */
@@ -467,7 +479,7 @@ continue_inserting:
         error= read_sep_field(thd, info, table_list, fields_vars,
                              set_fields, set_values, read_info,
 	  		    *enclosed, skip_lines, ignore, checkSchema, 
-                lastRow, is_partial_read, 1);
+                lastRow, is_partial_read, 1, rownum);
 
       // If there was warning on the last row, check to see if we can update the schema
       if(checkSchema && merge_method != SCHEMA_UPDATE_NONE) { 
@@ -504,11 +516,10 @@ continue_inserting:
           lastRow.push_back((const char*)read_info.row_start);
         }
         read_info.reset_line();
-        newSchema = schema_from_row(db_s, table_name_s, header, lastRow);  
+        newSchema = as.schema_from_row(db_s, table_name_s, header, lastRow);  
 
         fields_vars.delete_elements();
-        if (update_schema_to_accomodate_data(read_info, thd, ex, &table_list, 
-                fields_vars, header, merge_method, newSchema))
+        if (as.update_schema_to_accomodate_data(&table_list, newSchema))
           DBUG_RETURN(TRUE);
 
         table_list->reinit_before_use(thd);
@@ -954,7 +965,7 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
                List<Item> &set_values, READER &read_info,
 	       const String &enclosed, ulong skip_lines,
 	       bool ignore_check_option_errors, bool& checkSchema,
-           vector<string>& lastRow, bool halt_on_warning, uint ignore_warning_before)
+           vector<string>& lastRow, bool halt_on_warning, uint ignore_warning_before, uint& rownum)
 {
   List_iterator_fast<Item> it(fields_vars);
   Item *item;
@@ -962,7 +973,6 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
   uint enclosed_length;
   bool err;
   DBUG_ENTER("read_sep_field");
-  uint rownum = 0;
 
   uint warning_count = thd->get_stmt_da()->current_statement_warn_count();
   uint wc = warning_count;
