@@ -178,7 +178,8 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
 	        List<Item> &fields_vars, List<Item> &set_fields,
                 List<Item> &set_values,
                 enum enum_duplicates handle_duplicates, bool ignore,
-                bool read_file_from_client, schema_update_method  merge_method)
+                bool read_file_from_client, schema_update_method  merge_method,
+                bool relaxed_schema_inference, unsigned int infer_sample_size)
 {
   vector<string> header;
   // reaches this line, (verified via gdb) but cerr doesn't go to terminal
@@ -204,7 +205,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
   */
   char *tdb= thd->db ? thd->db : db;		// Result is never null
   ulong skip_lines= ex->skip_lines;
-  bool transactional_table;
+  bool DBUG_ONLY transactional_table;
   DBUG_ENTER("mysql_load");
 
   const int escape_char= (escaped->length() && (ex->escaped_given() ||
@@ -295,7 +296,8 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
     if (update_schema_to_accomodate_data(file, 0,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
-		      escape_char, read_file_from_client, is_fifo, thd, ex, &table_list, fields_vars, header, merge_method))
+		      escape_char, read_file_from_client, is_fifo, thd, ex, &table_list, 
+              fields_vars, header, merge_method, relaxed_schema_inference, infer_sample_size))
           DBUG_RETURN(TRUE);
     skip_lines++;
   }
@@ -530,24 +532,16 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
     if ((stat_info.st_mode & S_IFIFO) == S_IFIFO)
       is_fifo= 1;
 #endif
-
     if ((file= mysql_file_open(key_file_load,
-                               name, O_RDONLY, MYF(MY_WME))) < 0){
+                               name, O_RDONLY, MYF(MY_WME))) < 0)
+
       DBUG_RETURN(TRUE);
-    }
   }
-/*
-      std::ofstream outfile;
-      outfile.open("/tmp/update_schema_artifact");
-      outfile << "test123" << "\n";
-      outfile << file << "\n";
-      outfile.close();
-*/
+
   READ_INFO read_info(file,tot_length,
                       ex->cs ? ex->cs : thd->variables.collation_database,
 		      *field_term,*ex->line_start, *ex->line_term, *enclosed,
 		      info.escape_char, read_file_from_client, is_fifo);
-
   if (read_info.error)
   {
     if (file >= 0)
@@ -756,7 +750,6 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
 
   /* ok to client sent only after binlog write and engine commit */
   my_ok(thd, info.stats.copied + info.stats.deleted, 0L, name);
-
 err:
   DBUG_ASSERT(transactional_table ||
               !(info.stats.copied || info.stats.deleted) ||
@@ -764,11 +757,6 @@ err:
   table->file->ha_release_auto_increment();
   table->auto_increment_field_not_null= FALSE;
   thd->abort_on_warning= 0;
-
-//  if (merge_method != SCHEMA_UPDATE_NONE){
-//      finalize_schema_update(thd, table_list, merge_method);
-//  }
-
   DBUG_RETURN(error);
 }
 
@@ -792,8 +780,7 @@ static bool write_execute_load_query_log_event(THD *thd, sql_exchange* ex,
                       *p= NULL;
   size_t               pl= 0;
   List<Item>           fv;
-  Item                *item;
-  String              *str;
+  Item                *item, *val;
   String               pfield, pfields;
   int                  n;
   const char          *tbl= table_name_arg;
@@ -848,19 +835,19 @@ static bool write_execute_load_query_log_event(THD *thd, sql_exchange* ex,
   if (!thd->lex->update_list.is_empty())
   {
     List_iterator<Item> lu(thd->lex->update_list);
-    List_iterator<String> ls(thd->lex->load_set_str_list);
+    List_iterator<Item> lv(thd->lex->value_list);
 
     pfields.append(" SET ");
     n= 0;
 
     while ((item= lu++))
     {
-      str= ls++;
+      val= lv++;
       if (n++)
         pfields.append(", ");
       append_identifier(thd, &pfields, item->item_name.ptr(),
                         strlen(item->item_name.ptr()));
-      pfields.append((char *)str->ptr());
+      pfields.append(val->item_name.ptr());
     }
   }
 
@@ -930,16 +917,6 @@ read_fixed_length(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
 #endif
 
     restore_record(table, s->default_values);
-    /*
-      Check whether default values of the fields not specified in column list
-      are correct or not.
-    */
-    if (validate_default_values_of_unset_fields(thd, table))
-    {
-      read_info.error= 1;
-      break;
-    }
-
     /*
       There is no variables in fields_vars list in this format so
       this conversion is safe.
@@ -1060,15 +1037,6 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
     }
 
     restore_record(table, s->default_values);
-    /*
-      Check whether default values of the fields not specified in column list
-      are correct or not.
-    */
-    if (validate_default_values_of_unset_fields(thd, table))
-    {
-      read_info.error= 1;
-      break;
-    }
 
     while ((item= it++))
     {
@@ -1296,15 +1264,6 @@ read_xml_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
 #endif
     
     restore_record(table, s->default_values);
-    /*
-      Check whether default values of the fields not specified in column list
-      are correct or not.
-    */
-    if (validate_default_values_of_unset_fields(thd, table))
-    {
-      read_info.error= 1;
-      break;
-    }
     
     while ((item= it++))
     {

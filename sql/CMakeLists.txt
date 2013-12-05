@@ -40,6 +40,7 @@ SET(SQL_SHARED_SOURCES
   abstract_query_plan.cc
   datadict.cc
   debug_sync.cc
+  db_stats.cc
   derror.cc
   des_key_file.cc
   discover.cc
@@ -52,6 +53,7 @@ SET(SQL_SHARED_SOURCES
   gstream.cc
   handler.cc
   hostname.cc
+  hyperloglog.cc
   init.cc
   item.cc
   item_buff.cc
@@ -199,6 +201,7 @@ SET(SQL_SOURCE
   events.cc
   mysqld.cc
   sql_client.cc
+  table_stats.cc
   )
 
 IF (WIN32 AND OPENSSL_APPLINK_C)
@@ -247,7 +250,7 @@ SET (SLAVE_SOURCE rpl_slave.cc rpl_reporting.cc rpl_mi.cc rpl_rli.cc
 		  rpl_info_handler.cc rpl_info_file.cc rpl_info_table.cc
 		  rpl_info_values.cc rpl_info.cc rpl_info_factory.cc
 		  rpl_info_table_access.cc dynamic_ids.cc rpl_rli_pdb.cc
-		  rpl_info_dummy.cc)
+		  rpl_gtid_info.cc rpl_info_dummy.cc)
 ADD_LIBRARY(slave ${SLAVE_SOURCE})
 ADD_DEPENDENCIES(slave GenError)
 ADD_LIBRARY(sqlgunitlib

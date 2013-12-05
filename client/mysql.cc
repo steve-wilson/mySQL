@@ -97,7 +97,8 @@ extern "C" {
 #if defined(__WIN__)
 #include <conio.h>
 #else
-#include <readline.h>
+#include <readline/readline.h>
+#include <readline/history.h>
 #define HAVE_READLINE
 #define USE_POPEN
 #endif
@@ -117,6 +118,8 @@ extern "C" {
 
 #include "completion_hash.h"
 #include <welcome_copyright_notice.h> // ORACLE_WELCOME_COPYRIGHT_NOTICE
+
+#include "blind_fwrite.h"
 
 #define PROMPT_CHAR '\\'
 #define DEFAULT_DELIMITER ";"
@@ -1102,11 +1105,6 @@ typedef struct _hist_entry {
 } HIST_ENTRY; 
 #endif
 
-extern "C" int add_history(const char *command); /* From readline directory */
-extern "C" int read_history(const char *command);
-extern "C" int write_history(const char *command);
-extern "C" HIST_ENTRY *history_get(int num);
-extern "C" int history_length;
 static int not_in_history(const char *line);
 static void initialize_readline (char *name);
 static void fix_history(String *final_command);
@@ -3410,8 +3408,6 @@ com_go(String *buffer,char *line __attribute__((unused)))
   do
   {
     char *pos;
-    bool batchmode= (status.batch && verbose <= 1) ? TRUE : FALSE;
-    buff[0]= 0;
 
     if (quick)
     {
@@ -3464,10 +3460,9 @@ com_go(String *buffer,char *line __attribute__((unused)))
 	  print_tab_data(result);
 	else
 	  print_table_data(result);
-        if( !batchmode )
-	  sprintf(buff,"%lld %s in set",
-	          mysql_num_rows(result),
-		  mysql_num_rows(result) == 1LL ? "row" : "rows");
+	sprintf(buff,"%ld %s in set",
+		(long) mysql_num_rows(result),
+		(long) mysql_num_rows(result) == 1 ? "row" : "rows");
 	end_pager();
         if (mysql_errno(&mysql))
           error= put_error(&mysql);
@@ -3475,13 +3470,13 @@ com_go(String *buffer,char *line __attribute__((unused)))
     }
     else if (mysql_affected_rows(&mysql) == ~(ulonglong) 0)
       strmov(buff,"Query OK");
-    else if( !batchmode )
-      sprintf(buff,"Query OK, %lld %s affected",
-	      mysql_affected_rows(&mysql),
-	      mysql_affected_rows(&mysql) == 1LL ? "row" : "rows");
+    else
+      sprintf(buff,"Query OK, %ld %s affected",
+	      (long) mysql_affected_rows(&mysql),
+	      (long) mysql_affected_rows(&mysql) == 1 ? "row" : "rows");
 
     pos=strend(buff);
-    if ((warnings= mysql_warning_count(&mysql)) && !batchmode)
+    if ((warnings= mysql_warning_count(&mysql)))
     {
       *pos++= ',';
       *pos++= ' ';
@@ -5186,9 +5181,9 @@ void tee_write(FILE *file, const char *s, size_t slen, int flags)
           my_win_console_write(charset_info, s, mblen);
         else
 #endif
-        fwrite(s, 1, mblen, file);
+        blind_fwrite(s, 1, mblen, file);
         if (opt_outfile)
-          fwrite(s, 1, mblen, OUTFILE);
+          blind_fwrite(s, 1, mblen, OUTFILE);
         s+= mblen - 1;
         continue;
       }

@@ -91,9 +91,7 @@ enum enum_slave_exec_mode { SLAVE_EXEC_MODE_STRICT,
                             SLAVE_EXEC_MODE_IDEMPOTENT,
                             SLAVE_EXEC_MODE_LAST_BIT };
 enum enum_slave_type_conversions { SLAVE_TYPE_CONVERSIONS_ALL_LOSSY,
-                                   SLAVE_TYPE_CONVERSIONS_ALL_NON_LOSSY,
-                                   SLAVE_TYPE_CONVERSIONS_ALL_UNSIGNED,
-                                   SLAVE_TYPE_CONVERSIONS_ALL_SIGNED};
+                                   SLAVE_TYPE_CONVERSIONS_ALL_NON_LOSSY};
 enum enum_slave_rows_search_algorithms { SLAVE_ROWS_TABLE_SCAN = (1U << 0),
                                          SLAVE_ROWS_INDEX_SCAN = (1U << 1),
                                          SLAVE_ROWS_HASH_SCAN  = (1U << 2)};
@@ -402,7 +400,6 @@ extern const LEX_STRING Diag_condition_item_names[];
 
 #include "sql_lex.h"				/* Must be here */
 
-extern LEX_CSTRING sql_statement_names[(uint) SQLCOM_END + 1];
 class Delayed_insert;
 class select_result;
 class Time_zone;
@@ -433,6 +430,7 @@ typedef struct system_variables
   
   ulonglong max_heap_table_size;
   ulonglong tmp_table_size;
+  ulonglong tmp_table_max_file_size;
   ulonglong long_query_time;
   my_bool end_markers_in_json;
   /* A bitmap for switching optimizations on/off */
@@ -449,6 +447,7 @@ typedef struct system_variables
   ulong auto_increment_increment, auto_increment_offset;
   ulong bulk_insert_buff_size;
   uint  eq_range_index_dive_limit;
+  uint  part_scan_max;
   ulong join_buff_size;
   ulong lock_wait_timeout;
   ulong max_allowed_packet;
@@ -463,17 +462,18 @@ typedef struct system_variables
   ulong myisam_sort_buff_size;
   ulong myisam_stats_method;
   ulong net_buffer_length;
-  ulong net_interactive_timeout;
-  ulong net_read_timeout;
+  ulong net_interactive_timeout_seconds;
+  ulong net_read_timeout_seconds;
   ulong net_retry_count;
-  ulong net_wait_timeout;
-  ulong net_write_timeout;
+  ulong net_wait_timeout_seconds;
+  ulong net_write_timeout_seconds;
   ulong optimizer_prune_level;
   ulong optimizer_search_depth;
   ulong preload_buff_size;
   ulong profiling_history_size;
   ulong read_buff_size;
   ulong read_rnd_buff_size;
+  ulong slow_log_if_rows_examined_exceed;
   ulong div_precincrement;
   ulong sortbuff_size;
   ulong max_sp_recursion_depth;
@@ -485,6 +485,7 @@ typedef struct system_variables
   ulong trans_alloc_block_size;
   ulong trans_prealloc_size;
   ulong group_concat_max_len;
+  ulong working_duration;
 
   ulong binlog_format; ///< binlog format for this thd (see enum_binlog_format)
   my_bool binlog_direct_non_trans_update;
@@ -552,6 +553,9 @@ typedef struct system_variables
   Gtid_specification gtid_next;
   Gtid_set_or_null gtid_next_list;
 
+  ulong allow_noncurrent_db_rw;
+
+  my_bool expand_fast_index_creation;
 } SV;
 
 
@@ -611,9 +615,17 @@ typedef struct system_status_var
   ulonglong com_stmt_fetch;
   ulonglong com_stmt_reset;
   ulonglong com_stmt_close;
+  ulonglong read_requests;      /* Number of synchronous read requests */
+  ulonglong rows_examined;
+  ulonglong rows_sent;
 
   ulonglong bytes_received;
   ulonglong bytes_sent;
+
+  /* Performance counters */
+  ulonglong parse_time;         /* Time parsing client commands */
+  ulonglong read_time;          /* Time doing synchronous reads */
+
   /*
     Number of statements sent from the client
   */
@@ -1237,11 +1249,6 @@ void xid_cache_delete(XID_STATE *xid_state);
 */
 
 class Security_context {
-private:
-
-String host;
-String ip;
-String external_user;
 public:
   Security_context() {}                       /* Remove gcc warning */
   /*
@@ -1251,11 +1258,13 @@ public:
     priv_user - The user privilege we are using. May be "" for anonymous user.
     ip - client IP
   */
-  char   *user;
+  char   *host, *user, *ip;
   char   priv_user[USERNAME_LENGTH];
   char   proxy_user[USERNAME_LENGTH + MAX_HOSTNAME + 5];
   /* The host privilege we are using */
   char   priv_host[MAX_HOSTNAME];
+  /* The external user (if available) */
+  char   *external_user;
   /* points to host if host is available, otherwise points to ip */
   const char *host_or_ip;
   ulong master_access;                 /* Global privileges from mysql.user */
@@ -1271,13 +1280,7 @@ public:
   }
   
   bool set_user(char *user_arg);
-  String *get_host();
-  String *get_ip();
-  String *get_external_user();
-  void set_host(const char *p);
-  void set_ip(const char *p);
-  void set_external_user(const char *p);
-  void set_host(const char *str, size_t len);
+
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
   bool
   change_security_context(THD *thd,
@@ -1292,98 +1295,12 @@ public:
   bool user_matches(Security_context *);
 };
 
-
 /**
   @class Log_throttle
-  @brief Base class for rate-limiting a log (slow query log etc.)
+  @brief Used for rate-limiting a log (slow query log etc.)
 */
 
 class Log_throttle
-{
-  /**
-    When will/did current window end?
-  */
-  ulonglong window_end;
-
-  /**
-    Log no more than rate lines of a given type per window_size
-    (e.g. per minute, usually LOG_THROTTLE_WINDOW_SIZE).
-  */
-  const ulong window_size;
-
-  /**
-   There have been this many lines of this type in this window,
-   including those that we suppressed. (We don't simply stop
-   counting once we reach the threshold as we'll write a summary
-   of the suppressed lines later.)
-  */
-  ulong count;
-
-protected:
-  /**
-    Template for the summary line. Should contain %lu as the only
-    conversion specification.
-  */
-  const char *summary_template;
-
-  /**
-    Start a new window.
-  */
-  void new_window(ulonglong now);
-
-  /**
-    Increase count of logs we're handling.
-
-    @param rate  Limit on records to be logged during the throttling window.
-
-    @retval true -  log rate limit is exceeded, so record should be supressed.
-    @retval false - log rate limit is not exceeded, record should be logged.
-  */
-  bool inc_log_count(ulong rate) { return (++count > rate); }
-
-  /**
-    Check whether we're still in the current window. (If not, the caller
-    will want to print a summary (if the logging of any lines was suppressed),
-    and start a new window.)
-  */
-  bool in_window(ulonglong now) const { return (now < window_end); };
-
-  /**
-    Prepare a summary of suppressed lines for logging.
-    This function returns the number of queries that were qualified for
-    inclusion in the log, but were not printed because of the rate-limiting.
-    The summary will contain this count as well as the respective totals for
-    lock and execution time.
-    This function assumes that the caller already holds the necessary locks.
-
-    @param rate  Limit on records logged during the throttling window.
-  */
-  ulong prepare_summary(ulong rate);
-
-  /**
-    @param window_usecs  ... in this many micro-seconds
-    @param msg           use this template containing %lu as only non-literal
-  */
-  Log_throttle(ulong window_usecs, const char *msg)
-              : window_end(0), window_size(window_usecs),
-                count(0), summary_template(msg)
-  {}
-
-public:
-  /**
-    We're rate-limiting messages per minute; 60,000,000 microsecs = 60s
-    Debugging is less tedious with a window in the region of 5000000
-  */
-  static const ulong LOG_THROTTLE_WINDOW_SIZE= 60000000;
-};
-
-
-/**
-  @class Slow_log_throttle
-  @brief Used for rate-limiting the slow query log.
-*/
-
-class Slow_log_throttle : public Log_throttle
 {
 private:
   /**
@@ -1393,13 +1310,11 @@ private:
     after the time-window closes), as that would be misleading.
   */
   Security_context aggregate_sctx;
-
   /**
     Total of the execution times of queries in this time-window for which
     we suppressed logging. For use in summary printing.
   */
   ulonglong total_exec_time;
-
   /**
     Total of the lock times of queries in this time-window for which
     we suppressed logging. For use in summary printing.
@@ -1407,27 +1322,74 @@ private:
   ulonglong total_lock_time;
 
   /**
+    When will/did current window end?
+  */
+  ulonglong window_end;
+  /**
     A reference to the threshold ("no more than n log lines per ...").
     References a (system-?) variable in the server.
   */
   ulong *rate;
-
+  /**
+    Log no more than rate lines of a given type per window_size
+    (e.g. per minute, usually LOG_THROTTLE_WINDOW_SIZE).
+  */
+  const ulong window_size;
+  /**
+   There have been this many lines of this type in this window,
+   including those that we suppressed. (We don't simply stop
+   counting once we reach the threshold as we'll write a summary
+   of the suppressed lines later.)
+  */
+  ulong count;
+  /**
+    Template for the summary line. Should contain %lu as the only
+    conversion specification.
+  */
+  const char *summary_template;
+  /**
+    Log_throttle is shared between THDs.
+  */
+  mysql_mutex_t *LOCK_log_throttle;
   /**
     The routine we call to actually log a line (i.e. our summary).
     The signature miraculously coincides with slow_log_print().
   */
-  bool (*log_summary)(THD *, const char *, uint);
+  bool (*log_summary)(THD *, const char *, uint, struct system_status_var *);
 
   /**
-    Slow_log_throttle is shared between THDs.
+    Lock this object as it's shared between THDs.
   */
-  mysql_mutex_t *LOCK_log_throttle;
-
+  void lock_exclusive() { mysql_mutex_lock(LOCK_log_throttle); }
+  /**
+    Unlock this object.
+  */
+  void unlock() { mysql_mutex_unlock(LOCK_log_throttle); }
   /**
     Start a new window.
   */
   void new_window(ulonglong now);
-
+  /**
+    Increase count of queries of the type we're handling.
+    Returns the new value for the caller to compare against their limit.
+  */
+  ulong inc_queries() { return ++count; }
+  /**
+    Check whether we're still in the current window. (If not, the caller
+    will want to print a summary (if the logging of any lines was suppressed),
+    and start a new window.)
+  */
+  bool in_window(ulonglong now) const { return (now < window_end); };
+  /**
+    Prepare a summary of suppressed lines for logging.
+    (For now, to slow query log.)
+    This function returns the number of queries that were qualified for
+    inclusion in the log, but were not printed because of the rate-limiting.
+    The summary will contain this count as well as the respective totals for
+    lock and execution time.
+    This function assumes that the caller already holds the necessary locks.
+  */
+  ulong prepare_summary(THD *thd);
   /**
     Actually print the prepared summary to log.
   */
@@ -1436,6 +1398,11 @@ private:
                      ulonglong print_exec_time);
 
 public:
+  /**
+    We're rate-limiting messages per minute; 60,000,000 microsecs = 60s
+    Debugging is less tedious with a window in the region of 5000000
+  */
+  static const ulong LOG_THROTTLE_WINDOW_SIZE= 60000000;
 
   /**
     @param threshold     suppress after this many queries ...
@@ -1443,9 +1410,9 @@ public:
     @param logger        call this function to log a single line (our summary)
     @param msg           use this template containing %lu as only non-literal
   */
-  Slow_log_throttle(ulong *threshold, mysql_mutex_t *lock, ulong window_usecs,
-                    bool (*logger)(THD *, const char *, uint),
-                    const char *msg);
+  Log_throttle(ulong *threshold, mysql_mutex_t *lock, ulong window_usecs,
+               bool (*logger)(THD *, const char *, uint, struct system_status_var *),
+               const char *msg);
 
   /**
     Prepare and print a summary of suppressed lines to log.
@@ -1457,8 +1424,8 @@ public:
     locking/unlocking.
 
     @param thd                 The THD that tries to log the statement.
-    @retval false              Logging was not supressed, no summary needed.
-    @retval true               Logging was supressed; a summary was printed.
+    @retval 0                  Logging was not supressed, no summary needed.
+    @retval false              Logging was supressed; a summary was printed.
   */
   bool flush(THD *thd);
 
@@ -1472,63 +1439,7 @@ public:
   bool log(THD *thd, bool eligible);
 };
 
-
-/**
-  @class Slow_log_throttle
-  @brief Used for rate-limiting a error logs.
-*/
-
-class Error_log_throttle : public Log_throttle
-{
-private:
-  /**
-    The routine we call to actually log a line (i.e. our summary).
-  */
-  void (*log_summary)(const char *, ...);
-
-  /**
-    Actually print the prepared summary to log.
-  */
-  void print_summary(ulong suppressed)
-  {
-    (*log_summary)(summary_template, suppressed);
-  }
-
-public:
-  /**
-    @param window_usecs  ... in this many micro-seconds
-    @param logger        call this function to log a single line (our summary)
-    @param msg           use this template containing %lu as only non-literal
-  */
-  Error_log_throttle(ulong window_usecs,
-                     void (*logger)(const char*, ...),
-                     const char *msg)
-  : Log_throttle(window_usecs, msg), log_summary(logger)
-  {}
-
-  /**
-    Prepare and print a summary of suppressed lines to log.
-    (For now, slow query log.)
-    The summary states the number of queries that were qualified for
-    inclusion in the log, but were not printed because of the rate-limiting.
-
-    @param thd                 The THD that tries to log the statement.
-    @retval false              Logging was not supressed, no summary needed.
-    @retval true               Logging was supressed; a summary was printed.
-  */
-  bool flush(THD *thd);
-
-  /**
-    Top-level function.
-    @param thd                 The THD that tries to log the statement.
-    @retval true               Logging should be supressed.
-    @retval false              Logging should not be supressed.
-  */
-  bool log(THD *thd);
-};
-
-
-extern Slow_log_throttle log_throttle_qni;
+extern Log_throttle log_throttle_qni;
 
 
 /**
@@ -2230,21 +2141,41 @@ public:
   ulonglong  prior_thr_create_utime, thr_create_utime;
   ulonglong  start_utime, utime_after_lock;
 
+  my_io_perf_t io_perf_read;	/* IO perf counters for slow query log */
+  my_io_perf_t io_perf_write;	/* IO perf counters for slow query log */
+  my_io_perf_t io_perf_read_blob;/* IO perf counters for slow query log */
+  my_io_perf_t io_perf_read_primary;/* IO perf counters for slow query
+                                    log for primary index */
+  my_io_perf_t io_perf_read_secondary;/* IO perf counters for slow query
+                                      log for secondary index */
+
+  /* Counters for information_schema.USER_STATISTICS.
+     Set to 0 at statement start
+  */
+  ulonglong rows_deleted;
+  ulonglong rows_updated;
+  ulonglong rows_inserted;
+  ulonglong rows_read;
+  /* ulonglong rows_fetched; TODO(mcallaghan) */
+
+  ulonglong rows_index_first;
+  ulonglong rows_index_next;
+
+  /* Counter for information_schema.TABLE_STATISTICS.
+     To be assigned to the corresponding table after parsing query
+  */
+  ulonglong count_comment_bytes;
+
+  inline void reset_user_stats_counters() {
+    rows_deleted = rows_updated = rows_inserted = rows_read = 0;
+    rows_index_first = rows_index_next = 0;
+  }
+
   thr_lock_type update_lock_default;
   Delayed_insert *di;
 
   /* <> 0 if we are inside of trigger or stored function. */
   uint in_sub_stmt;
-
-  /** 
-    Used by fill_status() to avoid acquiring LOCK_status mutex twice
-    when this function is called recursively (e.g. queries 
-    that contains SELECT on I_S.GLOBAL_STATUS with subquery on the 
-    same I_S table).
-    Incremented each time fill_status() function is entered and 
-    decremented each time before it returns from the function.
-  */
-  uint fill_status_recursion_level;
 
   /* container for handler's private per-connection data */
   Ha_data ha_data[MAX_HA];
@@ -2410,6 +2341,8 @@ private:
   const char *m_trans_log_file;
   const char *m_trans_fixed_log_file;
   my_off_t m_trans_end_pos;
+  const char *m_trans_gtid;
+  char trans_gtid[Gtid::MAX_TEXT_LENGTH + 1];
   /**@}*/
 
 public:
@@ -2473,7 +2406,7 @@ public:
       bool xid_written;               // The session wrote an XID
       bool real_commit;               // Is this a "real" commit?
       bool commit_low;                // see MYSQL_BIN_LOG::ordered_commit
-      bool run_hooks;                 // Call the after_commit hook
+      bool run_hooks;                 // Call the before_commit hook
 #ifndef DBUG_OFF
       bool ready_preempt;             // internal in MYSQL_BIN_LOG::ordered_commit
 #endif
@@ -2908,7 +2841,8 @@ public:
      transaction written when committing this transaction.
    */
   /**@{*/
-  void set_trans_pos(const char *file, my_off_t pos)
+  void set_trans_pos(const char *file, my_off_t pos,
+                     const Cached_group *gtid_group)
   {
     DBUG_ENTER("THD::set_trans_pos");
     DBUG_ASSERT(((file == 0) && (pos == 0)) || ((file != 0) && (pos != 0)));
@@ -2930,19 +2864,34 @@ public:
     }
 
     m_trans_end_pos= pos;
+
+    if (gtid_group)
+    {
+      global_sid_lock->rdlock();
+      gtid_group->spec.to_string(global_sid_map, trans_gtid);
+      global_sid_lock->unlock();
+      m_trans_gtid = trans_gtid;
+    }
+    else
+      m_trans_gtid = NULL;
+
     DBUG_PRINT("return", ("m_trans_log_file: %s, m_trans_fixed_log_file: %s, "
-                          "m_trans_end_pos: %llu", m_trans_log_file,
-                          m_trans_fixed_log_file, m_trans_end_pos));
+                          "m_trans_end_pos: %llu m_trans_gtid: %s",
+                          m_trans_log_file, m_trans_fixed_log_file,
+                          m_trans_end_pos, m_trans_gtid));
     DBUG_VOID_RETURN;
   }
 
-  void get_trans_pos(const char **file_var, my_off_t *pos_var) const
+  void get_trans_pos(const char **file_var, my_off_t *pos_var,
+                     const char **gtid_var) const
   {
     DBUG_ENTER("THD::get_trans_pos");
     if (file_var)
       *file_var = m_trans_log_file;
     if (pos_var)
       *pos_var= m_trans_end_pos;
+    if (gtid_var)
+      *gtid_var = m_trans_gtid;
     DBUG_PRINT("return", ("file: %s, pos: %llu",
                           file_var ? *file_var : "<none>",
                           pos_var ? *pos_var : 0));
@@ -3736,6 +3685,7 @@ public:
     are owned by this thread.
   */
   Gtid_set owned_gtid_set;
+  my_bool should_write_gtid;
 
   void clear_owned_gtids()
   {
@@ -3774,12 +3724,6 @@ public:
   bool set_db(const char *new_db, size_t new_db_len)
   {
     bool result;
-    /*
-      Acquiring mutex LOCK_thd_data as we either free the memory allocated
-      for the database and reallocating the memory for the new db or memcpy
-      the new_db to the db.
-    */
-    mysql_mutex_lock(&LOCK_thd_data);
     /* Do not reallocate memory if current chunk is big enough. */
     if (db && new_db && db_length >= new_db_len)
       memcpy(db, new_db, new_db_len+1);
@@ -3792,7 +3736,6 @@ public:
         db= NULL;
     }
     db_length= db ? new_db_len : 0;
-    mysql_mutex_unlock(&LOCK_thd_data);
     result= new_db && !db;
 #ifdef HAVE_PSI_THREAD_INTERFACE
     if (result)
@@ -4034,8 +3977,8 @@ public:
   bool
   is_dml_gtid_compatible(bool transactional_table,
                          bool non_transactional_table,
-                         bool non_transactional_tmp_tables) const;
-  bool is_ddl_gtid_compatible() const;
+                         bool non_transactional_tmp_tables);
+  bool is_ddl_gtid_compatible();
   void binlog_invoker() { m_binlog_invoker= TRUE; }
   bool need_binlog_invoker() { return m_binlog_invoker; }
   void get_definer(LEX_USER *definer);
@@ -4055,6 +3998,7 @@ public:
   int get_gis_debug() { return gis_debug; }
   void set_gis_debug(int arg) { gis_debug= arg; }
 #endif
+  void reset_diagnostics();
 
 private:
 
@@ -4100,6 +4044,29 @@ private:
   LEX_STRING invoker_host;
 };
 
+/*
+  Use this to get the USER_STATS handle for a THD as THD::user_connect is not
+  set for the slave SQL replication thread and for other background threads.
+*/
+inline USER_STATS* thd_get_user_stats(THD* thd)
+{
+  USER_CONN* uc = const_cast<USER_CONN*>(thd->get_user_connect());
+  USER_STATS* us;
+  if (uc)
+  {
+    us= &(uc->user_stats);
+  }
+  else if (thd->slave_thread)
+  {
+    us= &slave_user_stats;
+  }
+  else
+  {
+    us= &other_user_stats;
+  }
+  DBUG_ASSERT(us->magic == USER_STATS_MAGIC);
+  return us;
+}
 
 /**
   A simple holder for the Prepared Statement Query_arena instance in THD.
@@ -4589,20 +4556,7 @@ public:
   uint  hidden_field_count;
   uint	group_parts,group_length,group_null_parts;
   uint	quick_group;
-  /**
-    Number of outer_sum_funcs i.e the number of set functions that are
-    aggregated in a query block outer to this subquery.
-
-    @see count_field_types
-  */
-  uint  outer_sum_func_count;
-  /**
-    Enabled when we have atleast one outer_sum_func. Needed when used
-    along with distinct.
-
-    @see create_tmp_table
-  */
-  bool  using_outer_summary_function;
+  bool  using_indirect_summary_function;
   CHARSET_INFO *table_charset; 
   bool schema_table;
   /*
@@ -4629,8 +4583,8 @@ public:
 
   TMP_TABLE_PARAM()
     :copy_field(0), copy_field_end(0), group_parts(0),
-     group_length(0), group_null_parts(0), outer_sum_func_count(0),
-     using_outer_summary_function(0),
+     group_length(0), group_null_parts(0),
+     using_indirect_summary_function(0),
      schema_table(0), precomputed_group_by(0), force_copy_fields(0),
      skip_create_table(FALSE), bit_fields_as_long(0)
   {}

@@ -28,6 +28,8 @@ Created 10/25/1995 Heikki Tuuri
 #include <debug_sync.h>
 #include <my_dbug.h>
 
+#include "log.h"
+
 #include "mem0mem.h"
 #include "hash0hash.h"
 #include "os0file.h"
@@ -43,6 +45,10 @@ Created 10/25/1995 Heikki Tuuri
 #include "dict0dict.h"
 #include "page0page.h"
 #include "page0zip.h"
+#ifdef XTRABACKUP
+#include "pars0pars.h"
+#include "que0que.h"
+#endif /* XTRABACKUP */
 #include "trx0sys.h"
 #include "row0mysql.h"
 #ifndef UNIV_HOTBACKUP
@@ -140,180 +146,9 @@ UNIV_INTERN mysql_pfs_key_t	fil_system_mutex_key;
 UNIV_INTERN mysql_pfs_key_t	fil_space_latch_key;
 #endif /* UNIV_PFS_RWLOCK */
 
-/** File node of a tablespace or the log data space */
-struct fil_node_t {
-	fil_space_t*	space;	/*!< backpointer to the space where this node
-				belongs */
-	char*		name;	/*!< path to the file */
-	ibool		open;	/*!< TRUE if file open */
-	os_file_t	handle;	/*!< OS handle to the file, if file open */
-	os_event_t	sync_event;/*!< Condition event to group and
-				serialize calls to fsync */
-	ibool		is_raw_disk;/*!< TRUE if the 'file' is actually a raw
-				device or a raw disk partition */
-	ulint		size;	/*!< size of the file in database pages, 0 if
-				not known yet; the possible last incomplete
-				megabyte may be ignored if space == 0 */
-	ulint		n_pending;
-				/*!< count of pending i/o's on this file;
-				closing of the file is not allowed if
-				this is > 0 */
-	ulint		n_pending_flushes;
-				/*!< count of pending flushes on this file;
-				closing of the file is not allowed if
-				this is > 0 */
-	ibool		being_extended;
-				/*!< TRUE if the node is currently
-				being extended. */
-	ib_int64_t	modification_counter;/*!< when we write to the file we
-				increment this by one */
-	ib_int64_t	flush_counter;/*!< up to what
-				modification_counter value we have
-				flushed the modifications to disk */
-	UT_LIST_NODE_T(fil_node_t) chain;
-				/*!< link field for the file chain */
-	UT_LIST_NODE_T(fil_node_t) LRU;
-				/*!< link field for the LRU list */
-	ulint		magic_n;/*!< FIL_NODE_MAGIC_N */
-};
-
-/** Value of fil_node_t::magic_n */
-#define	FIL_NODE_MAGIC_N	89389
-
-/** Tablespace or log data space: let us call them by a common name space */
-struct fil_space_t {
-	char*		name;	/*!< space name = the path to the first file in
-				it */
-	ulint		id;	/*!< space id */
-	ib_int64_t	tablespace_version;
-				/*!< in DISCARD/IMPORT this timestamp
-				is used to check if we should ignore
-				an insert buffer merge request for a
-				page because it actually was for the
-				previous incarnation of the space */
-	ibool		mark;	/*!< this is set to TRUE at database startup if
-				the space corresponds to a table in the InnoDB
-				data dictionary; so we can print a warning of
-				orphaned tablespaces */
-	ibool		stop_ios;/*!< TRUE if we want to rename the
-				.ibd file of tablespace and want to
-				stop temporarily posting of new i/o
-				requests on the file */
-	ibool		stop_new_ops;
-				/*!< we set this TRUE when we start
-				deleting a single-table tablespace.
-				When this is set following new ops
-				are not allowed:
-				* read IO request
-				* ibuf merge
-				* file flush
-				Note that we can still possibly have
-				new write operations because we don't
-				check this flag when doing flush
-				batches. */
-	ulint		purpose;/*!< FIL_TABLESPACE, FIL_LOG, or
-				FIL_ARCH_LOG */
-	UT_LIST_BASE_NODE_T(fil_node_t) chain;
-				/*!< base node for the file chain */
-	ulint		size;	/*!< space size in pages; 0 if a single-table
-				tablespace whose size we do not know yet;
-				last incomplete megabytes in data files may be
-				ignored if space == 0 */
-	ulint		flags;	/*!< tablespace flags; see
-				fsp_flags_is_valid(),
-				fsp_flags_get_zip_size() */
-	ulint		n_reserved_extents;
-				/*!< number of reserved free extents for
-				ongoing operations like B-tree page split */
-	ulint		n_pending_flushes; /*!< this is positive when flushing
-				the tablespace to disk; dropping of the
-				tablespace is forbidden if this is positive */
-	ulint		n_pending_ops;/*!< this is positive when we
-				have pending operations against this
-				tablespace. The pending operations can
-				be ibuf merges or lock validation code
-				trying to read a block.
-				Dropping of the tablespace is forbidden
-				if this is positive */
-	hash_node_t	hash;	/*!< hash chain node */
-	hash_node_t	name_hash;/*!< hash chain the name_hash table */
-#ifndef UNIV_HOTBACKUP
-	rw_lock_t	latch;	/*!< latch protecting the file space storage
-				allocation */
-#endif /* !UNIV_HOTBACKUP */
-	UT_LIST_NODE_T(fil_space_t) unflushed_spaces;
-				/*!< list of spaces with at least one unflushed
-				file we have written to */
-	bool		is_in_unflushed_spaces;
-				/*!< true if this space is currently in
-				unflushed_spaces */
-	UT_LIST_NODE_T(fil_space_t) space_list;
-				/*!< list of all spaces */
-	ulint		magic_n;/*!< FIL_SPACE_MAGIC_N */
-};
-
-/** Value of fil_space_t::magic_n */
-#define	FIL_SPACE_MAGIC_N	89472
-
-/** The tablespace memory cache; also the totality of logs (the log
-data space) is stored here; below we talk about tablespaces, but also
-the ib_logfiles form a 'space' and it is handled here */
-struct fil_system_t {
-#ifndef UNIV_HOTBACKUP
-	ib_mutex_t		mutex;		/*!< The mutex protecting the cache */
-#endif /* !UNIV_HOTBACKUP */
-	hash_table_t*	spaces;		/*!< The hash table of spaces in the
-					system; they are hashed on the space
-					id */
-	hash_table_t*	name_hash;	/*!< hash table based on the space
-					name */
-	UT_LIST_BASE_NODE_T(fil_node_t) LRU;
-					/*!< base node for the LRU list of the
-					most recently used open files with no
-					pending i/o's; if we start an i/o on
-					the file, we first remove it from this
-					list, and return it to the start of
-					the list when the i/o ends;
-					log files and the system tablespace are
-					not put to this list: they are opened
-					after the startup, and kept open until
-					shutdown */
-	UT_LIST_BASE_NODE_T(fil_space_t) unflushed_spaces;
-					/*!< base node for the list of those
-					tablespaces whose files contain
-					unflushed writes; those spaces have
-					at least one file node where
-					modification_counter > flush_counter */
-	ulint		n_open;		/*!< number of files currently open */
-	ulint		max_n_open;	/*!< n_open is not allowed to exceed
-					this */
-	ib_int64_t	modification_counter;/*!< when we write to a file we
-					increment this by one */
-	ulint		max_assigned_id;/*!< maximum space id in the existing
-					tables, or assigned during the time
-					mysqld has been up; at an InnoDB
-					startup we scan the data dictionary
-					and set here the maximum of the
-					space id's of the tables there */
-	ib_int64_t	tablespace_version;
-					/*!< a counter which is incremented for
-					every space object memory creation;
-					every space mem object gets a
-					'timestamp' from this; in DISCARD/
-					IMPORT this is used to check if we
-					should ignore an insert buffer merge
-					request */
-	UT_LIST_BASE_NODE_T(fil_space_t) space_list;
-					/*!< list of all file spaces */
-	ibool		space_id_reuse_warned;
-					/* !< TRUE if fil_space_create()
-					has issued a warning about
-					potential space_id reuse */
-};
-
 /** The tablespace memory cache. This variable is NULL before the module is
 initialized. */
-static fil_system_t*	fil_system	= NULL;
+fil_system_t*	fil_system	= NULL;
 
 /** Determine if (i) is a user tablespace id or not. */
 # define fil_is_user_tablespace_id(i) ((i) > srv_undo_tablespaces_open)
@@ -327,6 +162,11 @@ static fil_system_t*	fil_system	= NULL;
 #else /* __WIN__ */
 # define fil_buffering_disabled(s)	(0)
 #endif /* __WIN__ */
+
+/** Count usage of the doublewrite buffer separate from other activity to
+the system tablespace. */
+os_io_perf2_t	io_perf_doublewrite;
+comp_stat_t	comp_stat_doublewrite;
 
 #ifdef UNIV_DEBUG
 /** Try fil_validate() every this many times */
@@ -376,10 +216,13 @@ NOTE: you must call fil_mutex_enter_and_prepare_for_io() first!
 Prepares a file node for i/o. Opens the file if it is closed. Updates the
 pending i/o's field in the node and the system appropriately. Takes the node
 off the LRU list if it is in the LRU list. The caller must hold the fil_sys
-mutex.
-@return false if the file can't be opened, otherwise true */
+mutex. */
 static
-bool
+#ifdef XTRABACKUP
+ulint
+#else /* XTRABACKUP */
+void
+#endif /* XTRABACKUP */
 fil_node_prepare_for_io(
 /*====================*/
 	fil_node_t*	node,	/*!< in: file node */
@@ -398,6 +241,20 @@ fil_node_complete_io(
 				the node as modified if
 				type == OS_FILE_WRITE */
 /*******************************************************************//**
+Frees a fil_stats_t object. fil_system->mutex should not be held
+when this is called to avoid mutex contention. */
+static
+void
+fil_stats_free(
+/*===========*/
+	ulint		id);		/* in: space id */
+/*******************************************************************//**
+Frees all fil_stats_t objects. fil_system->mutex should not be held
+when this is called to avoid mutex contention. */
+static
+void
+fil_stats_all_free();
+/*******************************************************************//**
 Frees a space object from the tablespace memory cache. Closes the files in
 the chain but does not delete them. There must not be any pending i/o's or
 flushes on the files.
@@ -407,8 +264,7 @@ ibool
 fil_space_free(
 /*===========*/
 	ulint		id,		/* in: space id */
-	ibool		x_latched);	/* in: TRUE if caller has space->latch
-					in X mode */
+	ibool		x_latched);	/* in: TRUE if caller has space->latch */
 /********************************************************************//**
 Reads data from a space to a buffer. Remember that the possible incomplete
 blocks at the end of file are ignored: they are not taken into account when
@@ -469,24 +325,301 @@ fil_write(
 					   byte_offset, len, buf, message));
 }
 
-/*******************************************************************//**
-Returns the table space by a given id, NULL if not found. */
-UNIV_INLINE
-fil_space_t*
-fil_space_get_by_id(
-/*================*/
-	ulint	id)	/*!< in: space id */
+/****************************************************************//**
+Invokes table stats callback for all entries in one cell. */
+static void
+fil_update_table_stats_one_cell(
+/*============================*/
+	ulint		cell_number,	/*!< in: cell to report */
+	my_io_perf_t*	read_arr,	/*!< in: buffer for read stats */
+	my_io_perf_t*	write_arr,	/*!< in: buffer for write stats */
+	my_io_perf_t*	read_arr_blob,	/*!< in: buffer for read stats for blob */
+	my_io_perf_t*	read_arr_primary,  /*!< in: buffer for read stats for
+                                              primary index */
+	my_io_perf_t*	read_arr_secondary, /*!< in: buffer for read stats for
+                                              secondary index */
+	page_stats_t* page_stats_arr, /*< in: buffer for 'per page type' stats */
+	comp_stat_t*	comp_stat_arr, /*!< in: buffer for compression stats */
+	int*		n_lock_wait_arr, /*!< in: buffer for n_lock_wait stats */
+	int*		n_lock_wait_timeout_arr, /*!< in: buffer for
+						   n_lock_wait_timeout_stats */
+	ulint		max_per_cell,	/*!< in: size of buffers */
+	void		(*cb)(const char* db,
+				const char* tbl,
+				bool is_partition,
+				my_io_perf_t *r,
+				my_io_perf_t *w,
+				my_io_perf_t *r_blob,
+				my_io_perf_t *r_primary,
+				my_io_perf_t *r_secondary,
+				page_stats_t* page_stats,
+				comp_stat_t* comp_stat,
+				int n_lock_wait,
+				int n_lock_wait_timeout,
+				const char* engine),
+	char*		db_name_buf,	/*!< in: buffer for db names */
+	char*		table_name_buf,	/*!< in: buffer for table names */
+	bool*		is_partition)	/*!< in: buffer for partition flag */
 {
+	ulint		n_cells;
+	hash_cell_t*	cell;
 	fil_space_t*	space;
+	ulint		found = 0;
+	ulint		report = 0;
 
-	ut_ad(mutex_own(&fil_system->mutex));
+	mutex_enter(&fil_system->mutex);
+	n_cells = hash_get_n_cells(fil_system->spaces);
 
-	HASH_SEARCH(hash, fil_system->spaces, id,
-		    fil_space_t*, space,
-		    ut_ad(space->magic_n == FIL_SPACE_MAGIC_N),
-		    space->id == id);
+	if ((cell_number + 1) > n_cells) {
+		mutex_exit(&fil_system->mutex);
+		return;
+	}
 
-	return(space);
+	cell = hash_get_nth_cell(fil_system->spaces, cell_number);
+	space = static_cast<fil_space_t*>(cell->node);
+
+	/* Copy out all entries for which stats must be reported */
+
+	while (space && found < max_per_cell) {
+		if (space->stats.used) {
+			if (!space->is_partition)
+				space->stats.used = FALSE;
+			read_arr[found] = space->io_perf2.read;
+			write_arr[found] = space->io_perf2.write;
+			read_arr_blob[found] = space->io_perf2.read_blob;
+			read_arr_primary[found] = space->io_perf2.read_primary;
+			read_arr_secondary[found] = space->io_perf2.read_secondary;
+			page_stats_arr[found] = space->io_perf2.page_stats;
+			comp_stat_arr[found] = space->stats.comp_stat;
+			n_lock_wait_arr[found] = space->stats.n_lock_wait;
+			n_lock_wait_timeout_arr[found] =
+				space->stats.n_lock_wait_timeout;
+
+			strcpy(&(db_name_buf[found * (FN_LEN+1)]),
+				space->db_name);
+			strcpy(&(table_name_buf[found * (FN_LEN+1)]),
+				space->table_name);
+			is_partition[found] = space->is_partition;
+			found++;
+		}
+
+		space = static_cast<fil_space_t*>(HASH_GET_NEXT(hash, space));
+	}
+
+	mutex_exit(&fil_system->mutex);
+
+	/* Invoke callback after releasing mutex */
+
+	for (; report < found; ++report) {
+		cb(&(db_name_buf[report * (FN_LEN+1)]),
+			 &(table_name_buf[report * (FN_LEN+1)]),
+			 is_partition[report],
+			 &(read_arr[report]),
+			 &(write_arr[report]),
+			 &(read_arr_blob[report]),
+			 &(read_arr_primary[report]),
+			 &(read_arr_secondary[report]),
+			 &(page_stats_arr[report]),
+			 &(comp_stat_arr[report]),
+			 n_lock_wait_arr[report],
+			 n_lock_wait_timeout_arr[report],
+			 "InnoDB");
+	}
+}
+
+/****************************************************************//**
+Update stats with per-table data from InnoDB tables. */
+UNIV_INTERN
+void
+fil_update_table_stats(
+/*===================*/
+	/* per-table stats callback */
+	void (*cb)(const char* db,
+			const char* tbl,
+			bool is_partition,
+			my_io_perf_t *r,
+			my_io_perf_t *w,
+			my_io_perf_t *r_blob,
+			my_io_perf_t *r_primary,
+			my_io_perf_t *r_secondary,
+			page_stats_t *page_stats,
+			comp_stat_t* comp_stat,
+			int n_lock_wait,
+			int n_lock_wait_timeout,
+			const char* engine))
+{
+	ulint		n_cells;
+	ulint		n;
+	ulint		max_per_cell = 0;
+	my_io_perf_t*	read_arr;
+	my_io_perf_t*	write_arr;
+	my_io_perf_t*	read_arr_blob;
+	my_io_perf_t*	read_arr_primary;
+	my_io_perf_t*	read_arr_secondary;
+	page_stats_t*	page_stats_arr;
+	comp_stat_t*	comp_stat_arr;
+	int*		n_lock_wait_arr;
+	int*		n_lock_wait_timeout_arr;
+	char*		db_name_buf;
+	char*		table_name_buf;
+	bool*		is_partition;
+	static ibool	in_progress = FALSE;
+
+	/* This invokes the callback to report table stats for all
+	tablespaces with the assumption that file-per-table is used.
+	If it is not used, then the callback consumer assigns all
+	load per tablespace to the first table in the tablespace.
+
+	The code below figures out the max number of entries per
+	cell that might have data to be reported, allocates memory
+	and then calls fil_update_table_stats_one_cell to make
+	one pass over the hash table per cell and copy out data
+	for all entries per pass. This locks the fil_system mutex
+	once per pass. The mutex is not locked when the callback
+	is invoked.
+
+	To avoid allocating memory per cell the alternative is an O(N*N)
+	iteration of the hash table. I prefer not to do that. */
+
+	mutex_enter(&fil_system->mutex);
+
+	if (in_progress) {
+		/* Return rather than wait. No need for complexity */
+		mutex_exit(&fil_system->mutex);
+		return;
+	}
+
+	in_progress = TRUE;
+
+	n_cells = hash_get_n_cells(fil_system->spaces);
+
+	/* First figure out the max number of entries per cell
+	for which data is to be reported. */
+
+	for (n = 0; n < n_cells; ++n) {
+		ulint		per_cell = 0;
+		hash_cell_t*	cell = hash_get_nth_cell(fil_system->spaces, n);
+		fil_space_t*	space = static_cast<fil_space_t*>(cell->node);
+
+		while (space) {
+			if (space->stats.used)
+				++per_cell;
+
+			space = static_cast<fil_space_t*>(HASH_GET_NEXT(hash, space));
+		}
+
+		if (per_cell > max_per_cell)
+			max_per_cell = per_cell;
+	}
+
+	mutex_exit(&fil_system->mutex);
+
+	if (!max_per_cell) {
+		mutex_enter(&fil_system->mutex);
+		in_progress = FALSE;
+		mutex_exit(&fil_system->mutex);
+		return;
+	}
+
+	/* Then allocate memory for the max */
+
+	read_arr = (my_io_perf_t*) ut_malloc(sizeof(my_io_perf_t) * max_per_cell);
+	write_arr = (my_io_perf_t*) ut_malloc(sizeof(my_io_perf_t) * max_per_cell);
+	read_arr_blob = (my_io_perf_t*) ut_malloc(
+				sizeof(my_io_perf_t) * max_per_cell);
+	read_arr_primary = (my_io_perf_t*) ut_malloc(
+				sizeof(my_io_perf_t) * max_per_cell);
+	read_arr_secondary = (my_io_perf_t*) ut_malloc(
+				sizeof(my_io_perf_t) * max_per_cell);
+	page_stats_arr = (page_stats_t*) ut_malloc(
+				sizeof(page_stats_t) * max_per_cell);
+	comp_stat_arr = (comp_stat_t*) ut_malloc(
+				sizeof(comp_stat_t) * max_per_cell);
+	db_name_buf = (char*) ut_malloc((FN_LEN+1) * max_per_cell);
+	table_name_buf = (char*) ut_malloc((FN_LEN+1) * max_per_cell);
+	is_partition = (bool*) ut_malloc(sizeof(bool) * max_per_cell);
+	n_lock_wait_arr = (int*) ut_malloc(sizeof(int) * max_per_cell);
+	n_lock_wait_timeout_arr = (int*) ut_malloc(sizeof(int) * max_per_cell);
+
+	if (!read_arr || !write_arr || !read_arr_blob || !comp_stat_arr ||
+			!table_name_buf || !db_name_buf || !is_partition ||
+			!n_lock_wait_arr || !n_lock_wait_timeout_arr) {
+
+		mutex_enter(&fil_system->mutex);
+		in_progress = FALSE;
+		mutex_exit(&fil_system->mutex);
+
+		if (read_arr)
+			ut_free(read_arr);
+		if (write_arr)
+			ut_free(write_arr);
+		if (read_arr_blob)
+			ut_free(read_arr_blob);
+		if (read_arr_primary)
+			ut_free(read_arr_primary);
+		if (read_arr_secondary)
+			ut_free(read_arr_secondary);
+		if (page_stats_arr)
+			ut_free(page_stats_arr);
+		if (comp_stat_arr)
+			ut_free(comp_stat_arr);
+		if (db_name_buf)
+			ut_free(db_name_buf);
+		if (table_name_buf)
+			ut_free(table_name_buf);
+		if (is_partition)
+			ut_free(is_partition);
+		if (n_lock_wait_arr)
+			ut_free(n_lock_wait_arr);
+		if (n_lock_wait_timeout_arr)
+			ut_free(n_lock_wait_timeout_arr);
+
+		sql_print_error("Memory allocation failure in table stats.");
+		return;
+	}
+
+	/* Then copy out the valid data one cell at a time */
+
+	for (n = 0; n < n_cells; ++n) {
+		fil_update_table_stats_one_cell(
+			n, read_arr, write_arr, read_arr_blob,
+			read_arr_primary, read_arr_secondary, page_stats_arr,
+			comp_stat_arr, n_lock_wait_arr, n_lock_wait_timeout_arr,
+			max_per_cell, cb, db_name_buf,
+			table_name_buf, is_partition);
+	}
+
+	ut_free(read_arr);
+	ut_free(write_arr);
+	ut_free(read_arr_blob);
+	ut_free(read_arr_primary);
+	ut_free(read_arr_secondary);
+	ut_free(page_stats_arr);
+	ut_free(comp_stat_arr);
+	ut_free(table_name_buf);
+	ut_free(db_name_buf);
+	ut_free(is_partition);
+	ut_free(n_lock_wait_arr);
+	ut_free(n_lock_wait_timeout_arr);
+
+	/* Invoke the callback for doublewrite buffer IO */
+	cb("sys:innodb" /* schema */,
+		 "doublewrite" /* table */,
+		 false,
+		 &io_perf_doublewrite.read,
+		 &io_perf_doublewrite.write,
+		 &io_perf_doublewrite.read_blob,
+		 &io_perf_doublewrite.read_primary,
+		 &io_perf_doublewrite.read_secondary,
+		 &io_perf_doublewrite.page_stats,
+		 &comp_stat_doublewrite,
+		 0, /* n_lock_wait */
+		 0, /* n_lock_wait_timeout */
+		 "InnoDB");
+
+	mutex_enter(&fil_system->mutex);
+	in_progress = FALSE;
+	mutex_exit(&fil_system->mutex);
 }
 
 /*******************************************************************//**
@@ -654,6 +787,7 @@ fil_node_create(
 
 	node->sync_event = os_event_create();
 	node->is_raw_disk = is_raw;
+	node->flush_size = size;
 	node->size = size;
 	node->magic_n = FIL_NODE_MAGIC_N;
 
@@ -693,10 +827,13 @@ fil_node_create(
 
 /********************************************************************//**
 Opens a file of a node of a tablespace. The caller must own the fil_system
-mutex.
-@return false if the file can't be opened, otherwise true */
+mutex. */
 static
-bool
+#ifdef XTRABACKUP
+ulint
+#else /* XTRABACKUP */
+void
+#endif /* XTRABACKUP */
 fil_node_open_file(
 /*===============*/
 	fil_node_t*	node,	/*!< in: file node */
@@ -730,16 +867,30 @@ fil_node_open_file(
 			OS_FILE_READ_ONLY, &success);
 		if (!success) {
 			/* The following call prints an error message */
+#ifdef XTRABACKUP
+			if (os_file_get_last_error(TRUE) == OS_FILE_NOT_FOUND)
+			{
+				ut_print_timestamp(stderr);
+				fprintf(stderr,
+					" InnoDB: Warning: cannot open %s\n"
+					"InnoDB: this can happen if the table "
+					"was removed or renamed during an \n"
+					"InnoDB: xtrabackup run and is not dangerous.\n",
+					node->name);
+				return(OS_FILE_NOT_FOUND);
+			}
+#endif /* XTRABACKUP */
+
 			os_file_get_last_error(true);
 
 			ut_print_timestamp(stderr);
 
-			ib_logf(IB_LOG_LEVEL_WARN, "InnoDB: Error: cannot "
-				"open %s\n. InnoDB: Have you deleted .ibd "
-				"files under a running mysqld server?\n",
+			fprintf(stderr,
+				"  InnoDB: Fatal error: cannot open %s\n."
+				"InnoDB: Have you deleted .ibd files"
+				" under a running mysqld server?\n",
 				node->name);
-
-			return(false);
+			ut_a(0);
 		}
 
 		size_bytes = os_file_get_size(node->handle);
@@ -758,7 +909,7 @@ fil_node_open_file(
 			fprintf(stderr,
 				"InnoDB: Error: the size of single-table"
 				" tablespace file %s\n"
-				"InnoDB: is only "UINT64PF","
+				"InnoDB: is only " UINT64PF ","
 				" should be at least %lu!\n",
 				node->name,
 				size_bytes,
@@ -787,13 +938,27 @@ fil_node_open_file(
 		os_file_close(node->handle);
 
 		if (UNIV_UNLIKELY(space_id != space->id)) {
+#ifdef XTRABACKUP
+			fprintf(stderr,
+				"InnoDB: Warning: tablespace id is %lu"
+				" in the data dictionary\n"
+				"InnoDB: but in file %s it is %lu!\n"
+				"InnoDB: this can happen if the table "
+				"metadata was modified during an xtrabackup "
+				"run\n"
+				"InnoDB: and is not dangerous.\n",
+
+				space->id, node->name, space_id);
+
+			return(OS_FILE_NOT_FOUND);
+#else /* XTRABACKUP */
 			fprintf(stderr,
 				"InnoDB: Error: tablespace id is %lu"
 				" in the data dictionary\n"
 				"InnoDB: but in file %s it is %lu!\n",
 				space->id, node->name, space_id);
-
 			ut_error;
+#endif /* XTRABACKUP */
 		}
 
 		if (UNIV_UNLIKELY(space_id == ULINT_UNDEFINED
@@ -830,8 +995,12 @@ fil_node_open_file(
 		}
 
 		if (size_bytes >= 1024 * 1024) {
+
+/* In xtrabackup, the size should be exact for after applying .delta */
+#ifndef XTRABACKUP
 			/* Truncate the size to whole megabytes. */
 			size_bytes = ut_2pow_round(size_bytes, 1024 * 1024);
+#endif /* !XTRABACKUP */
 		}
 
 		if (!fsp_flags_is_compressed(flags)) {
@@ -845,6 +1014,7 @@ fil_node_open_file(
 #ifdef UNIV_HOTBACKUP
 add_size:
 #endif /* UNIV_HOTBACKUP */
+		node->flush_size = node->size;
 		space->size += node->size;
 	}
 
@@ -885,7 +1055,9 @@ add_size:
 		UT_LIST_ADD_FIRST(LRU, system->LRU, node);
 	}
 
-	return(true);
+#ifdef XTRABACKUP
+	return(0);
+#endif /* XTRABACKUP */
 }
 
 /**********************************************************************//**
@@ -1060,7 +1232,7 @@ retry:
 
 		/* Flush tablespaces so that we can close modified
 		files in the LRU list */
-		fil_flush_file_spaces(FIL_TABLESPACE);
+		fil_flush_file_spaces(FIL_TABLESPACE, FLUSH_FROM_OTHER);
 
 		os_thread_sleep(20000);
 
@@ -1129,7 +1301,7 @@ close_more:
 	/* Flush tablespaces so that we can close modified files in the LRU
 	list */
 
-	fil_flush_file_spaces(FIL_TABLESPACE);
+	fil_flush_file_spaces(FIL_TABLESPACE, FLUSH_FROM_OTHER);
 
 	count++;
 
@@ -1223,6 +1395,51 @@ fil_space_truncate_start(
 #endif /* UNIV_LOG_ARCHIVE */
 
 /*******************************************************************//**
+Parse db and table name from tablespace name. Use "sys:innodb" for
+db name of the system tablespace and logfiles and tablespace names
+that cannot be parsed. Use "log" as the table name for log files.
+Use "system" as the table name for the system tablespace.
+For the tablespace "foo/bar", the db name is "foo" and the
+table name is "bar". This expects names to be of the form:
+   "db/table"
+
+@return values in db_name and table_name. */
+static void
+parse_db_and_table(
+/*===============*/
+	const char*	name,		/*!< in: name to parse */
+	char*		db_name,	/*!< out: return db name */
+	char*		table_name,	/*!< out: return table name */
+	bool*		is_partition,	/*!< out: true if table is partition */
+	ulint		purpose,	/*!< in: type of tablespace */
+	ulint		id)		/*!< in: tablespace id */
+{
+	if (purpose == FIL_LOG) {
+		strcpy(db_name, "sys:innodb");
+		strcpy(table_name, "log");
+	} else if (id == 0) {
+		strcpy(db_name, "sys:innodb");
+		strcpy(table_name, "system");
+	} else {
+		if (sscanf(name, "%" FN_LEN_STR "[^/]/%" FN_LEN_STR "[^/]",
+		    db_name, table_name) != 2) {
+			strcpy(db_name, "sys:innodb");
+			strcpy(table_name, "other");
+			fprintf(stderr,
+				"InnoDB: unable to parse table and "
+				"db name from ::%s::\n", name);
+		} else {
+			// Use only base table name for partitioned tables
+			char *part = strstr(table_name, "#P#");
+			if (part) {
+				*part = '\0';
+				*is_partition = true;
+			}
+		}
+	}
+}
+
+/*******************************************************************//**
 Creates a space memory object and puts it to the 'fil system' hash table.
 If there is an error, prints an error message to the .err log.
 @return	TRUE if success */
@@ -1236,8 +1453,21 @@ fil_space_create(
 	ulint		purpose)/*!< in: FIL_TABLESPACE, or FIL_LOG if log */
 {
 	fil_space_t*	space;
+	ib_mutex_t*	stats_mutex;
+	char		db_name[FN_LEN + 1];
+	char		table_name[FN_LEN + 1];
+	bool		is_partition = false;
+	unsigned char db_stats_index;
 
 	DBUG_EXECUTE_IF("fil_space_create_failure", return(false););
+
+	parse_db_and_table(name, db_name, table_name, &is_partition,
+			   purpose, id);
+#ifdef XTRABACKUP
+	db_stats_index = 0;
+#else /* XTRABACKUP */
+	db_stats_index = get_db_stats_index(db_name);
+#endif /* XTRABACKUP */
 
 	ut_a(fil_system);
 	ut_a(fsp_flags_is_valid(flags));
@@ -1266,6 +1496,10 @@ fil_space_create(
 				"from the cache with id %lu",
 				name, (ulong) id);
 
+			/* Prefer not to call this when fil_system->mutex is
+			locked - not possible here. Good thing this is rare. */
+			fil_stats_free(space->id);
+
 			ibool	success = fil_space_free(space->id, FALSE);
 			ut_a(success);
 
@@ -1292,6 +1526,9 @@ fil_space_create(
 
 	space->name = mem_strdup(name);
 	space->id = id;
+	strcpy(space->db_name, db_name);
+	strcpy(space->table_name, table_name);
+	space->is_partition = is_partition;
 
 	fil_system->tablespace_version++;
 	space->tablespace_version = fil_system->tablespace_version;
@@ -1326,9 +1563,29 @@ fil_space_create(
 		    ut_fold_string(name), space);
 	space->is_in_unflushed_spaces = false;
 
+	my_io_perf_init(&(space->io_perf2.read));
+	my_io_perf_init(&(space->io_perf2.write));
+	my_io_perf_init(&(space->io_perf2.read_blob));
+	my_io_perf_init(&(space->io_perf2.read_primary));
+	my_io_perf_init(&(space->io_perf2.read_secondary));
+	memset(&(space->io_perf2.page_stats), 0, sizeof space->io_perf2.page_stats);
+	memset(&(space->stats.comp_stat), 0, sizeof space->stats.comp_stat);
+	space->stats.n_lock_wait = 0;
+	space->stats.n_lock_wait_timeout = 0;
+	space->stats.id = id;
+	space->stats.magic_n = FIL_STATS_MAGIC_N;
+	space->stats.used = TRUE;
+	space->stats.stats_next = NULL;
+
 	UT_LIST_ADD_LAST(space_list, fil_system->space_list, space);
+	space->stats.db_stats_index = db_stats_index;
 
 	mutex_exit(&fil_system->mutex);
+	stats_mutex = hash_get_mutex(fil_system->stats_hash, id);
+	mutex_enter(stats_mutex);
+	HASH_INSERT(fil_stats_t, stats_next, fil_system->stats_hash,
+		    id, (&space->stats));
+	mutex_exit(stats_mutex);
 
 	return(TRUE);
 }
@@ -1392,6 +1649,47 @@ fil_assign_new_space_id(
 
 	return(success);
 }
+
+/*******************************************************************//**
+Frees a fil_stats_t object. Prefer that fil_system->mutex is not locked
+when this is held to avoid mutex contention. */
+static
+void
+fil_stats_free(
+/*===========*/
+	ulint		id)		/* in: space id */
+{
+	fil_stats_t*	stats;
+	ib_mutex_t*	stats_mutex;
+
+	stats_mutex = hash_get_mutex(fil_system->stats_hash, id);
+	ut_ad(!mutex_own(stats_mutex));
+	mutex_enter(stats_mutex);
+
+	HASH_SEARCH(stats_next, fil_system->stats_hash, id,
+		    fil_stats_t*, stats,
+		    ut_ad(stats->magic_n == FIL_STATS_MAGIC_N),
+		    stats->id == id);
+
+	if (stats) {
+		HASH_DELETE(fil_stats_t, stats_next, fil_system->stats_hash,
+			    id, stats);
+	}
+	mutex_exit(stats_mutex);
+}
+
+/*******************************************************************//**
+Frees all fil_stats_t objects. fil_system->mutex should not be held
+when this is called to avoid mutex contention. */
+static
+void
+fil_stats_all_free()
+{
+	hash_mutex_enter_all(fil_system->stats_hash);
+	hash_table_clear(fil_system->stats_hash);
+	hash_mutex_exit_all(fil_system->stats_hash);
+}
+
 
 /*******************************************************************//**
 Frees a space object from the tablespace memory cache. Closes the files in
@@ -1462,6 +1760,7 @@ fil_space_free(
 
 	rw_lock_free(&(space->latch));
 
+	fil_stats_free(id);
 	mem_free(space->name);
 	mem_free(space);
 
@@ -1516,11 +1815,16 @@ fil_space_get_space(
 		the file yet; the following calls will open it and update the
 		size fields */
 
-		if (!fil_node_prepare_for_io(node, fil_system, space)) {
-			/* The single-table tablespace can't be opened,
-			because the ibd file is missing. */
+#ifdef XTRABACKUP
+		if (fil_node_prepare_for_io(node, fil_system, space))
+		{
+			mutex_exit(&fil_system->mutex);
+
 			return(NULL);
 		}
+#else /* XTRABACKUP */
+		fil_node_prepare_for_io(node, fil_system, space);
+#endif /* XTRABACKUP */
 		fil_node_complete_io(node, fil_system, OS_FILE_READ);
 	}
 
@@ -1692,9 +1996,27 @@ fil_init(
 	fil_system->spaces = hash_create(hash_size);
 	fil_system->name_hash = hash_create(hash_size);
 
+	fil_system->stats_hash = hash_create(hash_size);
+	hash_create_sync_obj(fil_system->stats_hash, HASH_TABLE_SYNC_MUTEX,
+			     64, SYNC_NO_ORDER_CHECK);
+
 	UT_LIST_INIT(fil_system->LRU);
 
 	fil_system->max_n_open = max_n_open;
+
+	my_io_perf_init(&io_perf_doublewrite.read);
+	my_io_perf_init(&io_perf_doublewrite.write);
+	my_io_perf_init(&io_perf_doublewrite.read_blob);
+	my_io_perf_init(&io_perf_doublewrite.read_primary);
+	my_io_perf_init(&io_perf_doublewrite.read_secondary);
+	memset(&io_perf_doublewrite.page_stats, 0,
+		sizeof(io_perf_doublewrite.page_stats));
+	memset(&comp_stat_doublewrite, 0, sizeof(comp_stat_doublewrite));
+
+	for (int x = 0; x < FLUSH_FROM_NUMBER; ++x)
+	{
+		fil_system->flush_types[x] = 0;
+	}
 }
 
 /*******************************************************************//**
@@ -1728,15 +2050,7 @@ fil_open_log_and_system_tablespace_files(void)
 		     node = UT_LIST_GET_NEXT(chain, node)) {
 
 			if (!node->open) {
-				if (!fil_node_open_file(node, fil_system,
-							space)) {
-					/* This func is called during server's
-					startup. If some file of log or system
-					tablespace is missing, the server
-					can't start successfully. So we should
-					assert for it. */
-					ut_a(0);
-				}
+				fil_node_open_file(node, fil_system, space);
 			}
 
 			if (fil_system->max_n_open < 10 + fil_system->n_open) {
@@ -1800,6 +2114,7 @@ fil_close_all_files(void)
 	}
 
 	mutex_exit(&fil_system->mutex);
+	fil_stats_all_free();
 }
 
 /*******************************************************************//**
@@ -1966,7 +2281,7 @@ fil_write_flushed_lsn_to_data_files(
 }
 
 /*******************************************************************//**
-Checks the consistency of the first data page of a tablespace
+Checks the consistency of the first data page of a data file
 at database startup.
 @retval NULL on success, or if innodb_force_recovery is set
 @return pointer to an error message string */
@@ -1974,7 +2289,9 @@ static __attribute__((warn_unused_result))
 const char*
 fil_check_first_page(
 /*=================*/
-	const page_t*	page)		/*!< in: data page */
+	const page_t*	page,		/*!< in: data page */
+	ibool		first_page)	/*!< in: TRUE if this is the
+					first page of the tablespace */
 {
 	ulint	space_id;
 	ulint	flags;
@@ -1986,11 +2303,11 @@ fil_check_first_page(
 	space_id = mach_read_from_4(FSP_HEADER_OFFSET + FSP_SPACE_ID + page);
 	flags = mach_read_from_4(FSP_HEADER_OFFSET + FSP_SPACE_FLAGS + page);
 
-	if (UNIV_PAGE_SIZE != fsp_flags_get_page_size(flags)) {
+	if (first_page && UNIV_PAGE_SIZE != fsp_flags_get_page_size(flags)) {
 		return("innodb-page-size mismatch");
 	}
 
-	if (!space_id && !flags) {
+	if (first_page && !space_id && !flags) {
 		ulint		nonzero_bytes	= UNIV_PAGE_SIZE;
 		const byte*	b		= page;
 
@@ -2008,8 +2325,9 @@ fil_check_first_page(
 		return("checksum mismatch");
 	}
 
-	if (page_get_space_id(page) == space_id
-	    && page_get_page_no(page) == 0) {
+	if (!first_page
+	    || (page_get_space_id(page) == space_id
+		&& page_get_page_no(page) == 0)) {
 		return(NULL);
 	}
 
@@ -2045,7 +2363,7 @@ fil_read_first_page(
 	byte*		buf;
 	byte*		page;
 	lsn_t		flushed_lsn;
-	const char*	check_msg = NULL;
+	const char*	check_msg;
 
 	buf = static_cast<byte*>(ut_malloc(2 * UNIV_PAGE_SIZE));
 
@@ -2061,9 +2379,7 @@ fil_read_first_page(
 
 	flushed_lsn = mach_read_from_8(page + FIL_PAGE_FILE_FLUSH_LSN);
 
-	if (!one_read_already) {
-		check_msg = fil_check_first_page(page);
-	}
+	check_msg = fil_check_first_page(page, !one_read_already);
 
 	ut_free(buf);
 
@@ -2195,7 +2511,7 @@ fil_create_directory_for_tablename(
 	mem_free(path);
 }
 
-#ifndef UNIV_HOTBACKUP
+#ifndef XTRABACKUP
 /********************************************************//**
 Writes a log record about an .ibd file create/rename/delete. */
 static
@@ -2260,7 +2576,7 @@ fil_op_write_log(
 		mlog_catenate_string(mtr, (byte*) new_name, len);
 	}
 }
-#endif
+#endif /* !XTRABACKUP */
 
 /*******************************************************************//**
 Parses the body of a log record written about an .ibd file operation. That is,
@@ -2376,7 +2692,7 @@ fil_op_log_parse_or_replay(
 	case MLOG_FILE_DELETE:
 		if (fil_tablespace_exists_in_mem(space_id)) {
 			dberr_t	err = fil_delete_tablespace(
-				space_id, BUF_REMOVE_FLUSH_NO_WRITE);
+				space_id, BUF_REMOVE_ALL_NO_WRITE);
 			ut_a(err == DB_SUCCESS);
 		}
 
@@ -2429,7 +2745,9 @@ fil_op_log_parse_or_replay(
 				    space_id, name, path, flags,
 				    DICT_TF2_USE_TABLESPACE,
 				    FIL_IBD_FILE_INITIAL_SIZE) != DB_SUCCESS) {
+#ifndef XTRABACKUP
 				ut_error;
+#endif /* !XTRABACKUP */
 			}
 		}
 
@@ -2788,7 +3106,7 @@ fil_delete_tablespace(
 	}
 
 	if (err == DB_SUCCESS) {
-#ifndef UNIV_HOTBACKUP
+#ifndef XTRABACKUP
 		/* Write a log record about the deletion of the .ibd
 		file, so that ibbackup can replay it in the
 		--apply-log phase. We use a dummy mtr and the familiar
@@ -2801,7 +3119,7 @@ fil_delete_tablespace(
 
 		fil_op_write_log(MLOG_FILE_DELETE, id, 0, 0, path, NULL, &mtr);
 		mtr_commit(&mtr);
-#endif
+#endif /* !XTRABACKUP */
 		err = DB_SUCCESS;
 	}
 
@@ -2922,6 +3240,7 @@ fil_rename_tablespace_in_mem(
 
 	HASH_DELETE(fil_space_t, name_hash, fil_system->name_hash,
 		    ut_fold_string(space->name), space);
+
 	mem_free(space->name);
 	mem_free(node->name);
 
@@ -3020,13 +3339,14 @@ fil_rename_tablespace(
 	char*		old_name;
 	char*		old_path;
 	const char*	not_given	= "(name not specified)";
+	const int WARN_INTERVAL = 1000;
 
 	ut_a(id != 0);
 
 retry:
 	count++;
 
-	if (!(count % 1000)) {
+	if (!(count % WARN_INTERVAL)) {
 		ut_print_timestamp(stderr);
 		fputs("  InnoDB: Warning: problems renaming ", stderr);
 		ut_print_filename(stderr,
@@ -3077,21 +3397,42 @@ retry:
 		/* There are pending i/o's or flushes or the file is
 		currently being extended, sleep for a while and
 		retry */
+		ulint sleep_usecs = 20000;
+
+		/* Avoid deadly embrace. When stop_ios=TRUE then other threads
+		can get stuck in fil_mutex_enter_and_prepare_for_io and won't
+		decrement counters (n_pending, n_pending_flushes, flush_counter,
+		modification_counter) for which this thread is blocked. The
+		sleep time is increased to be much larger than the 20000 usecs
+		that threads sleep in fil_mutex_enter_and_prepare_for_io. This
+		is only done some of the time to preserve existing behavior. */
+
+		if (!(count % WARN_INTERVAL)) {
+			space->stop_ios = FALSE;
+			sleep_usecs = 200000;
+		}
 
 		mutex_exit(&fil_system->mutex);
 
-		os_thread_sleep(20000);
+		os_thread_sleep(sleep_usecs);
 
 		goto retry;
 
 	} else if (node->modification_counter > node->flush_counter) {
 		/* Flush the space */
+		ulint sleep_usecs = 20000;
+
+		/* See comment above on deadly embrace */
+		if (!(count % WARN_INTERVAL)) {
+			space->stop_ios = FALSE;
+			sleep_usecs = 200000;
+		}
 
 		mutex_exit(&fil_system->mutex);
 
-		os_thread_sleep(20000);
+		os_thread_sleep(sleep_usecs);
 
-		fil_flush(id);
+		fil_flush(id, FLUSH_FROM_OTHER);
 
 		goto retry;
 
@@ -3136,6 +3477,12 @@ skip_second_rename:
 
 			ut_a(fil_rename_tablespace_in_mem(
 					space, node, old_name, old_path));
+		} else {
+			parse_db_and_table(new_name,
+					   space->db_name,
+					   space->table_name,
+					   &space->is_partition,
+					   FIL_TABLESPACE, id);
 		}
 	}
 
@@ -3143,7 +3490,7 @@ skip_second_rename:
 
 	mutex_exit(&fil_system->mutex);
 
-#ifndef UNIV_HOTBACKUP
+#ifndef XTRABACKUP
 	if (success && !recv_recovery_on) {
 		mtr_t		mtr;
 
@@ -3153,7 +3500,7 @@ skip_second_rename:
 				 &mtr);
 		mtr_commit(&mtr);
 	}
-#endif /* !UNIV_HOTBACKUP */
+#endif /* !XTRABACKUP */
 
 	mem_free(new_path);
 	mem_free(old_path);
@@ -3527,7 +3874,7 @@ fil_create_new_single_table_tablespace(
 		goto error_exit_1;
 	}
 
-#ifndef UNIV_HOTBACKUP
+#ifndef XTRABACKUP
 	{
 		mtr_t		mtr;
 		ulint		mlog_file_flag = 0;
@@ -3546,7 +3893,7 @@ fil_create_new_single_table_tablespace(
 
 		mtr_commit(&mtr);
 	}
-#endif
+#endif /* !XTRABACKUP */
 	err = DB_SUCCESS;
 
 	/* Error code is set.  Cleanup the various variables used.
@@ -3618,6 +3965,99 @@ struct fsp_open_info {
 	ulint		arch_log_no;	/*!< latest archived log file number */
 #endif /* UNIV_LOG_ARCHIVE */
 };
+
+#ifdef XTRABACKUP
+static
+void
+fil_remove_invalid_table_from_data_dict(const char *name)
+{
+	trx_t*		trx;
+	pars_info_t*	info = NULL;
+
+	trx = trx_allocate_for_mysql();
+	trx_start_for_ddl(trx, TRX_DICT_OP_TABLE);
+
+	ut_ad(mutex_own(&dict_sys->mutex));
+
+	trx->op_info = "removing invalid table from data dictionary";
+
+	info = pars_info_create();
+
+	pars_info_add_str_literal(info, "table_name", name);
+
+	que_eval_sql(info,
+		     "PROCEDURE DROP_TABLE_PROC () IS\n"
+		     "sys_foreign_id CHAR;\n"
+		     "table_id CHAR;\n"
+		     "index_id CHAR;\n"
+		     "foreign_id CHAR;\n"
+		     "found INT;\n"
+		     "BEGIN\n"
+		     "SELECT ID INTO table_id\n"
+		     "FROM SYS_TABLES\n"
+		     "WHERE NAME = :table_name\n"
+		     "LOCK IN SHARE MODE;\n"
+		     "IF (SQL % NOTFOUND) THEN\n"
+		     "       RETURN;\n"
+		     "END IF;\n"
+		     "found := 1;\n"
+		     "SELECT ID INTO sys_foreign_id\n"
+		     "FROM SYS_TABLES\n"
+		     "WHERE NAME = 'SYS_FOREIGN'\n"
+		     "LOCK IN SHARE MODE;\n"
+		     "IF (SQL % NOTFOUND) THEN\n"
+		     "       found := 0;\n"
+		     "END IF;\n"
+		     "IF (:table_name = 'SYS_FOREIGN') THEN\n"
+		     "       found := 0;\n"
+		     "END IF;\n"
+		     "IF (:table_name = 'SYS_FOREIGN_COLS') THEN\n"
+		     "       found := 0;\n"
+		     "END IF;\n"
+		     "WHILE found = 1 LOOP\n"
+		     "       SELECT ID INTO foreign_id\n"
+		     "       FROM SYS_FOREIGN\n"
+		     "       WHERE FOR_NAME = :table_name\n"
+		     "               AND TO_BINARY(FOR_NAME)\n"
+		     "                 = TO_BINARY(:table_name)\n"
+		     "               LOCK IN SHARE MODE;\n"
+		     "       IF (SQL % NOTFOUND) THEN\n"
+		     "               found := 0;\n"
+		     "       ELSE\n"
+		     "               DELETE FROM SYS_FOREIGN_COLS\n"
+		     "               WHERE ID = foreign_id;\n"
+		     "               DELETE FROM SYS_FOREIGN\n"
+		     "               WHERE ID = foreign_id;\n"
+		     "       END IF;\n"
+		     "END LOOP;\n"
+		     "found := 1;\n"
+		     "WHILE found = 1 LOOP\n"
+		     "       SELECT ID INTO index_id\n"
+		     "       FROM SYS_INDEXES\n"
+		     "       WHERE TABLE_ID = table_id\n"
+		     "       LOCK IN SHARE MODE;\n"
+		     "       IF (SQL % NOTFOUND) THEN\n"
+		     "               found := 0;\n"
+		     "       ELSE\n"
+		     "               DELETE FROM SYS_FIELDS\n"
+		     "               WHERE INDEX_ID = index_id;\n"
+		     "               DELETE FROM SYS_INDEXES\n"
+		     "               WHERE ID = index_id\n"
+		     "               AND TABLE_ID = table_id;\n"
+		     "       END IF;\n"
+		     "END LOOP;\n"
+		     "DELETE FROM SYS_COLUMNS\n"
+		     "WHERE TABLE_ID = table_id;\n"
+		     "DELETE FROM SYS_TABLES\n"
+		     "WHERE ID = table_id;\n"
+		     "END;\n"
+		     , FALSE, trx);
+
+	trx_commit_for_mysql(trx);
+
+	trx_free_for_mysql(trx);
+}
+#endif /* XTRABACKUP */
 
 /********************************************************************//**
 Tries to open a single-table tablespace and optionally checks that the
@@ -3830,11 +4270,21 @@ fil_open_single_table_tablespace(
 		/* The following call prints an error message */
 		os_file_get_last_error(true);
 
+#ifdef XTRABACKUP
+		ib_logf(IB_LOG_LEVEL_WARN,
+#else /* XTRABACKUP */
 		ib_logf(IB_LOG_LEVEL_ERROR,
+#endif /* XTRABACKUP */
 			"Could not find a valid tablespace file for '%s'. "
 			"See " REFMAN "innodb-troubleshooting-datadict.html "
 			"for how to resolve the issue.",
 			tablename);
+#ifdef XTRABACKUP
+		ib_logf(IB_LOG_LEVEL_WARN,
+			"It will be removed from the data dictionary.");
+
+		fil_remove_invalid_table_from_data_dict(tablename);
+#endif /* XTRABACKUP */
 
 		err = DB_CORRUPTION;
 
@@ -4271,17 +4721,17 @@ will_not_choose:
 	cannot be ok. */
 	ulong minimum_size = FIL_IBD_FILE_INITIAL_SIZE * UNIV_PAGE_SIZE;
 	if (size < minimum_size) {
-#ifndef UNIV_HOTBACKUP
+#ifndef XTRABACKUP
 		ib_logf(IB_LOG_LEVEL_ERROR,
 			"The size of single-table tablespace file %s "
 			"is only " UINT64PF ", should be at least %lu!",
 			fsp->filepath, size, minimum_size);
 		os_file_close(fsp->file);
 		goto no_good_file;
-#else
+#else /* !XTRABACKUP */
 		fsp->id = ULINT_UNDEFINED;
 		fsp->flags = 0;
-#endif /* !UNIV_HOTBACKUP */
+#endif /* !XTRABACKUP */
 	}
 
 #ifdef UNIV_HOTBACKUP
@@ -4399,7 +4849,7 @@ directory. We retry 100 times if os_file_readdir_next_file() returns -1. The
 idea is to read as much good data as we can and jump over bad data.
 @return 0 if ok, -1 if error even after the retries, 1 if at the end
 of the directory */
-static
+UNIV_INTERN
 int
 fil_file_readdir_next_file(
 /*=======================*/
@@ -4674,6 +5124,9 @@ fil_space_for_table_exists_in_mem(
 {
 	fil_space_t*	fnamespace;
 	fil_space_t*	space;
+#ifdef XTRABACKUP
+	ibool		remove_from_data_dict = FALSE;
+#endif /* XTRABACKUP */
 
 	ut_ad(fil_system);
 
@@ -4751,6 +5204,12 @@ fil_space_for_table_exists_in_mem(
 		if (fnamespace == NULL) {
 			if (print_error_if_does_not_exist) {
 				fil_report_missing_tablespace(name, id);
+#ifdef XTRABACKUP
+				ib_logf(IB_LOG_LEVEL_WARN,
+					"It will be removed from "
+					"the data dictionary.");
+				remove_from_data_dict = TRUE;
+#endif /* XTRABACKUP */
 			}
 		} else {
 			ut_print_timestamp(stderr);
@@ -4773,6 +5232,12 @@ error_exit:
 		      "InnoDB: for how to resolve the issue.\n", stderr);
 
 		mutex_exit(&fil_system->mutex);
+
+#ifdef XTRABACKUP
+		if (remove_from_data_dict) {
+			fil_remove_invalid_table_from_data_dict(name);
+		}
+#endif /* XTRABACKUP */
 
 		return(FALSE);
 	}
@@ -4864,6 +5329,9 @@ fil_extend_space_to_desired_size(
 	ulint		page_size;
 	ulint		pages_added;
 	ibool		success;
+#ifdef XTRABACKUP
+	ulint		err = 0;
+#endif /* XTRABACKUP */
 
 	ut_ad(!srv_read_only_mode);
 
@@ -4908,18 +5376,21 @@ retry:
 		goto retry;
 	}
 
-	if (!fil_node_prepare_for_io(node, fil_system, space)) {
-		/* The tablespace data file, such as .ibd file, is missing */
-		node->being_extended = false;
-		mutex_exit(&fil_system->mutex);
-
-		return(false);
-	}
+#ifdef XTRABACKUP
+	err =
+#endif /* XTRABACKUP */
+	fil_node_prepare_for_io(node, fil_system, space);
 
 	/* At this point it is safe to release fil_system mutex. No
 	other thread can rename, delete or close the file because
 	we have set the node->being_extended flag. */
 	mutex_exit(&fil_system->mutex);
+
+#ifdef XTRABACKUP
+	if (err) {
+		return FALSE;
+	}
+#endif /* XTRABACKUP */
 
 	start_page_no = space->size;
 	file_start_page_no = space->size - node->size;
@@ -4946,7 +5417,12 @@ retry:
 		success = os_aio(OS_FILE_WRITE, OS_AIO_SYNC,
 				 node->name, node->handle, buf,
 				 offset, page_size * n_pages,
-				 NULL, NULL);
+				 NULL, NULL,
+				 /* We do not collect primary and secondary
+				    index IO stats for system table space */
+				 (TRX_SYS_SPACE == space->id)
+					? NULL : &space->primary_index_id,
+				 &space->io_perf2, NULL, TRUE);
 #endif /* UNIV_HOTBACKUP */
 		if (success) {
 			os_has_said_disk_full = FALSE;
@@ -5000,7 +5476,7 @@ retry:
 	size_after_extend, *actual_size); */
 	mutex_exit(&fil_system->mutex);
 
-	fil_flush(space_id);
+	fil_flush(space_id, FLUSH_FROM_OTHER);
 
 	return(success);
 }
@@ -5164,10 +5640,13 @@ NOTE: you must call fil_mutex_enter_and_prepare_for_io() first!
 Prepares a file node for i/o. Opens the file if it is closed. Updates the
 pending i/o's field in the node and the system appropriately. Takes the node
 off the LRU list if it is in the LRU list. The caller must hold the fil_sys
-mutex.
-@return false if the file can't be opened, otherwise true */
+mutex. */
 static
-bool
+#ifdef XTRABACKUP
+ulint
+#else /* XTRABACKUP */
+void
+#endif /* XTRABACKUP */
 fil_node_prepare_for_io(
 /*====================*/
 	fil_node_t*	node,	/*!< in: file node */
@@ -5187,12 +5666,19 @@ fil_node_prepare_for_io(
 	}
 
 	if (node->open == FALSE) {
+#ifdef XTRABACKUP
+		ulint	err;
+#endif /* XTRABACKUP */
 		/* File is closed: open it */
 		ut_a(node->n_pending == 0);
-
-		if (!fil_node_open_file(node, system, space)) {
-			return(false);
-		}
+#ifdef XTRABACKUP
+		err =
+#endif /* XTRABACKUP */
+		fil_node_open_file(node, system, space);
+#ifdef XTRABACKUP
+		if (err)
+			return(err);
+#endif /* XTRABACKUP */
 	}
 
 	if (node->n_pending == 0 && fil_space_belongs_in_lru(space)) {
@@ -5204,8 +5690,9 @@ fil_node_prepare_for_io(
 	}
 
 	node->n_pending++;
-
-	return(true);
+#ifdef XTRABACKUP
+	return(0);
+#endif /* XTRABACKUP */
 }
 
 /********************************************************************//**
@@ -5292,7 +5779,7 @@ Reads or writes data. This operation is asynchronous (aio).
 i/o on a tablespace which does not exist */
 UNIV_INTERN
 dberr_t
-fil_io(
+_fil_io(
 /*===*/
 	ulint	type,		/*!< in: OS_FILE_READ or OS_FILE_WRITE,
 				ORed to OS_FILE_LOG, if a log i/o
@@ -5302,8 +5789,11 @@ fil_io(
 				may introduce hidden chances of deadlocks,
 				because i/os are not actually handled until
 				all have been posted: use with great
-				caution! */
-	bool	sync,		/*!< in: true if synchronous aio is desired */
+				caution! When ORed to OS_AIO_DOUBLE_WRITE,
+				OS_FILE_LOG or OS_AIO_SIMULATED_WAKE_LATER is
+				used to indicate how perf counters are to
+				be updated for sync writes. */
+	bool	sync,		/*!< in: TRUE if synchronous aio is desired */
 	ulint	space_id,	/*!< in: space id */
 	ulint	zip_size,	/*!< in: compressed page size in bytes;
 				0 for uncompressed pages */
@@ -5317,23 +5807,40 @@ fil_io(
 	void*	buf,		/*!< in/out: buffer where to store read data
 				or from where to write; in aio this must be
 				appropriately aligned */
-	void*	message)	/*!< in: message for aio handler if non-sync
+	void*	message,	/*!< in: message for aio handler if non-sync
 				aio used, else ignored */
+	os_io_table_perf_t* table_io_perf,/* in/out: tracks table IO stats
+				to be counted in IS.user_statistics only
+				for sync reads and writes */
+	ibool	should_buffer)	/*!< in: whether to buffer an aio request.
+				AIO read ahead uses this. If you plan to
+				use this parameter, make sure you remember
+				to call os_aio_linux_dispatch_read_array_submit
+				when you're ready to commit all your requests.*/
 {
 	ulint		mode;
 	fil_space_t*	space;
 	fil_node_t*	node;
 	ibool		ret;
 	ulint		is_log;
-	ulint		wake_later;
+	ulint		io_flags;
+	ulint		is_file_pad;
 	os_offset_t	offset;
 	ibool		ignore_nonexistent_pages;
 
+	io_flags = type & OS_AIO_SIMULATED_WAKE_LATER;
+	type = type & ~OS_AIO_SIMULATED_WAKE_LATER;
+
 	is_log = type & OS_FILE_LOG;
+	io_flags |= is_log;
 	type = type & ~OS_FILE_LOG;
 
-	wake_later = type & OS_AIO_SIMULATED_WAKE_LATER;
-	type = type & ~OS_AIO_SIMULATED_WAKE_LATER;
+	is_file_pad = type & OS_FILE_PAD;
+	io_flags |= is_file_pad;
+	type = type & ~OS_FILE_PAD;
+
+	io_flags |= (type & OS_AIO_DOUBLE_WRITE);
+	type = type & ~OS_AIO_DOUBLE_WRITE;
 
 	ignore_nonexistent_pages = type & BUF_READ_IGNORE_NONEXISTENT_PAGES;
 	type &= ~BUF_READ_IGNORE_NONEXISTENT_PAGES;
@@ -5407,8 +5914,19 @@ fil_io(
 
 	ut_ad(mode != OS_AIO_IBUF || space->purpose == FIL_TABLESPACE);
 
-	node = UT_LIST_GET_FIRST(space->chain);
+#ifdef XTRABACKUP
+	if (space->size > 0 && space->size <= block_offset) {
+		ulint	actual_size;
 
+		mutex_exit(&fil_system->mutex);
+		fil_extend_space_to_desired_size(&actual_size, space->id,
+						 block_offset + 1);
+		mutex_enter(&fil_system->mutex);
+		/* should retry? but it may safe for xtrabackup for now. */
+	}
+#endif /* XTRABACKUP */
+
+	node = UT_LIST_GET_FIRST(space->chain);
 	for (;;) {
 		if (node == NULL) {
 			if (ignore_nonexistent_pages) {
@@ -5422,7 +5940,7 @@ fil_io(
 
 			ut_error;
 
-		} else if (fil_is_user_tablespace_id(space->id)
+		} else  if (fil_is_user_tablespace_id(space->id)
 			   && node->size == 0) {
 
 			/* We do not know the size of a single-table tablespace
@@ -5438,28 +5956,15 @@ fil_io(
 	}
 
 	/* Open file if closed */
-	if (!fil_node_prepare_for_io(node, fil_system, space)) {
-		if (space->purpose == FIL_TABLESPACE
-		    && fil_is_user_tablespace_id(space->id)) {
-			mutex_exit(&fil_system->mutex);
+#ifdef XTRABACKUP
+	if (fil_node_prepare_for_io(node, fil_system, space)) {
 
-			ib_logf(IB_LOG_LEVEL_ERROR,
-				"Trying to do i/o to a tablespace which "
-				"exists without .ibd data file. "
-				"i/o type %lu, space id %lu, page no %lu, "
-				"i/o length %lu bytes",
-				(ulong) type, (ulong) space_id,
-				(ulong) block_offset, (ulong) len);
-
-			return(DB_TABLESPACE_DELETED);
-		}
-
-		/* The tablespace is for log. Currently, we just assert here
-		to prevent handling errors along the way fil_io returns.
-		Also, if the log files are missing, it would be hard to
-		promise the server can continue running. */
-		ut_a(0);
+		mutex_exit(&fil_system->mutex);
+		return(DB_TABLESPACE_DELETED);
 	}
+#else /* XTRABACKUP */
+	fil_node_prepare_for_io(node, fil_system, space);
+#endif /* XTRABACKUP */
 
 	/* Check that at least the start offset is within the bounds of a
 	single-table tablespace, including rollback tablespaces. */
@@ -5472,6 +5977,8 @@ fil_io(
 
 		ut_error;
 	}
+
+	space->stats.used = TRUE;
 
 	/* Now we have made the changes in the data structures of fil_system */
 	mutex_exit(&fil_system->mutex);
@@ -5517,8 +6024,15 @@ fil_io(
 	}
 #else
 	/* Queue the aio request */
-	ret = os_aio(type, mode | wake_later, node->name, node->handle, buf,
-		     offset, len, node, message);
+	ret = os_aio(type, mode | io_flags, node->name, node->handle, buf,
+		     offset, len, node, message,
+		     /* We do not collect primary and secondary index
+			IO stats for system table space */
+		     (TRX_SYS_SPACE == space->id)
+			? NULL : &space->primary_index_id,
+		     /*(io_flags & OS_AIO_DOUBLE_WRITE)
+			? &io_perf_doublewrite : */&space->io_perf2,
+		     table_io_perf, should_buffer);
 #endif /* UNIV_HOTBACKUP */
 	ut_a(ret);
 
@@ -5616,8 +6130,9 @@ UNIV_INTERN
 void
 fil_flush(
 /*======*/
-	ulint	space_id)	/*!< in: file space id (this can be a group of
+	ulint	space_id,	/*!< in: file space id (this can be a group of
 				log files or a tablespace of the database) */
+	flush_from_t	from)	/*!< in: identifies the caller */
 {
 	fil_space_t*	space;
 	fil_node_t*	node;
@@ -5625,6 +6140,9 @@ fil_flush(
 
 
 	mutex_enter(&fil_system->mutex);
+
+	ut_a(from < FLUSH_FROM_NUMBER);
+	fil_system->flush_types[from]++;
 
 	space = fil_space_get_by_id(space_id);
 
@@ -5682,6 +6200,14 @@ fil_flush(
 			goto skip_flush;
 		}
 #endif /* __WIN__ */
+#ifdef UNIV_LINUX
+		if (space->purpose == FIL_TABLESPACE
+		    && srv_unix_file_flush_method == SRV_UNIX_O_DIRECT
+		    && node->flush_size == node->size) {
+			goto skip_flush;
+		}
+#endif
+
 retry:
 		if (node->n_pending_flushes > 0) {
 			/* We want to avoid calling os_file_flush() on
@@ -5719,6 +6245,7 @@ retry:
 		os_event_set(node->sync_event);
 
 		node->n_pending_flushes--;
+		node->flush_size = node->size;
 skip_flush:
 		if (node->flush_counter < old_mod_counter) {
 			node->flush_counter = old_mod_counter;
@@ -5754,7 +6281,8 @@ UNIV_INTERN
 void
 fil_flush_file_spaces(
 /*==================*/
-	ulint	purpose)	/*!< in: FIL_TABLESPACE, FIL_LOG */
+	ulint		purpose,/*!< in: FIL_TABLESPACE, FIL_LOG */
+	flush_from_t	from)	/*!< in: identifies the caller */
 {
 	fil_space_t*	space;
 	ulint*		space_ids;
@@ -5795,7 +6323,7 @@ fil_flush_file_spaces(
 	a non-existing space id. */
 	for (i = 0; i < n_space_ids; i++) {
 
-		fil_flush(space_ids[i]);
+		fil_flush(space_ids[i], from);
 	}
 
 	mem_free(space_ids);
@@ -5951,6 +6479,7 @@ fil_close(void)
 	hash_table_free(fil_system->spaces);
 
 	hash_table_free(fil_system->name_hash);
+	hash_table_free(fil_system->stats_hash);
 
 	ut_a(UT_LIST_GET_LEN(fil_system->LRU) == 0);
 	ut_a(UT_LIST_GET_LEN(fil_system->unflushed_spaces) == 0);
@@ -6334,6 +6863,7 @@ fil_get_space_names(
 	return(err);
 }
 
+#ifndef XTRABACKUP
 /****************************************************************//**
 Generate redo logs for swapping two .ibd files */
 UNIV_INTERN
@@ -6359,4 +6889,68 @@ fil_mtr_rename_log(
 		fil_op_write_log(MLOG_FILE_RENAME, new_space_id,
 				 0, 0, new_name, old_name, mtr);
 	}
+}
+#endif /* !XTRABACKUP */
+
+/*************************************************************************
+Changes count of lock wait on a row for this space. Will lock/unlock
+fil_system->mutex */
+void
+fil_change_lock_wait_count(
+/*=================*/
+	ulint	id,	/* in: tablespace id for which count changes */
+	int	amount)	/* in: amount by which the count changes */
+{
+	fil_stats_t*	stats;
+	ib_mutex_t*	stats_mutex;
+
+	stats = fil_get_stats_lock_mutex_by_id(id, &stats_mutex);
+
+	if (stats) {
+		stats->used = TRUE;
+		stats->n_lock_wait += amount;
+	}
+
+	mutex_exit(stats_mutex);
+}
+
+/*************************************************************************
+Changes count of lock wait timeout on a row for this space. Will lock/unlock
+fil_system->mutex */
+void
+fil_change_lock_wait_timeout_count(
+/*=================*/
+	ulint	id,	/* in: tablespace id for which count changes */
+	int	amount)	/* in: amount by which the count changes */
+{
+	fil_stats_t*	stats;
+	ib_mutex_t*	stats_mutex;
+
+	stats = fil_get_stats_lock_mutex_by_id(id, &stats_mutex);
+
+	if (stats) {
+		stats->used = TRUE;
+		stats->n_lock_wait_timeout += amount;
+	}
+
+	mutex_exit(stats_mutex);
+}
+
+/*************************************************************************
+Print tablespace data for SHOW INNODB STATUS. */
+void
+fil_print(
+/*=======*/
+       FILE* file)     /* in: print results to this */
+{
+	fprintf(file,
+		"fsync callers: %lu buffer pool, %lu other, %lu checkpoint, "
+		"%lu log aio, %lu log sync, %lu archive, %lu doublwrite\n",
+		fil_system->flush_types[FLUSH_FROM_DIRTY_BUFFER],
+		fil_system->flush_types[FLUSH_FROM_OTHER],
+		fil_system->flush_types[FLUSH_FROM_CHECKPOINT],
+		fil_system->flush_types[FLUSH_FROM_LOG_IO_COMPLETE],
+		fil_system->flush_types[FLUSH_FROM_LOG_WRITE_UP_TO],
+		fil_system->flush_types[FLUSH_FROM_ARCHIVE],
+		fil_system->flush_types[FLUSH_FROM_DOUBLEWRITE]);
 }

@@ -414,19 +414,12 @@ TABLE *open_proc_table_for_read(THD *thd, Open_tables_backup *backup)
 
   if (open_system_tables_for_read(thd, &table, backup))
     DBUG_RETURN(NULL);
-   
-  if (!table.table->key_info)
-  {
-    my_error(ER_TABLE_CORRUPT, MYF(0), table.table->s->db.str,
-             table.table->s->table_name.str);
-    goto err;
-  }
 
   if (!proc_table_intact.check(table.table, &proc_table_def))
     DBUG_RETURN(table.table);
 
-err:
   close_system_tables(thd, backup);
+
   DBUG_RETURN(NULL);
 }
 
@@ -2435,9 +2428,11 @@ uint sp_get_flags_for_command(LEX *lex)
   case SQLCOM_SHOW_ENGINE_STATUS:
   case SQLCOM_SHOW_ENGINE_LOGS:
   case SQLCOM_SHOW_ENGINE_MUTEX:
+  case SQLCOM_SHOW_ENGINE_TRX:
   case SQLCOM_SHOW_EVENTS:
   case SQLCOM_SHOW_KEYS:
   case SQLCOM_SHOW_MASTER_STAT:
+  case SQLCOM_SHOW_MEMORY_STATUS:
   case SQLCOM_SHOW_OPEN_TABLES:
   case SQLCOM_SHOW_PRIVILEGES:
   case SQLCOM_SHOW_PROCESSLIST:
@@ -2453,6 +2448,7 @@ uint sp_get_flags_for_command(LEX *lex)
   case SQLCOM_SHOW_VARIABLES:
   case SQLCOM_SHOW_WARNS:
   case SQLCOM_REPAIR:
+  case SQLCOM_FIND_GTID_POSITION:
     flags= sp_head::MULTI_RESULTS;
     break;
   /*

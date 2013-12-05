@@ -289,9 +289,7 @@ page_cur_search_with_match(
 	ulint		dbg_matched_fields;
 	ulint		dbg_matched_bytes;
 #endif
-#ifdef UNIV_ZIP_DEBUG
 	const page_zip_des_t*	page_zip = buf_block_get_page_zip(block);
-#endif /* UNIV_ZIP_DEBUG */
 	mem_heap_t*	heap		= NULL;
 	ulint		offsets_[REC_OFFS_NORMAL_SIZE];
 	ulint*		offsets		= offsets_;
@@ -311,9 +309,10 @@ page_cur_search_with_match(
 			      || mode == PAGE_CUR_G || mode == PAGE_CUR_GE);
 #endif /* UNIV_DEBUG */
 	page = buf_block_get_frame(block);
-#ifdef UNIV_ZIP_DEBUG
-	ut_a(!page_zip || page_zip_validate(page_zip, page, index));
-#endif /* UNIV_ZIP_DEBUG */
+
+	if (UNIV_UNLIKELY(page_zip_debug)) {
+		ut_a(!page_zip || page_zip_validate(page_zip, page, index));
+	}
 
 	page_check_dir(page);
 
@@ -1207,9 +1206,10 @@ page_cur_insert_rec_zip(
 	      == index->id || mtr->inside_ibuf || recv_recovery_is_on());
 
 	ut_ad(!page_cur_is_after_last(cursor));
-#ifdef UNIV_ZIP_DEBUG
-	ut_a(page_zip_validate(page_zip, page, index));
-#endif /* UNIV_ZIP_DEBUG */
+
+	if (UNIV_UNLIKELY(page_zip_debug)) {
+		ut_a(page_zip_validate(page_zip, page, index));
+	}
 
 	/* 1. Get the size of the physical record in the page */
 	rec_size = rec_offs_size(offsets);
@@ -1242,7 +1242,7 @@ page_cur_insert_rec_zip(
 	    || reorg_before_insert) {
 		/* The values can change dynamically. */
 		bool	log_compressed	= page_zip_log_pages;
-		ulint	level		= page_zip_level;
+		uchar	compression_flags		= page_zip_compression_flags;
 #ifdef UNIV_DEBUG
 		rec_t*	cursor_rec	= page_cur_get_rec(cursor);
 #endif /* UNIV_DEBUG */
@@ -1280,7 +1280,7 @@ page_cur_insert_rec_zip(
 			/* Insert into uncompressed page only, and
 			try page_zip_reorganize() afterwards. */
 		} else if (btr_page_reorganize_low(
-				   recv_recovery_is_on(), level,
+				   recv_recovery_is_on(), compression_flags,
 				   cursor, index, mtr)) {
 			ut_ad(!page_header_get_ptr(page, PAGE_FREE));
 
@@ -1335,12 +1335,12 @@ page_cur_insert_rec_zip(
 			if (!log_compressed) {
 				if (page_zip_compress(
 					    page_zip, page, index,
-					    level, NULL)) {
+					    compression_flags, NULL)) {
 					page_cur_insert_rec_write_log(
 						insert_rec, rec_size,
 						cursor->rec, index, mtr);
 					page_zip_compress_write_log_no_data(
-						level, page, index, mtr);
+						compression_flags, page, index, mtr);
 
 					rec_offs_make_valid(
 						insert_rec, index, offsets);
@@ -1387,7 +1387,9 @@ page_cur_insert_rec_zip(
 
 			/* Out of space: restore the page */
 			btr_blob_dbg_remove(page, index, "insert_zip_fail");
-			if (!page_zip_decompress(page_zip, page, FALSE)) {
+			const buf_block_t *block = page_cur_get_block(cursor);
+			if (!page_zip_decompress(page_zip, page, FALSE,
+						 buf_block_get_space(block))) {
 				ut_error; /* Memory corrupted? */
 			}
 			ut_ad(page_validate(page, index));
@@ -2011,11 +2013,8 @@ page_cur_delete_rec(
 	/* The record must not be the supremum or infimum record. */
 	ut_ad(page_rec_is_user_rec(current_rec));
 
-	if (page_get_n_recs(page) == 1 && !recv_recovery_is_on()) {
-		/* Empty the page, unless we are applying the redo log
-		during crash recovery. During normal operation, the
-		page_create_empty() gets logged as one of MLOG_PAGE_CREATE,
-		MLOG_COMP_PAGE_CREATE, MLOG_ZIP_PAGE_COMPRESS. */
+	if (page_get_n_recs(page) == 1) {
+		/* Empty the page. */
 		ut_ad(page_is_leaf(page));
 		/* Usually, this should be the root page,
 		and the whole index tree should become empty.
@@ -2108,9 +2107,9 @@ page_cur_delete_rec(
 		page_dir_balance_slot(page, page_zip, cur_slot_no);
 	}
 
-#ifdef UNIV_ZIP_DEBUG
-	ut_a(!page_zip || page_zip_validate(page_zip, page, index));
-#endif /* UNIV_ZIP_DEBUG */
+	if (UNIV_UNLIKELY(page_zip_debug)) {
+		ut_a(!page_zip || page_zip_validate(page_zip, page, index));
+	}
 }
 
 #ifdef UNIV_COMPILE_TEST_FUNCS

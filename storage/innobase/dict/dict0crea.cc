@@ -892,15 +892,11 @@ create:
 	for (index = UT_LIST_GET_FIRST(table->indexes);
 	     index;
 	     index = UT_LIST_GET_NEXT(indexes, index)) {
-		if (index->id == index_id) {
-			if (index->type & DICT_FTS) {
-				return(FIL_NULL);
-			} else {
-				root_page_no = btr_create(type, space, zip_size,
-							  index_id, index, mtr);
-				index->page = (unsigned int) root_page_no;
-				return(root_page_no);
-			}
+		if (index->id == index_id && !(index->type & DICT_FTS)) {
+			root_page_no = btr_create(type, space, zip_size,
+						  index_id, index, mtr);
+			index->page = (unsigned int) root_page_no;
+			return(root_page_no);
 		}
 	}
 
@@ -1656,7 +1652,7 @@ dict_create_add_foreigns_to_dictionary(
 
 	trx->op_info = "committing foreign key definitions";
 
-	trx_commit(trx);
+	trx_commit(trx, TRUE);
 
 	trx->op_info = "";
 
@@ -1832,7 +1828,7 @@ dict_create_add_tablespace_to_dictionary(
 
 	if (commit) {
 		trx->op_info = "committing tablespace and datafile definition";
-		trx_commit(trx);
+		trx_commit(trx, TRUE);
 	}
 
 	trx->op_info = "";

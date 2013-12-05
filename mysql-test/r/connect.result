@@ -18,6 +18,7 @@ proc
 procs_priv
 proxies_priv
 servers
+slave_gtid_info
 slave_master_info
 slave_relay_log_info
 slave_worker_info
@@ -56,6 +57,7 @@ proc
 procs_priv
 proxies_priv
 servers
+slave_gtid_info
 slave_master_info
 slave_relay_log_info
 slave_worker_info
@@ -107,6 +109,7 @@ proc
 procs_priv
 proxies_priv
 servers
+slave_gtid_info
 slave_master_info
 slave_relay_log_info
 slave_worker_info
@@ -404,15 +407,24 @@ DROP USER must_change@localhost;
 CREATE USER wl6587@localhost IDENTIFIED BY 'wl6587';
 ALTER USER wl6587@localhost PASSWORD EXPIRE;
 # non-interactive mysql should fail
-Warning: Using a password on the command line interface can be insecure.
 ERROR 1862 (HY000): Your password has expired. To log in you must change it using a client that supports expired passwords.
 # mysqladmin non-password should fail
-Warning: Using a password on the command line interface can be insecure.
 mysqladmin: connect to server at 'localhost' failed
 error: 'Your password has expired. To log in you must change it using a client that supports expired passwords.'
 # mysqladmin password should work
-Warning: Using a password on the command line interface can be insecure.
 DROP USER wl6587@localhost;
+#
+# Bug#70026: Auto reconnect does not work with 5.6 libmysqlclient
+#
+# Connect via TCP/IP.
+# Kill self.
+KILL CONNECTION_ID();
+ERROR 70100: Query execution was interrupted
+# Check reconnection.
+SELECT 1;
+1
+1
+# Disconnect.
 # ------------------------------------------------------------------
 # -- End of 5.6 tests
 # ------------------------------------------------------------------

@@ -9,6 +9,7 @@
 #include <my_sys.h>
 #include <my_bitmap.h>
 #include "rpl_slave.h"
+#include "rpl_gtid.h"
 
 /**
   Legends running throughout the module:
@@ -161,12 +162,11 @@ typedef struct st_slave_job_group
   char*    checkpoint_log_name;
   my_off_t checkpoint_relay_log_pos; // T-event lop_pos filled by W for CheckPoint
   char*    checkpoint_relay_log_name;
+  char *worker_last_gtid;
   volatile uchar done;  // Flag raised by W,  read and reset by Coordinator
   ulong    shifted;     // shift the last CP bitmap at receiving a new CP
   time_t   ts;          // Group's timestampt to update Seconds_behind_master
-#ifndef DBUG_OFF
-  bool     notified;    // to debug group_master_log_name change notification
-#endif
+
   /*
     Coordinator fills the struct with defaults and options at starting of 
     a group distribution.
@@ -177,6 +177,7 @@ typedef struct st_slave_job_group
     group_master_log_pos= group_relay_log_pos= 0;
     group_master_log_name= NULL; // todo: remove
     group_relay_log_name= NULL;
+    worker_last_gtid = NULL;
     worker_id= MTS_WORKER_UNDEF;
     total_seqno= seqno;
     checkpoint_log_name= NULL;
@@ -185,9 +186,6 @@ typedef struct st_slave_job_group
     checkpoint_relay_log_pos= 0;
     checkpoint_seqno= (uint) -1;
     done= 0;
-#ifndef DBUG_OFF
-    notified= false;
-#endif
   }
 } Slave_job_group;
 
@@ -302,10 +300,17 @@ public:
   virtual ~Slave_worker();
 
   Slave_jobs_queue jobs;   // assignment queue containing events to execute
+  ulong current_event_index; // index of the event in current group
+  // number of events executed in the current group before temporary error.
+  // last_current_event_index is the maximum of current_event_index over
+  // several runs of same transaction or group.
+  ulong last_current_event_index;
+  ulong trans_retries;  // transaction retries count by this slave worker
   mysql_mutex_t jobs_lock; // mutex for the jobs queue
   mysql_cond_t  jobs_cond; // condition variable for the jobs queue
   Relay_log_info *c_rli;   // pointer to Coordinator's rli
   DYNAMIC_ARRAY curr_group_exec_parts; // Current Group Executed Partitions
+  DYNAMIC_ARRAY worker_gtid_infos;
   bool curr_group_seen_begin; // is set to TRUE with explicit B-event
   ulong id;                 // numberic identifier of the Worker
 
@@ -325,7 +330,6 @@ public:
 
   volatile bool relay_log_change_notified; // Coord sets and resets, W can read
   volatile bool checkpoint_notified; // Coord sets and resets, W can read
-  volatile bool master_log_change_notified; // Coord sets and resets, W can read
   ulong bitmap_shifted;  // shift the last bitmap at receiving new CP
   // WQ current excess above the overrun level
   long wq_overrun_cnt;
@@ -345,6 +349,7 @@ public:
     When WQ length is dropped below overrun the counter is reset.
   */
   ulong excess_cnt;
+  char worker_last_gtid[Gtid::MAX_TEXT_LENGTH + 1];
   /*
     Coordinates of the last CheckPoint (CP) this Worker has
     acknowledged; part of is persisent data
@@ -373,10 +378,7 @@ public:
   int rli_init_info(bool);
   int flush_info(bool force= FALSE);
   static size_t get_number_worker_fields();
-  void slave_worker_ends_group(Log_event*, int);
-  const char *get_master_log_name();
-  ulonglong get_master_log_pos() { return master_log_pos; };
-  ulonglong set_master_log_pos(ulong val) { return master_log_pos= val; };
+  void slave_worker_ends_group(Log_event*, int&, bool&);
   bool commit_positions(Log_event *evt, Slave_job_group *ptr_g, bool force);
   bool reset_recovery_info();
   /**
@@ -398,27 +400,21 @@ public:
     rli_description_event= fdle;
   }
 
-  inline void reset_gaq_index() { gaq_index= c_rli->gaq->size; };
-  inline void set_gaq_index(ulong val)
-  { 
-    if (gaq_index == c_rli->gaq->size)
-      gaq_index= val;
-  };
-
 protected:
 
   virtual void do_report(loglevel level, int err_code,
                          const char *msg, va_list v_args) const;
 
 private:
-  ulong gaq_index;          // GAQ index of the current assignment 
-  ulonglong master_log_pos; // event's cached log_pos for possibile error report
   void end_info();
   bool read_info(Rpl_info_handler *from);
   bool write_info(Rpl_info_handler *to);
   Slave_worker& operator=(const Slave_worker& info);
   Slave_worker(const Slave_worker& info);
 };
+
+bool append_item_to_jobs(slave_job_item *job_item,
+                         Slave_worker *w, Relay_log_info *rli);
 
 TABLE* mts_move_temp_table_to_entry(TABLE*, THD*, db_worker_hash_entry*);
 TABLE* mts_move_temp_tables_to_thd(THD*, TABLE*);

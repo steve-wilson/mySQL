@@ -1,3 +1,4 @@
+
 /*****************************************************************************
 
 Copyright (c) 2005, 2013, Oracle and/or its affiliates. All Rights Reserved.
@@ -32,16 +33,48 @@ Created June 2005 by Marko Makela
 # define UNIV_INLINE
 #endif
 
-#include "mtr0types.h"
 #include "page0types.h"
 #include "buf0types.h"
+#ifndef UNIV_INNOCHECKSUM
+#include "mtr0types.h"
 #include "dict0types.h"
 #include "srv0srv.h"
 #include "trx0types.h"
 #include "mem0mem.h"
+#endif /* !UNIV_INNOCHECKSUM */
+#include "zlib.h"
+
+/* Below macros are used to calculate the memory requirement for zlib's
+compression/decompression streams */
+#define DEFLATE_MEMORY_BOUND(windowBits, memLevel) \
+    ((4L << (windowBits)) + (512L << (memLevel)) + (128UL << 10))
+
+#define INFLATE_MEMORY_BOUND(windowBits) \
+    ((1L << (windowBits)) + (128UL << 10))
 
 /* Compression level to be used by zlib. Settable by user. */
 extern uint	page_zip_level;
+
+#ifndef UNIV_INNOCHECKSUM
+extern ulint	malloc_cache_compress_len;
+extern ulint	malloc_cache_decompress_len;
+extern mem_block_cache_t*	malloc_cache_compress;
+extern mem_block_cache_t*	malloc_cache_decompress;
+#endif /* !UNIV_INNOCHECKSUM */
+
+
+/* Calculates block size as an upper bound required for memory, used for
+page_zip_compress and page_zip_decompress, and calls mem_block_cache_init
+which initializes the mem_block_cache with it */
+UNIV_INTERN
+void
+page_zip_init(void);
+
+/* Frees the malloc_cache_compress, and malloc_cache_decompress
+mem_blocks, and all the cached mem_blocks in the queue. */
+UNIV_INTERN
+void
+page_zip_close();
 
 /* Default compression level. */
 #define DEFAULT_COMPRESSION_LEVEL	6
@@ -49,7 +82,11 @@ extern uint	page_zip_level;
 /* Whether or not to log compressed page images to avoid possible
 compression algorithm changes in zlib. */
 extern my_bool	page_zip_log_pages;
+extern my_bool page_zip_zlib_wrap;
+extern uint page_zip_zlib_strategy;
+extern my_bool page_zip_debug;
 
+#ifndef UNIV_INNOCHECKSUM
 /**********************************************************************//**
 Determine the size of a compressed page in bytes.
 @return	size in bytes */
@@ -112,6 +149,7 @@ page_zip_set_alloc(
 /*===============*/
 	void*		stream,		/*!< in/out: zlib stream */
 	mem_heap_t*	heap);		/*!< in: memory heap to use */
+#endif /* !UNIV_INNOCHECKSUM */
 
 /**********************************************************************//**
 Compress a page.
@@ -125,9 +163,13 @@ page_zip_compress(
 				m_start, m_end, m_nonempty */
 	const page_t*	page,	/*!< in: uncompressed page */
 	dict_index_t*	index,	/*!< in: index of the B-tree node */
-	ulint		level,	/*!< in: compression level */
+	uchar		compression_flags,	/*!< in: compression options to be used */
 	mtr_t*		mtr)	/*!< in: mini-transaction, or NULL */
 	__attribute__((nonnull(1,2,3)));
+
+#define page_zip_decompress(page_zip, page, all, space_id) \
+		page_zip_decompress_low((page_zip), (page), (all), \
+		                        (space_id), NULL, NULL)
 
 /**********************************************************************//**
 Decompress a page.  This function should tolerate errors on the compressed
@@ -136,15 +178,26 @@ inconsistency is detected.
 @return	TRUE on success, FALSE on failure */
 UNIV_INTERN
 ibool
-page_zip_decompress(
+page_zip_decompress_low(
 /*================*/
 	page_zip_des_t*	page_zip,/*!< in: data, ssize;
 				out: m_start, m_end, m_nonempty, n_blobs */
 	page_t*		page,	/*!< out: uncompressed page, may be trashed */
-	ibool		all)	/*!< in: TRUE=decompress the whole page;
+	ibool		all,	/*!< in: TRUE=decompress the whole page;
 				FALSE=verify but do not copy some
 				page header fields that should not change
 				after page creation */
+#ifndef UNIV_INNOCHECKSUM
+	ulint space_id,
+	mem_heap_t** heap_ptr, /*!< out: if index_ptr is not NULL then
+	*heap_ptr is set to the heap that is allocated by this function. The
+	caller is responsible for freeing the heap. */
+	dict_index_t** index_ptr) /*!< out: if index_ptr is not NULL then
+	*index_ptr is set to the index object that's created by this function.
+	The caller is responsible for calling dict_index_mem_free(). */
+#else
+	ulint space_id)
+#endif
 	__attribute__((nonnull(1,2)));
 
 #ifdef UNIV_DEBUG
@@ -159,7 +212,6 @@ page_zip_simple_validate(
 						descriptor */
 #endif /* UNIV_DEBUG */
 
-#ifdef UNIV_ZIP_DEBUG
 /**********************************************************************//**
 Check that the compressed and decompressed pages match.
 @return	TRUE if valid, FALSE if not */
@@ -183,8 +235,8 @@ page_zip_validate(
 	const page_t*		page,	/*!< in: uncompressed page */
 	const dict_index_t*	index)	/*!< in: index of the page, if known */
 	__attribute__((nonnull(1,2)));
-#endif /* UNIV_ZIP_DEBUG */
 
+#ifndef UNIV_INNOCHECKSUM
 /**********************************************************************//**
 Determine how big record can be inserted without recompressing the page.
 @return a positive number indicating the maximum size of a record
@@ -418,6 +470,8 @@ page_zip_reorganize(
 	dict_index_t*	index,	/*!< in: index of the B-tree node */
 	mtr_t*		mtr)	/*!< in: mini-transaction */
 	__attribute__((nonnull));
+#endif /* !UNIV_INNOCHECKSUM */
+
 #ifndef UNIV_HOTBACKUP
 /**********************************************************************//**
 Copy the records of a page byte for byte.  Do not copy the page header
@@ -474,16 +528,47 @@ page_zip_verify_checksum(
 /*=====================*/
 	const void*	data,	/*!< in: compressed page */
 	ulint		size);	/*!< in: size of compressed page */
+
+#ifndef UNIV_INNOCHECKSUM
 /**********************************************************************//**
 Write a log record of compressing an index page without the data on the page. */
 UNIV_INLINE
 void
 page_zip_compress_write_log_no_data(
 /*================================*/
-	ulint		level,	/*!< in: compression level */
+	uchar		compression_flags,	/*!< in: compression options to be used */
 	const page_t*	page,	/*!< in: page that is compressed */
 	dict_index_t*	index,	/*!< in: index */
 	mtr_t*		mtr);	/*!< in: mtr */
+/**********************************************************************//**
+Read the compression level and other compression options from the compression
+flag. */
+UNIV_INLINE
+void
+page_zip_decode_compression_flags(
+/*=============================*/
+	uchar  flags,
+	uint*  level,
+	uint*  no_wrap,
+	uint*  strategy);
+
+/**********************************************************************//**
+Write the compression level and other compression options into the compression
+flag and return it. */
+UNIV_INLINE
+uchar
+page_zip_encode_compression_flags(
+/*=============================*/
+	uint  level,
+	uint  no_wrap,
+	uint  strategy);
+
+#define page_zip_compression_flags \
+    page_zip_encode_compression_flags( \
+    page_zip_level, \
+    page_zip_zlib_wrap, \
+    page_zip_zlib_strategy)
+
 /**********************************************************************//**
 Parses a log record of compressing an index page without the data.
 @return	end of log record or NULL */
@@ -505,6 +590,26 @@ UNIV_INLINE
 void
 page_zip_reset_stat_per_index();
 /*===========================*/
+
+/**********************************************************************//**
+This function determines the sign for window_bits and reads the zlib header
+from the decompress stream. The data may have been compressed with a negative
+(no adler32 headers) or a positive (with adler32 headers) window_bits.
+Regardless of the current value of page_zip_zlib_wrap, we always
+first try the positive window_bits then negative window_bits, because the
+surest way to determine if the stream has adler32 headers is to see if the
+stream begins with the zlib header together with the adler32 value of it.
+This adds a tiny bit of overhead for the pages that were compressed without
+adler32s.
+@return TRUE if stream is initialized and zlib header was read, FALSE
+if data can be decompressed with neither window_bits nor -window_bits */
+UNIV_INTERN
+ibool
+page_zip_init_d_stream(
+	z_stream* strm,
+	ulint window_bits,
+	ibool read_zlib_header);
+#endif /* !UNIV_INNOCHECKSUM */
 
 #ifndef UNIV_HOTBACKUP
 /** Check if a pointer to an uncompressed page matches a compressed page.
@@ -531,8 +636,10 @@ from outside the buffer pool.
 # define UNIV_INLINE	UNIV_INLINE_ORIGINAL
 #endif
 
+#ifndef UNIV_INNOCHECKSUM
 #ifndef UNIV_NONINL
 # include "page0zip.ic"
 #endif
+#endif /* !UNIV_INNOCHECKSUM */
 
 #endif /* page0zip_h */

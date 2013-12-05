@@ -360,11 +360,13 @@ enum enum_alter_inplace_result {
 */
 
 // WITH CONSISTENT SNAPSHOT option
-static const uint MYSQL_START_TRANS_OPT_WITH_CONS_SNAPSHOT = 1;
+static const uint MYSQL_START_TRANS_OPT_WITH_CONS_SNAPSHOT        = 1;
 // READ ONLY option
-static const uint MYSQL_START_TRANS_OPT_READ_ONLY          = 2;
+static const uint MYSQL_START_TRANS_OPT_READ_ONLY                 = 2;
 // READ WRITE option
-static const uint MYSQL_START_TRANS_OPT_READ_WRITE         = 4;
+static const uint MYSQL_START_TRANS_OPT_READ_WRITE                = 4;
+// WITH CONSISTENT INNODB SNAPSHOT option
+static const uint MYSQL_START_TRANS_OPT_WITH_CONS_INNODB_SNAPSHOT = 8;
 
 /* Flags for method is_fatal_error */
 #define HA_CHECK_DUP_KEY 1
@@ -685,6 +687,7 @@ enum enum_schema_tables
   SCH_FILES,
   SCH_GLOBAL_STATUS,
   SCH_GLOBAL_VARIABLES,
+  SCH_INDEX_STATISTICS,
   SCH_KEY_COLUMN_USAGE,
   SCH_OPEN_TABLES,
   SCH_OPTIMIZER_TRACE,
@@ -706,8 +709,11 @@ enum enum_schema_tables
   SCH_TABLE_CONSTRAINTS,
   SCH_TABLE_NAMES,
   SCH_TABLE_PRIVILEGES,
+  SCH_TABLE_STATISTICS,
+  SCH_DB_STATISTICS,
   SCH_TRIGGERS,
   SCH_USER_PRIVILEGES,
+  SCH_USER_STATISTICS,
   SCH_VARIABLES,
   SCH_VIEWS
 };
@@ -718,7 +724,8 @@ typedef struct st_foreign_key_info FOREIGN_KEY_INFO;
 typedef bool (stat_print_fn)(THD *thd, const char *type, uint type_len,
                              const char *file, uint file_len,
                              const char *status, uint status_len);
-enum ha_stat_type { HA_ENGINE_STATUS, HA_ENGINE_LOGS, HA_ENGINE_MUTEX };
+enum ha_stat_type { HA_ENGINE_STATUS, HA_ENGINE_LOGS, HA_ENGINE_MUTEX,
+                    HA_ENGINE_TRX };
 extern st_plugin_int *hton2plugin[MAX_HA];
 
 /* Transaction log maintains type definitions */
@@ -858,10 +865,12 @@ struct handlerton
      NOTE 'all' is also false in auto-commit mode where 'end of statement'
      and 'real commit' mean the same event.
    */
-   int  (*commit)(handlerton *hton, THD *thd, bool all);
+   int  (*commit)(handlerton *hton, THD *thd, bool all, bool async);
+   bool (*is_fake_change)(handlerton *hton, THD *thd);
    int  (*rollback)(handlerton *hton, THD *thd, bool all);
-   int  (*prepare)(handlerton *hton, THD *thd, bool all);
-   int  (*recover)(handlerton *hton, XID *xid_list, uint len);
+   int  (*prepare)(handlerton *hton, THD *thd, bool all, bool async);
+   int  (*recover)(handlerton *hton, XID *xid_list, uint len,
+                   char *binlog_file, my_off_t *binlog_pos);
    int  (*commit_by_xid)(handlerton *hton, XID *xid);
    int  (*rollback_by_xid)(handlerton *hton, XID *xid);
    void *(*create_cursor_read_view)(handlerton *hton, THD *thd);
@@ -870,7 +879,11 @@ struct handlerton
    handler *(*create)(handlerton *hton, TABLE_SHARE *table, MEM_ROOT *mem_root);
    void (*drop_database)(handlerton *hton, char* path);
    int (*panic)(handlerton *hton, enum ha_panic_function flag);
-   int (*start_consistent_snapshot)(handlerton *hton, THD *thd);
+   int (*start_consistent_snapshot)(handlerton *hton, THD *thd,
+                                    char *binlog_file,
+                                    ulonglong* binlog_pos,
+                                    char **gtid_executed,
+                                    int* gtid_executed_length);
    bool (*flush_logs)(handlerton *hton);
    bool (*show_status)(handlerton *hton, THD *thd, stat_print_fn *print, enum ha_stat_type stat);
    uint (*partition_flags)();
@@ -952,6 +965,19 @@ struct handlerton
                                     const char *table_name,
                                     bool is_sql_layer_system_table);
 
+  void (*update_table_stats)(void (*cb)(const char *db, const char *tbl,
+					bool is_partition,
+					my_io_perf_t *r, my_io_perf_t *w,
+					my_io_perf_t *r_blob,
+                                        my_io_perf_t *r_primary,
+                                        my_io_perf_t *r_secondary,
+                                        page_stats_t* page_stats,
+                                        comp_stat_t* comp_stat,
+                                        int n_lock_wait,
+                                        int n_lock_wait_timeout,
+					const char *engine));
+  void (*update_index_stats)(TABLE_STATS* table_stats);
+
    uint32 license; /* Flag for Engine License */
    void *data; /* Location for engines to keep personal structures */
 };
@@ -968,7 +994,6 @@ struct handlerton
 #define HTON_TEMPORARY_NOT_SUPPORTED (1 << 6) //Having temporary tables not supported
 #define HTON_SUPPORT_LOG_TABLES      (1 << 7) //Engine supports log tables
 #define HTON_NO_PARTITION            (1 << 8) //You can not partition these tables
-
 /*
   This flag should be set when deciding that the engine does not allow row based
   binary logging (RBL) optimizations.
@@ -982,17 +1007,6 @@ struct handlerton
   no meaning for replication.
 */
 #define HTON_NO_BINLOG_ROW_OPT       (1 << 9)
-
-/**
-  Engine supports extended keys. The flag allows to
-  use 'extended key' feature if the engine is able to
-  do it (has primary key values in the secondary key).
-  Note that handler flag HA_PRIMARY_KEY_IN_READ_INDEX is
-  actually partial case of HTON_SUPPORTS_EXTENDED_KEYS.
-*/
-
-#define HTON_SUPPORTS_EXTENDED_KEYS  (1 << 10)
-
 
 enum enum_tx_isolation { ISO_READ_UNCOMMITTED, ISO_READ_COMMITTED,
 			 ISO_REPEATABLE_READ, ISO_SERIALIZABLE};
@@ -1371,8 +1385,7 @@ typedef struct st_key_create_information
   /**
     A flag to determine if we will check for duplicate indexes.
     This typically means that the key information was specified
-    directly by the user (set by the parser) or a column
-    associated with it was dropped.
+    directly by the user (set by the parser).
   */
   bool check_for_duplicate_indexes;
 } KEY_CREATE_INFO;
@@ -1700,18 +1713,43 @@ public:
   ulong check_time;
   ulong update_time;
   uint block_size;			/* index block size */
-  
+
+  void reset_table_stats();
+  bool has_table_stats();
+
+  /* Counts for TABLE_STATISTICS */
+  ulonglong rows_inserted;	/* count rows inserted */
+  ulonglong rows_updated;	/* count rows updated */
+  ulonglong rows_deleted;	/* count rows deleted */
+  ulonglong rows_read;		/* count row read attempts that return a row */
+  ulonglong rows_requested;	/* count row read attempts, successful or not */
+
+  /* Count row reads by access type */
+  volatile ulonglong rows_index_first;	/* first read of a row on index scan */
+  volatile ulonglong rows_index_next;	/* reads after first on index scan */
+
   /*
     number of buffer bytes that native mrr implementation needs,
   */
-  uint mrr_length_per_rec; 
+  uint mrr_length_per_rec;
+
+  my_io_perf_t table_io_perf_read;  /* per table IO perf counters */
+  my_io_perf_t table_io_perf_write; /* per table IO perf counters */
+  my_io_perf_t table_io_perf_read_blob; /* per table IO perf counters */
+  my_io_perf_t table_io_perf_read_primary;/* per table IO perf counters for
+                                             primary index */
+  my_io_perf_t table_io_perf_read_secondary;/* per table IO perf counters for
+                                               secondary index */
+  ulonglong index_inserts;          /* per table secondary index inserts */
 
   ha_statistics():
     data_file_length(0), max_data_file_length(0),
     index_file_length(0), delete_length(0), auto_increment_value(0),
     records(0), deleted(0), mean_rec_length(0), create_time(0),
     check_time(0), update_time(0), block_size(0)
-  {}
+  {
+    reset_table_stats();
+  }
 };
 
 uint calculate_key_len(TABLE *, uint, const uchar *, key_part_map);
@@ -1792,6 +1830,8 @@ protected:
   TABLE_SHARE *table_share;             /* The table definition */
   TABLE *table;                         /* The current open table */
   Table_flags cached_table_flags;       /* Set on init() and open() */
+  /* table_stats saves a hash table search when set. */
+  TABLE_STATS *table_stats;
 
   ha_rows estimation_rows_to_insert;
 public:
@@ -1852,6 +1892,8 @@ public:
   uint errkey;				/* Last dup key */
   uint key_used_on_scan;
   uint active_index;
+  /** Last value for active_index. Not set to MAX_KEY by index_end() */
+  uint last_active_index;
   /** Length of ref (1-8 or the clustered key length) */
   uint ref_length;
   FT_INFO *ft_handler;
@@ -1893,6 +1935,14 @@ public:
   uint auto_inc_intervals_count;
 
   /**
+     Max on-disk size of the table. Set to 0 when unlimited. Otherwise,
+     this is enforced on insert and update for MyISAM temp tables.
+  */
+  ulonglong max_bytes;
+  void set_max_bytes(ulonglong v) { max_bytes= v; }
+  ulonglong get_max_bytes() { return max_bytes; }
+
+  /**
     Instrumented table associated with this handler.
     This member should be set to NULL when no instrumentation is in place,
     so that linking an instrumented/non instrumented server/plugin works.
@@ -1927,16 +1977,17 @@ private:
 public:
   handler(handlerton *ht_arg, TABLE_SHARE *share_arg)
     :table_share(share_arg), table(0),
+    table_stats(NULL),
     estimation_rows_to_insert(0), ht(ht_arg),
     ref(0), range_scan_direction(RANGE_SCAN_ASC),
     in_range_check_pushed_down(false), end_range(NULL),
-    key_used_on_scan(MAX_KEY), active_index(MAX_KEY),
+    key_used_on_scan(MAX_KEY), active_index(MAX_KEY),last_active_index(MAX_KEY),
     ref_length(sizeof(my_off_t)),
     ft_handler(0), inited(NONE),
     implicit_emptied(0),
     pushed_cond(0), pushed_idx_cond(NULL), pushed_idx_cond_keyno(MAX_KEY),
     next_insert_id(0), insert_id_for_cur_row(0),
-    auto_inc_intervals_count(0),
+    auto_inc_intervals_count(0), max_bytes(0),
     m_psi(NULL), m_lock_type(F_UNLCK), ha_share(NULL)
     {
       DBUG_PRINT("info",
@@ -2011,7 +2062,7 @@ public:
   int ha_end_bulk_insert();
   int ha_bulk_update_row(const uchar *old_data, uchar *new_data,
                          uint *dup_key_found);
-  int ha_delete_all_rows();
+  int ha_delete_all_rows(ha_rows* nrows = NULL);
   int ha_truncate();
   int ha_reset_auto_increment(ulonglong value);
   int ha_optimize(THD* thd, HA_CHECK_OPT* check_opt);
@@ -2023,6 +2074,7 @@ public:
   int ha_rename_table(const char *from, const char *to);
   int ha_delete_table(const char *name);
   void ha_drop_table(const char *name);
+  int ha_defragment_table(const char *name, const char *index, bool async);
 
   int ha_create(const char *name, TABLE *form, HA_CREATE_INFO *info);
 
@@ -2070,6 +2122,9 @@ public:
   {
     table= table_arg;
     table_share= share;
+    table_stats= NULL;
+    // TODO: Assert that stats have been saved.
+    stats.reset_table_stats();
   }
   /* Estimates calculation */
   virtual double scan_time()
@@ -3001,6 +3056,21 @@ public:
     return 0;
   }
 
+  /* Update global per-table counters for work done by this handler. Should be
+     called at the end of a statement.
+  */
+  void update_global_table_stats(THD *thd);
+
+  /* Return true when innodb_fake_changes was set for the current transaction
+     on this handler.
+  */
+  virtual my_bool is_fake_change_enabled(THD *thd) { return FALSE; }
+
+  /**
+    Called by owner ha_partition (if there's one) to assign stats object
+  */
+  virtual void set_partition_owner_stats(ha_statistics* stats) {}
+
 protected:
   /* Service methods for use by storage engines. */
   void ha_statistic_increment(ulonglong SSV::*offset) const;
@@ -3038,7 +3108,11 @@ private:
 
   virtual int open(const char *name, int mode, uint test_if_locked)=0;
   virtual int close(void)=0;
-  virtual int index_init(uint idx, bool sorted) { active_index= idx; return 0; }
+  virtual int index_init(uint idx, bool sorted)
+  {
+    last_active_index= active_index= idx;
+    return 0;
+  }
   virtual int index_end() { active_index= MAX_KEY; return 0; }
   /**
     rnd_init() can be called two times without rnd_end() in between
@@ -3159,8 +3233,10 @@ public:
     If the handler don't support this, then this function will
     return HA_ERR_WRONG_COMMAND and MySQL will delete the rows one
     by one.
+
+    @param nrows If not NULL, it will be set to the number of rows deleted
   */
-  virtual int delete_all_rows()
+  virtual int delete_all_rows(ha_rows* nrows = NULL)
   { return (my_errno=HA_ERR_WRONG_COMMAND); }
   /**
     Quickly remove all rows from a table.
@@ -3199,6 +3275,8 @@ public:
   virtual int discard_or_import_tablespace(my_bool discard)
   { return (my_errno=HA_ERR_WRONG_COMMAND); }
   virtual void drop_table(const char *name);
+  virtual int defragment_table(const char *name, const char *index, bool async)
+  { return HA_ADMIN_NOT_IMPLEMENTED; }
   virtual int create(const char *name, TABLE *form, HA_CREATE_INFO *info)=0;
 
   virtual int create_handler_files(const char *name, const char *old_name,
@@ -3380,6 +3458,22 @@ int ha_delete_table(THD *thd, handlerton *db_type, const char *path,
 /* statistics and info */
 bool ha_show_status(THD *thd, handlerton *db_type, enum ha_stat_type stat);
 
+/* Get updated table statistics from all engines */
+void ha_get_table_stats(void (*cb)(const char* db, const char* tbl,
+				   bool is_partition,
+				   my_io_perf_t* r, my_io_perf_t* w,
+				   my_io_perf_t* r_blob,
+                                   my_io_perf_t* r_primary,
+                                   my_io_perf_t* r_secondary,
+                                   page_stats_t* page_stats,
+                                   comp_stat_t* comp_stat,
+                                   int n_lock_wait,
+                                   int n_lock_wait_timeout,
+				   const char* engine));
+
+void ha_get_index_stats(void* table_stats);
+
+
 /* discovery */
 int ha_create_table_from_engine(THD* thd, const char *db, const char *name);
 bool ha_check_if_table_exists(THD* thd, const char *db, const char *name,
@@ -3402,20 +3496,24 @@ int ha_change_key_cache(KEY_CACHE *old_key_cache, KEY_CACHE *new_key_cache);
 int ha_release_temporary_latches(THD *thd);
 
 /* transactions: interface to handlerton functions */
-int ha_start_consistent_snapshot(THD *thd);
+int ha_start_consistent_snapshot(THD *thd, char *binlog_file,
+                                 ulonglong* binlog_pos,
+                                 char **gtid_executed,
+                                 int* gtid_executed_length);
 int ha_commit_or_rollback_by_xid(THD *thd, XID *xid, bool commit);
-int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock= false);
+int ha_commit_trans(THD *thd, bool all, bool async, bool ignore_global_read_lock= false);
 int ha_rollback_trans(THD *thd, bool all);
 int ha_prepare(THD *thd);
-int ha_recover(HASH *commit_list);
+int ha_recover(HASH *commit_list, char *binlog_file = NULL,
+               my_off_t *binlog_pos = NULL);
 
 /*
  transactions: interface to low-level handlerton functions. These are
  intended to be used by the transaction coordinators to
  commit/prepare/rollback transactions in the engines.
 */
-int ha_commit_low(THD *thd, bool all, bool run_after_commit= true);
-int ha_prepare_low(THD *thd, bool all);
+int ha_commit_low(THD *thd, bool all, bool async);
+int ha_prepare_low(THD *thd, bool all, bool async);
 int ha_rollback_low(THD *thd, bool all);
 
 /* transactions: these functions never call handlerton functions directly */

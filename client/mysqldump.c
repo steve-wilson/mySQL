@@ -47,6 +47,7 @@
 #include <m_ctype.h>
 #include <hash.h>
 #include <stdarg.h>
+#include <my_list.h>
 
 #include "client_priv.h"
 #include "my_default.h"
@@ -84,6 +85,21 @@
 #define IGNORE_DATA 0x01 /* don't dump data for this table */
 #define IGNORE_INSERT_DELAYED 0x02 /* table doesn't support INSERT DELAYED */
 
+typedef enum {
+  KEY_TYPE_NONE,
+  KEY_TYPE_PRIMARY,
+  KEY_TYPE_UNIQUE,
+  KEY_TYPE_NON_UNIQUE
+} key_type_t;
+
+/* general_log or slow_log tables under mysql database */
+static inline my_bool general_log_or_slow_log_tables(const char *db, 
+                                                     const char *table)
+{
+  return (strcmp(db, "mysql") == 0) &&
+         ((strcmp(table, "general_log") == 0) ||
+          (strcmp(table, "slow_log") == 0));
+}
 
 static void add_load_option(DYNAMIC_STRING *str, const char *option,
                              const char *option_value);
@@ -126,6 +142,10 @@ static char compatible_mode_normal_str[255];
 /* Server supports character_set_results session variable? */
 static my_bool server_supports_switching_charsets= TRUE;
 static ulong opt_compatible_mode= 0;
+static ulong opt_timeout = 0;
+static ulong opt_lra_size = 0;
+static ulong opt_lra_sleep = 0;
+static ulong opt_lra_n_node_recs_before_sleep = 0;
 #define MYSQL_OPT_MASTER_DATA_EFFECTIVE_SQL 1
 #define MYSQL_OPT_MASTER_DATA_COMMENTED_SQL 2
 #define MYSQL_OPT_SLAVE_DATA_EFFECTIVE_SQL 1
@@ -157,6 +177,11 @@ static char *shared_memory_base_name=0;
 #endif
 static uint opt_protocol= 0;
 static char *opt_plugin_dir= 0, *opt_default_auth= 0;
+
+static my_bool server_supports_sql_no_fcache= FALSE;
+
+static my_bool opt_innodb_optimize_keys= FALSE;
+static my_bool opt_print_ordering_key= FALSE;
 
 /*
 Dynamic_string wrapper functions. In this file use these
@@ -202,6 +227,8 @@ TYPELIB compatible_mode_typelib= {array_elements(compatible_mode_names) - 1,
                                   "", compatible_mode_names, NULL};
 
 HASH ignore_table;
+
+LIST *skipped_keys_list;
 
 static struct my_option my_long_options[] =
 {
@@ -372,6 +399,15 @@ static struct my_option my_long_options[] =
    "in dump produced with --dump-slave.", &opt_include_master_host_port,
    &opt_include_master_host_port, 0, GET_BOOL, NO_ARG,
    0, 0, 0, 0, 0, 0},
+  {"innodb-optimize-keys", OPT_INNODB_OPTIMIZE_KEYS,
+   "Use InnoDB fast index creation by creating secondary indexes after "
+   "dumping the data.",
+   &opt_innodb_optimize_keys, &opt_innodb_optimize_keys, 0, GET_BOOL, NO_ARG,
+   0, 0, 0, 0, 0, 0},
+  {"print-ordering-key", OPT_PRINT_ORDERING_KEY,
+   "Print the key used for ordering rows in the dumpfile",
+   &opt_print_ordering_key, &opt_print_ordering_key, 0 , GET_BOOL, NO_ARG,
+   0, 0, 0, 0, 0, 0},
   {"insert-ignore", OPT_INSERT_IGNORE, "Insert rows with INSERT IGNORE.",
    &opt_ignore, &opt_ignore, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0,
    0, 0},
@@ -389,6 +425,18 @@ static struct my_option my_long_options[] =
   {"log-error", OPT_ERROR_LOG_FILE, "Append warnings and errors to given file.",
    &log_error_file, &log_error_file, 0, GET_STR,
    REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+  {"lra_size", OPT_LRA_SIZE,
+   "Set innodb_lra_size for the session of this dump.",
+   &opt_lra_size, &opt_lra_size, 0, GET_ULONG, REQUIRED_ARG, 0, 0, 16384, 0,
+   0, 0},
+  {"lra_sleep", OPT_LRA_SLEEP,
+   "Set innodb_lra_sleep for the session of this dump.",
+   &opt_lra_sleep, &opt_lra_sleep, 0, GET_ULONG, REQUIRED_ARG, 0, 0, 1000, 0,
+   0, 0},
+  {"lra_n_node_recs_before_sleep", OPT_LRA_N_NODE_RECS_BEFORE_SLEEP,
+   "Set innodb_lra_n_node_recs_before_sleep for the session of this dump.",
+   &opt_lra_n_node_recs_before_sleep, &opt_lra_n_node_recs_before_sleep,
+   0, GET_ULONG, REQUIRED_ARG, 1024, 128, ULONG_MAX, 0, 0, 0},
   {"master-data", OPT_MASTER_DATA,
    "This causes the binary log position and filename to be appended to the "
    "output. If equal to 1, will print it as a CHANGE MASTER command; if equal"
@@ -488,8 +536,7 @@ static struct my_option my_long_options[] =
   */
   {"single-transaction", OPT_TRANSACTION,
    "Creates a consistent snapshot by dumping all tables in a single "
-   "transaction. Works ONLY for tables stored in storage engines which "
-   "support multiversioning (currently only InnoDB does); the dump is NOT "
+   "transaction. Works ONLY for tables stored in InnoDB; the dump is NOT "
    "guaranteed to be consistent for other storage engines. "
    "While a --single-transaction dump is in process, to ensure a valid "
    "dump file (correct table contents and binary log position), no other "
@@ -513,6 +560,10 @@ static struct my_option my_long_options[] =
    "and .txt files.) NOTE: This only works if mysqldump is run on the same "
    "machine as the mysqld server.",
    &path, &path, 0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+  {"timeout", OPT_TIMEOUT,
+   "Set data transfer timeouts for server-side session (default server setting, if 0)",
+   &opt_timeout, &opt_timeout, 0, GET_ULONG, REQUIRED_ARG, 0, 0, 3600*12, 0,
+   0, 0},
   {"tables", OPT_TABLES, "Overrides option --databases (-B).",
    0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0},
   {"triggers", OPT_TRIGGERS, "Dump triggers for each dumped table.",
@@ -1548,6 +1599,18 @@ static int connect_to_db(char *host, char *user,char *passwd)
     /* Don't switch charsets for 4.1 and earlier.  (bug#34192). */
     server_supports_switching_charsets= FALSE;
   } 
+
+  /* Check to see if we support SQL_NO_FCACHE on this server. */
+  if (mysql_query(mysql, "SELECT SQL_NO_FCACHE NOW()") == 0)
+  {
+    MYSQL_RES *res = mysql_store_result(mysql);
+    if (res)
+    {
+      mysql_free_result(res);
+    }
+    server_supports_sql_no_fcache= TRUE;
+  }
+
   /*
     As we're going to set SQL_MODE, it would be lost on reconnect, so we
     cannot reconnect.
@@ -1557,6 +1620,44 @@ static int connect_to_db(char *host, char *user,char *passwd)
               compatible_mode_normal_str);
   if (mysql_query_with_error_report(mysql, 0, buff))
     DBUG_RETURN(1);
+
+  if (opt_timeout)
+  {
+    my_snprintf(buff, sizeof(buff), "SET wait_timeout=%lu, "
+                "net_write_timeout=%lu", opt_timeout, opt_timeout);
+    if (mysql_query_with_error_report(mysql, 0, buff))
+      DBUG_RETURN(1);
+  }
+
+  if (opt_lra_size)
+  {
+    my_snprintf(buff, sizeof(buff), "SET innodb_lra_size=%lu", opt_lra_size);
+    if (mysql_query(mysql, buff))
+    {
+      fprintf(stderr,
+              "%s: Warning: Server does not support logical read ahead. "
+              "--lra* options will be ignored.\n", my_progname);
+    }
+    else
+    {
+      if (opt_lra_sleep)
+      {
+        my_snprintf(buff, sizeof(buff), "SET innodb_lra_sleep=%lu",
+                    opt_lra_sleep);
+        if (mysql_query_with_error_report(mysql, 0, buff))
+          DBUG_RETURN(1);
+      }
+      if (opt_lra_n_node_recs_before_sleep)
+      {
+        my_snprintf(buff, sizeof(buff),
+                    "SET innodb_lra_n_node_recs_before_sleep=%lu",
+                    opt_lra_n_node_recs_before_sleep);
+        if (mysql_query_with_error_report(mysql, 0, buff))
+          DBUG_RETURN(1);
+      }
+    }
+  }
+
   /*
     set time_zone to UTC to allow dumping date types between servers with
     different time zone settings
@@ -1899,7 +2000,7 @@ static void print_xml_row(FILE *xml_file, const char *row_name,
                           const char *str_create)
 {
   uint i;
-  my_bool body_found= 0;
+  my_bool DBUG_ONLY body_found= 0;
   char *create_stmt_ptr= NULL;
   ulong create_stmt_len= 0;
   MYSQL_FIELD *field;
@@ -2449,14 +2550,255 @@ static uint dump_routines_for_db(char *db)
   DBUG_RETURN(0);
 }
 
-/* general_log or slow_log tables under mysql database */
-static inline my_bool general_log_or_slow_log_tables(const char *db,
-                                                     const char *table)
+/*
+  Parse the specified key definition string and check if the key contains an
+  AUTO_INCREMENT column as the first key part. We only check for the first key
+  part, because unlike MyISAM, InnoDB does not allow the AUTO_INCREMENT column
+  as a secondary key column, i.e. the AUTO_INCREMENT column would not be
+  considered indexed for such key specification.
+*/
+static my_bool contains_autoinc_column(const char *autoinc_column,
+                                       const char *keydef,
+                                       key_type_t type)
 {
-  return (!my_strcasecmp(charset_info, db, "mysql")) &&
-          (!my_strcasecmp(charset_info, table, "general_log") ||
-           !my_strcasecmp(charset_info, table, "slow_log"));
+  char *from, *to;
+  uint idnum;
+
+  DBUG_ASSERT(type != KEY_TYPE_NONE);
+
+  if (autoinc_column == NULL || !(from= strchr(keydef, '`')))
+    return FALSE;
+
+  to= from;
+  idnum= 0;
+
+  while ((to= strchr(to + 1, '`')))
+  {
+    /*
+      Double backticks represent a backtick in identifier, rather than a quote
+      character.
+    */
+    if (to[1] == '`')
+    {
+      to++;
+      continue;
+    }
+
+    if (to <= from + 1)
+      break;                                    /* Broken key definition */
+
+    idnum++;
+
+    /*
+      Skip the check if it's the first identifier and we are processing a
+      secondary key.
+    */
+    if ((type == KEY_TYPE_PRIMARY || idnum != 1) &&
+        !strncmp(autoinc_column, from + 1, to - from - 1))
+      return TRUE;
+
+    /*
+      Check only the first (for PRIMARY KEY) or the second (for secondary keys)
+      quoted identifier.
+    */
+    if ((idnum == 1 + test(type != KEY_TYPE_PRIMARY)) ||
+        !(from= strchr(to + 1, '`')))
+      break;
+
+    to= from;
+  }
+
+  return FALSE;
 }
+
+
+/*
+  Remove secondary/foreign key definitions from a given SHOW CREATE TABLE string
+  and store them into a temporary list to be used later.
+
+  SYNOPSIS
+    skip_secondary_keys()
+    create_str                SHOW CREATE TABLE output
+    has_pk                    TRUE, if the table has PRIMARY KEY
+                              (or UNIQUE key on non-nullable columns)
+
+
+  DESCRIPTION
+
+    Stores all lines starting with "KEY" or "UNIQUE KEY"
+    into skipped_keys_list and removes them from the input string.
+    Ignoring FOREIGN KEYS constraints when creating the table is ok, because
+    mysqldump sets foreign_key_checks to 0 anyway.
+*/
+
+static void skip_secondary_keys(char *create_str, my_bool has_pk)
+{
+  char *ptr, *strend;
+  char *last_comma= NULL;
+  my_bool pk_processed= FALSE;
+  char *autoinc_column= NULL;
+  my_bool has_autoinc= FALSE;
+  key_type_t type;
+
+  strend= create_str + strlen(create_str);
+
+  ptr= create_str;
+  while (*ptr)
+  {
+    char *tmp, *orig_ptr, c;
+
+    orig_ptr= ptr;
+    /* Skip leading whitespace */
+    while (*ptr && my_isspace(charset_info, *ptr))
+      ptr++;
+
+    /* Read the next line */
+    for (tmp= ptr; *tmp != '\n' && *tmp != '\0'; tmp++);
+
+    c= *tmp;
+    *tmp= '\0'; /* so strstr() only processes the current line */
+
+    if (!strncmp(ptr, "UNIQUE KEY ", sizeof("UNIQUE KEY ") - 1))
+      type= KEY_TYPE_UNIQUE;
+    else if (!strncmp(ptr, "KEY ", sizeof("KEY ") - 1))
+      type= KEY_TYPE_NON_UNIQUE;
+    else if (!strncmp(ptr, "PRIMARY KEY ", sizeof("PRIMARY KEY ") - 1))
+      type= KEY_TYPE_PRIMARY;
+    else
+      type= KEY_TYPE_NONE;
+
+    has_autoinc= (type != KEY_TYPE_NONE) ?
+      contains_autoinc_column(autoinc_column, ptr, type) : FALSE;
+
+    /* Is it a secondary index definition? */
+    if (c == '\n' &&
+        ((type == KEY_TYPE_UNIQUE && (pk_processed || !has_pk)) ||
+         type == KEY_TYPE_NON_UNIQUE) && !has_autoinc)
+    {
+      char *data, *end= tmp - 1;
+
+      /* Remove the trailing comma */
+      if (*end == ',')
+        end--;
+      data= my_strndup(ptr, end - ptr + 1, MYF(MY_FAE));
+      skipped_keys_list= list_cons(data, skipped_keys_list);
+
+      memmove(orig_ptr, tmp + 1, strend - tmp);
+      ptr= orig_ptr;
+      strend-= tmp + 1 - ptr;
+
+      /* Remove the comma on the previos line */
+      if (last_comma != NULL)
+      {
+        *last_comma= ' ';
+      }
+    }
+    else
+    {
+      char *end;
+
+      if (last_comma != NULL && *ptr != ')')
+      {
+        /*
+          It's not the last line of CREATE TABLE, so we have skipped a key
+          definition. We have to restore the last removed comma.
+        */
+        *last_comma= ',';
+      }
+
+      /*
+        If we are skipping a key which indexes an AUTO_INCREMENT column, it is
+        safe to optimize all subsequent keys, i.e. we should not be checking for
+        that column anymore.
+      */
+      if (type != KEY_TYPE_NONE && has_autoinc)
+      {
+          DBUG_ASSERT(autoinc_column != NULL);
+
+          my_free(autoinc_column);
+          autoinc_column= NULL;
+      }
+
+      if ((has_pk && type == KEY_TYPE_UNIQUE && !pk_processed) ||
+          type == KEY_TYPE_PRIMARY)
+        pk_processed= TRUE;
+
+      if (strstr(ptr, "AUTO_INCREMENT") && *ptr == '`')
+      {
+        /*
+          The first secondary key defined on this column later cannot be
+          skipped, as CREATE TABLE would fail on import. Unless there is a
+          PRIMARY KEY and it indexes that column.
+        */
+        for (end= ptr + 1;
+             /* Skip double backticks as they are a part of identifier */
+             *end != '\0' && (*end != '`' || end[1] == '`');
+             end++)
+          /* empty */;
+
+        if (*end == '`' && end > ptr + 1)
+        {
+          DBUG_ASSERT(autoinc_column == NULL);
+
+          autoinc_column= my_strndup(ptr + 1, end - ptr - 1, MYF(MY_FAE));
+        }
+      }
+
+      *tmp= c;
+
+      if (tmp[-1] == ',')
+        last_comma= tmp - 1;
+      ptr= (*tmp == '\0') ? tmp : tmp + 1;
+    }
+  }
+
+  my_free(autoinc_column);
+}
+
+/*
+  Check if the table has a primary key defined either explicitly or
+  implicitly (i.e. a unique key on non-nullable columns).
+
+  SYNOPSIS
+    my_bool has_primary_key(const char *table_name)
+
+    table_name  quoted table name
+
+  RETURNS     TRUE if the table has a primary key
+
+  DESCRIPTION
+*/
+
+static my_bool has_primary_key(const char *table_name)
+{
+  MYSQL_RES  *res= NULL;
+  MYSQL_ROW  row;
+  char query_buff[QUERY_LENGTH];
+  my_bool has_pk= TRUE;
+
+  my_snprintf(query_buff, sizeof(query_buff),
+              "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE "
+              "TABLE_SCHEMA=DATABASE() AND TABLE_NAME='%s' AND "
+              "COLUMN_KEY='PRI'", table_name);
+  if (mysql_query(mysql, query_buff) || !(res= mysql_store_result(mysql)) ||
+      !(row= mysql_fetch_row(res)))
+  {
+    fprintf(stderr, "Warning: Couldn't determine if table %s has a "
+            "primary key (%s). "
+            "--innodb-optimize-keys may work inefficiently.\n",
+            table_name, mysql_error(mysql));
+    goto cleanup;
+  }
+
+  has_pk= atoi(row[0]) > 0;
+
+cleanup:
+  if (res)
+    mysql_free_result(res);
+
+  return has_pk;
+}
+
 
 /*
   get_table_structure -- retrievs database structure, prints out corresponding
@@ -2496,6 +2838,7 @@ static uint get_table_structure(char *table, char *db, char *table_type,
   my_bool    is_log_table;
   MYSQL_RES  *result;
   MYSQL_ROW  row;
+  my_bool    has_pk= FALSE;
   DBUG_ENTER("get_table_structure");
   DBUG_PRINT("enter", ("db: %s  table: %s", db, table));
 
@@ -2536,6 +2879,9 @@ static uint get_table_structure(char *table, char *db, char *table_type,
 
   result_table=     quote_name(table, table_buff, 1);
   opt_quoted_table= quote_name(table, table_buff2, 0);
+
+  if (opt_innodb_optimize_keys && !strcmp(table_type, "InnoDB"))
+    has_pk= has_primary_key(table);
 
   if (opt_order_by_primary)
     order_by= primary_key_fields(result_table);
@@ -2715,6 +3061,9 @@ static uint get_table_structure(char *table, char *db, char *table_type,
       }
 
       row= mysql_fetch_row(result);
+
+      if (opt_innodb_optimize_keys && !strcmp(table_type, "InnoDB"))
+        skip_secondary_keys(row[1], has_pk);
 
       is_log_table= general_log_or_slow_log_tables(db, table);
       if (is_log_table)
@@ -3367,6 +3716,36 @@ static char *alloc_query_str(ulong size)
 }
 
 
+
+/*
+  Perform delayed secondary index creation for --innodb-optimize-keys.
+*/
+
+static void restore_secondary_keys(char *table)
+{
+    if (skipped_keys_list)
+    {
+      uint keys;
+      skipped_keys_list= list_reverse(skipped_keys_list);
+      fprintf(md_result_file, "ALTER TABLE %s ", table);
+      for (keys= list_length(skipped_keys_list); keys > 0; keys--)
+      {
+        LIST *node= skipped_keys_list;
+        char *def= node->data;
+
+        fprintf(md_result_file, "ADD %s%s", def, (keys > 1) ? ", " : ";\n");
+
+        skipped_keys_list= list_delete(skipped_keys_list, node);
+        my_free(def);
+        my_free(node);
+      }
+
+      DBUG_ASSERT(skipped_keys_list == NULL);
+    }
+}
+
+
+
 /*
 
  SYNOPSIS
@@ -3388,12 +3767,13 @@ static void dump_table(char *table, char *db)
   char ignore_flag;
   char buf[200], table_buff[NAME_LEN+3];
   DYNAMIC_STRING query_string;
+  DYNAMIC_STRING explain_query_string;
   char table_type[NAME_LEN];
   char *result_table, table_buff2[NAME_LEN*2+3], *opt_quoted_table;
   int error= 0;
   ulong         rownr, row_break, total_length, init_length;
   uint num_fields;
-  MYSQL_RES     *res;
+  MYSQL_RES     *res = NULL;
   MYSQL_FIELD   *field;
   MYSQL_ROW     row;
   DBUG_ENTER("dump_table");
@@ -3410,11 +3790,15 @@ static void dump_table(char *table, char *db)
   if (strcmp(table_type, "VIEW") == 0)
     DBUG_VOID_RETURN;
 
+  result_table= quote_name(table,table_buff, 1);
+  opt_quoted_table= quote_name(table, table_buff2, 0);
+
   /* Check --no-data flag */
   if (opt_no_data)
   {
     verbose_msg("-- Skipping dump data for table '%s', --no-data was used\n",
                 table);
+    restore_secondary_keys(opt_quoted_table);
     DBUG_VOID_RETURN;
   }
 
@@ -3466,7 +3850,12 @@ static void dump_table(char *table, char *db)
 
     /* now build the query string */
 
-    dynstr_append_checked(&query_string, "SELECT /*!40001 SQL_NO_CACHE */ * INTO OUTFILE '");
+    dynstr_append_checked(&query_string, "SELECT /*!40001 SQL_NO_CACHE */ ");
+    if (server_supports_sql_no_fcache)
+    {
+      dynstr_append_checked(&query_string, "/*!50084 SQL_NO_FCACHE */ ");
+    }
+    dynstr_append_checked(&query_string, "* INTO OUTFILE '");
     dynstr_append_checked(&query_string, filename);
     dynstr_append_checked(&query_string, "'");
 
@@ -3513,7 +3902,12 @@ static void dump_table(char *table, char *db)
                   "\n--\n-- Dumping data for table %s\n--\n",
                   result_table);
     
-    dynstr_append_checked(&query_string, "SELECT /*!40001 SQL_NO_CACHE */ * FROM ");
+    dynstr_append_checked(&query_string, "SELECT /*!40001 SQL_NO_CACHE */ ");
+    if (server_supports_sql_no_fcache)
+    {
+      dynstr_append_checked(&query_string, "/*!50084 SQL_NO_FCACHE */ ");
+    }
+    dynstr_append_checked(&query_string, "* FROM ");
     dynstr_append_checked(&query_string, result_table);
 
     if (where)
@@ -3529,6 +3923,23 @@ static void dump_table(char *table, char *db)
 
       dynstr_append_checked(&query_string, " ORDER BY ");
       dynstr_append_checked(&query_string, order_by);
+    }
+
+    if (opt_print_ordering_key)
+    {
+      init_dynamic_string_checked(&explain_query_string, "EXPLAIN ", 1024, 1024);
+      dynstr_append_checked(&explain_query_string, query_string.str);
+      if (mysql_query(mysql, explain_query_string.str) ||
+          !(res = mysql_store_result(mysql)) ||
+          !(row = mysql_fetch_row(res)))
+      {
+        if(res)
+          mysql_free_result(res);
+        dynstr_free(&explain_query_string);
+        DB_error(mysql, "when trying to save the result of EXPLAIN SELECT *.");
+        goto err;
+      }
+      fprintf(md_result_file, "/* ORDERING KEY : %s */;\n", row[5]);
     }
 
     if (!opt_xml && !opt_compact)
@@ -3830,6 +4241,8 @@ static void dump_table(char *table, char *db)
       goto err;
     }
 
+    restore_secondary_keys(opt_quoted_table);
+
     /* Moved enable keys to before unlock per bug 15977 */
     if (opt_disable_keys)
     {
@@ -3848,6 +4261,9 @@ static void dump_table(char *table, char *db)
       check_io(md_result_file);
     }
     mysql_free_result(res);
+    print_comment(md_result_file, 0,
+                  "\n--\n-- Rows found for %s: %lu\n--\n",
+                  table, rownr);
   }
   dynstr_free(&query_string);
   DBUG_VOID_RETURN;
@@ -4380,8 +4796,7 @@ static int dump_all_tables_in_db(char *database)
   char table_buff[NAME_LEN*2+3];
   char hash_key[2*NAME_LEN+2];  /* "db.tablename" */
   char *afterdot;
-  my_bool general_log_table_exists= 0, slow_log_table_exists=0;
-  int using_mysql_db= !my_strcasecmp(charset_info, database, "mysql");
+  int using_mysql_db= my_strcasecmp(&my_charset_latin1, database, "mysql");
   DBUG_ENTER("dump_all_tables_in_db");
 
   afterdot= strmov(hash_key, database);
@@ -4392,6 +4807,22 @@ static int dump_all_tables_in_db(char *database)
   if (opt_xml)
     print_xml_tag(md_result_file, "", "\n", "database", "name=", database, NullS);
 
+  if (strcmp(database, "mysql") == 0)
+  {
+    char table_type[NAME_LEN];
+    char ignore_flag;
+    uint num_fields;
+    num_fields= get_table_structure((char *) "general_log", 
+                                    database, table_type, &ignore_flag);
+    if (num_fields == 0)
+      verbose_msg("-- Warning: get_table_structure() failed with some internal "
+                  "error for 'general_log' table\n");
+    num_fields= get_table_structure((char *) "slow_log", 
+                                    database, table_type, &ignore_flag);
+    if (num_fields == 0)
+      verbose_msg("-- Warning: get_table_structure() failed with some internal "
+                  "error for 'slow_log' table\n");
+  }
   if (lock_tables)
   {
     DYNAMIC_STRING query;
@@ -4437,26 +4868,6 @@ static int dump_all_tables_in_db(char *database)
         }
       }
     }
-    else
-    {
-      /*
-        If general_log and slow_log exists in the 'mysql' database,
-         we should dump the table structure. But we cannot
-         call get_table_structure() here as 'LOCK TABLES' query got executed
-         above on the session and that 'LOCK TABLES' query does not contain
-         'general_log' and 'slow_log' tables. (you cannot acquire lock
-         on log tables). Hence mark the existence of these log tables here and
-         after 'UNLOCK TABLES' query is executed on the session, get the table
-         structure from server and dump it in the file.
-      */
-      if (using_mysql_db)
-      {
-        if (!my_strcasecmp(charset_info, table, "general_log"))
-          general_log_table_exists= 1;
-        else if (!my_strcasecmp(charset_info, table, "slow_log"))
-          slow_log_table_exists= 1;
-      }
-    }
   }
   if (opt_events && mysql_get_server_version(mysql) >= 50106)
   {
@@ -4475,26 +4886,7 @@ static int dump_all_tables_in_db(char *database)
   }
   if (lock_tables)
     (void) mysql_query_with_error_report(mysql, 0, "UNLOCK TABLES");
-  if (using_mysql_db)
-  {
-    char table_type[NAME_LEN];
-    char ignore_flag;
-    if (general_log_table_exists)
-    {
-      if (!get_table_structure((char *) "general_log",
-                               database, table_type, &ignore_flag) )
-        verbose_msg("-- Warning: get_table_structure() failed with some internal "
-                    "error for 'general_log' table\n");
-    }
-    if (slow_log_table_exists)
-    {
-      if (!get_table_structure((char *) "slow_log",
-                               database, table_type, &ignore_flag) )
-        verbose_msg("-- Warning: get_table_structure() failed with some internal "
-                    "error for 'slow_log' table\n");
-    }
-  }
-  if (flush_privileges && using_mysql_db)
+  if (flush_privileges && using_mysql_db == 0)
   {
     fprintf(md_result_file,"\n--\n-- Flush Grant Tables \n--\n");
     fprintf(md_result_file,"\n/*! FLUSH PRIVILEGES */;\n");
@@ -4747,13 +5139,24 @@ static int dump_selected_tables(char *db, char **table_names, int tables)
   DBUG_RETURN(0);
 } /* dump_selected_tables */
 
+static void write_master_status_to_output(const char* filename,
+                                          const char* position) {
+  const char *comment_prefix=
+    (opt_master_data == MYSQL_OPT_MASTER_DATA_COMMENTED_SQL) ? "-- " : "";
+
+  print_comment(md_result_file, 0,
+                "\n--\n-- Position to start replication or point-in-time "
+                "recovery from\n--\n\n");
+  fprintf(md_result_file,
+          "%sCHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s;\n",
+          comment_prefix, filename, position);
+  check_io(md_result_file);
+}
 
 static int do_show_master_status(MYSQL *mysql_con)
 {
   MYSQL_ROW row;
   MYSQL_RES *master;
-  const char *comment_prefix=
-    (opt_master_data == MYSQL_OPT_MASTER_DATA_COMMENTED_SQL) ? "-- " : "";
   if (mysql_query_with_error_report(mysql_con, &master, "SHOW MASTER STATUS"))
   {
     return 1;
@@ -4763,14 +5166,7 @@ static int do_show_master_status(MYSQL *mysql_con)
     row= mysql_fetch_row(master);
     if (row && row[0] && row[1])
     {
-      /* SHOW MASTER STATUS reports file and position */
-      print_comment(md_result_file, 0,
-                    "\n--\n-- Position to start replication or point-in-time "
-                    "recovery from\n--\n\n");
-      fprintf(md_result_file,
-              "%sCHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s;\n",
-              comment_prefix, row[0], row[1]);
-      check_io(md_result_file);
+      write_master_status_to_output(row[0], row[1]);
     }
     else if (!ignore_errors)
     {
@@ -4930,12 +5326,6 @@ static int do_flush_tables_read_lock(MYSQL *mysql_con)
                                     "FLUSH TABLES WITH READ LOCK") );
 }
 
-
-static int do_unlock_tables(MYSQL *mysql_con)
-{
-  return mysql_query_with_error_report(mysql_con, 0, "UNLOCK TABLES");
-}
-
 static int get_bin_log_name(MYSQL *mysql_con,
                             char* buff_log_name, uint buff_len)
 {
@@ -4973,8 +5363,8 @@ static int purge_bin_logs_to(MYSQL *mysql_con, char* log_name)
   return err;
 }
 
-
-static int start_transaction(MYSQL *mysql_con)
+static int start_transaction(MYSQL *mysql_con, char* filename_out,
+                             char* pos_out)
 {
   verbose_msg("-- Starting transaction...\n");
   /*
@@ -4998,14 +5388,32 @@ static int start_transaction(MYSQL *mysql_con)
       exit(EX_MYSQLERR);
   }
 
-  return (mysql_query_with_error_report(mysql_con, 0,
-                                        "SET SESSION TRANSACTION ISOLATION "
-                                        "LEVEL REPEATABLE READ") ||
-          mysql_query_with_error_report(mysql_con, 0,
-                                        "START TRANSACTION "
-                                        "/*!40100 WITH CONSISTENT SNAPSHOT */"));
-}
+  if (mysql_query_with_error_report(mysql_con, 0,
+                                    "SET SESSION TRANSACTION ISOLATION "
+                                    "LEVEL REPEATABLE READ"))
+    return 1;
 
+  {
+    MYSQL_RES *res = NULL;
+
+    if (mysql_query_with_error_report(
+        mysql_con, &res,
+        "START TRANSACTION WITH CONSISTENT INNODB SNAPSHOT") || !res)
+      return 1;
+
+    {
+      MYSQL_ROW row = mysql_fetch_row(res);
+      if (!row || !row[0][0] || !row[1][0]) {
+        return 1;
+      }
+
+      strcpy(filename_out, row[0]);
+      strcpy(pos_out, row[1]);
+    }
+  }
+
+  return 0;
+}
 
 static ulong find_set(TYPELIB *lib, const char *x, uint length,
                       char **err_pos, uint *err_len)
@@ -5696,7 +6104,8 @@ static void dynstr_realloc_checked(DYNAMIC_STRING *str, ulong additional_size)
 
 int main(int argc, char **argv)
 {
-  char bin_log_name[FN_REFLEN];
+  char bin_log_name[FN_REFLEN] = "";
+  char bin_log_pos[21] = ""; // 20 digits plus trailing null byte
   int exit_code;
   MY_INIT("mysqldump");
 
@@ -5737,7 +6146,7 @@ int main(int argc, char **argv)
   if (opt_slave_data && do_stop_slave_sql(mysql))
     goto err;
 
-  if ((opt_lock_all_tables || opt_master_data ||
+  if ((opt_lock_all_tables ||
        (opt_single_transaction && flush_logs)) &&
       do_flush_tables_read_lock(mysql))
     goto err;
@@ -5746,7 +6155,7 @@ int main(int argc, char **argv)
     Flush logs before starting transaction since
     this causes implicit commit starting mysql-5.5.
   */
-  if (opt_lock_all_tables || opt_master_data ||
+  if (opt_lock_all_tables ||
       (opt_single_transaction && flush_logs) ||
       opt_delete_master_logs)
   {
@@ -5767,7 +6176,8 @@ int main(int argc, char **argv)
       goto err;
   }
 
-  if (opt_single_transaction && start_transaction(mysql))
+  if (opt_single_transaction &&
+      start_transaction(mysql, bin_log_name, bin_log_pos))
     goto err;
 
   /* Add 'STOP SLAVE to beginning of dump */
@@ -5779,12 +6189,15 @@ int main(int argc, char **argv)
   if (process_set_gtid_purged(mysql))
     goto err;
 
-
-  if (opt_master_data && do_show_master_status(mysql))
-    goto err;
+  if (opt_master_data) {
+    if (bin_log_name[0] && bin_log_pos[0]) {
+      write_master_status_to_output(bin_log_name, bin_log_pos);
+    } else {
+      if (do_show_master_status(mysql))
+        goto err;
+    }
+  }
   if (opt_slave_data && do_show_slave_status(mysql))
-    goto err;
-  if (opt_single_transaction && do_unlock_tables(mysql)) /* unlock but no commit! */
     goto err;
 
   if (opt_alltspcs)

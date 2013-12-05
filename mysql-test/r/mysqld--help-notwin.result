@@ -11,6 +11,9 @@ The following options may be given as the first argument:
  --abort-slave-event-count=# 
  Option used by mysql-test for debugging and testing of
  replication.
+ --allow-noncurrent-db-rw=name 
+ Switch to allow/deny reads and writes to a table not in
+ the current database.
  --allow-suspicious-udfs 
  Allows use of UDFs consisting of only one symbol xxx()
  without corresponding xxx_init() or xxx_deinit(). That
@@ -165,6 +168,8 @@ The following options may be given as the first argument:
  client that does INSERT DELAYED will wait until there is
  room in the queue again.This variable is deprecated along
  with INSERT DELAYED.
+ --disable-working-set-size 
+ Do not maintain working set size if on
  --disconnect-on-expired-password 
  Give clients that don't signal password expiration
  support execution time error(s) instead of connection
@@ -196,6 +201,10 @@ The following options may be given as the first argument:
  and DISABLED (keep the event scheduler completely
  deactivated, it cannot be activated run-time)
  -T, --exit-info[=#] Used for debugging. Use at your own risk.
+ --expand-fast-index-creation 
+ Enable/disable improvements to the InnoDB fast index
+ creation functionality. Has no effect when fast index
+ creation is disabled with the fast-index-creation option
  --expire-logs-days=# 
  If non-zero, binary logs will be purged after
  expire_logs_days days; possible purges happen at startup
@@ -305,6 +314,10 @@ The following options may be given as the first argument:
  row based binary log.  If equal to 0, then the latest
  version of events are written.  This option is useful
  during some upgrades.
+ --log-datagram      Enable logging queries to a unix local datagram socket
+ --log-datagram-usecs=# 
+ Log queries longer than log-datagram-usecs to a unix
+ local datagram socket
  --log-error[=name]  Error log file
  --log-isam[=name]   Log all MyISAM changes to file.
  --log-output=name   Syntax: log-output=value[,value...], where "value" could
@@ -323,6 +336,7 @@ The following options may be given as the first argument:
  --log-slow-admin-statements 
  Log slow OPTIMIZE, ANALYZE, ALTER and other
  administrative statements to the slow log if it is open.
+ --log-slow-extra    Print more attributes to the slow query log
  --log-slow-slave-statements 
  Log slow statements executed by slave thread to the slow
  log if it is open.
@@ -454,6 +468,11 @@ The following options may be given as the first argument:
  --myisam-use-mmap   Use memory mapping for reading and writing MyISAM tables
  --net-buffer-length=# 
  Buffer length for TCP/IP and socket communication
+ --net-compression-level=# 
+ Compression level for compressed master/slave protocol
+ (when enabled) and client connections (when requested). 0
+ is no compression (for testing), 1 is fastest, 9 is
+ slowest, 6 is default.
  --net-read-timeout=# 
  Number of seconds to wait for more data from a connection
  before aborting the read
@@ -519,6 +538,10 @@ The following options may be given as the first argument:
  Maximum allowed cumulated size of stored optimizer traces
  --optimizer-trace-offset=# 
  Offset of first optimizer trace to show; see manual
+ --peak-lag-sample-rate=# 
+ The rate of sampling replayed events on slave to
+ determine the peak replication lag over some period.
+ --peak-lag-time=#   The time frame peak lag is measured within, in seconds.
  --performance-schema 
  Enable the performance schema.
  (Defaults to on; use --skip-performance-schema to disable.)
@@ -665,8 +688,9 @@ The following options may be given as the first argument:
  --preload-buffer-size=# 
  The size of the buffer that is allocated when preloading
  indexes
- --profiling-history-size=# 
- Limit of query profiling memory
+ --process-can-disable-bin-log 
+ Allow PROCESS to disable bin log, not just SUPER
+ (Defaults to on; use --skip-process-can-disable-bin-log to disable.)
  --query-alloc-block-size=# 
  Allocation block size for query parsing and execution
  --query-cache-limit=# 
@@ -792,9 +816,18 @@ The following options may be given as the first argument:
  not sure, leave this option unset
  --report-user=name  The account user name of the slave to be reported to the
  master during slave registration
- --rpl-stop-slave-timeout=# 
- Timeout in seconds to wait for slave to stop before
- returning a warning.
+ --reset-seconds-behind-master 
+ When TRUE reset Seconds_Behind_Master to 0 when SQL
+ thread catches up to the IO thread. This is the original
+ behavior but also causes reported lag to flip-flop
+ between 0 and the real lag when the IO thread is the
+ bottleneck.
+ (Defaults to on; use --skip-reset-seconds-behind-master to disable.)
+ --rpl-event-buffer-size=# 
+ The size of the preallocated event buffer for slave
+ connections that avoids calls to malloc & free for events
+ smaller than this.
+ --rpl-read-size=#   The size for reads done from the binlog and relay log.
  --safe-user-create  Don't allow new user creation by the user who has no
  write privileges to the mysql.user table.
  --secure-auth       Disallow authentication for accounts that have old
@@ -878,20 +911,17 @@ The following options may be given as the first argument:
  lock wait timeout, before giving up and stopping
  --slave-type-conversions=name 
  Set of slave type conversions that are enabled. Legal
- values are: ALL_LOSSY to enable lossy conversions,
- ALL_NON_LOSSY to enable non-lossy conversions,
- ALL_UNSIGNED to treat all integer column type data to be
- unsigned values, and ALL_SIGNED to treat all integer
- column type data to be signed values. Default treatment
- is ALL_SIGNED. If ALL_SIGNED and ALL_UNSIGNED both are
- specifed, ALL_SIGNED will take high priority than
- ALL_UNSIGNED. If the variable is assigned the empty set,
- no conversions are allowed and it is expected that the
- types match exactly.
+ values are: ALL_LOSSY to enable lossy conversions and
+ ALL_NON_LOSSY to enable non-lossy conversions. If the
+ variable is assigned the empty set, no conversions are
+ allowed and it is expected that the types match exactly.
  --slow-launch-time=# 
  If creating the thread takes longer than this value (in
  seconds), the Slow_launch_threads counter will be
  incremented
+ --slow-log-if-rows-examined-exceed[=#] 
+ Log queries that examine more than
+ slow_log_if_rows_examined_exceed rows to file.
  --slow-query-log    Log slow queries to a table or log file. Defaults logging
  to a file hostname-slow.log or a table mysql.slow_log if
  --log-output=TABLE is used. Must be enabled to activate
@@ -912,6 +942,8 @@ The following options may be given as the first argument:
  --stored-program-cache=# 
  The soft upper limit for number of cached stored routines
  for one connection.
+ --super-read-only   Enable read_only, and also block writes by users with the
+ SUPER privilege
  -s, --symbolic-links 
  Enable symbolic link support.
  --sync-binlog=#     Synchronously flush binary log to disk after every #th
@@ -983,9 +1015,13 @@ The following options may be given as the first argument:
  -V, --version       Output version information and exit.
  --wait-timeout=#    The number of seconds the server waits for activity on a
  connection before closing it
+ --working-duration=# 
+ The period of time for which we want working set size
+ statistics
 
 Variables (--variable-name=value)
 abort-slave-event-count 0
+allow-noncurrent-db-rw ON
 allow-suspicious-udfs FALSE
 auto-increment-increment 1
 auto-increment-offset 1
@@ -1025,6 +1061,7 @@ delay-key-write ON
 delayed-insert-limit 100
 delayed-insert-timeout 300
 delayed-queue-size 1000
+disable-working-set-size FALSE
 disconnect-on-expired-password TRUE
 disconnect-slave-event-count 0
 div-precision-increment 4
@@ -1032,6 +1069,7 @@ end-markers-in-json FALSE
 enforce-gtid-consistency FALSE
 eq-range-index-dive-limit 10
 event-scheduler OFF
+expand-fast-index-creation FALSE
 expire-logs-days 0
 explicit-defaults-for-timestamp FALSE
 external-locking FALSE
@@ -1070,6 +1108,8 @@ log-bin (No default value)
 log-bin-index (No default value)
 log-bin-trust-function-creators FALSE
 log-bin-use-v1-row-events FALSE
+log-datagram FALSE
+log-datagram-usecs 0
 log-error 
 log-isam myisam.log
 log-output FILE
@@ -1078,6 +1118,7 @@ log-raw FALSE
 log-short-format FALSE
 log-slave-updates FALSE
 log-slow-admin-statements FALSE
+log-slow-extra FALSE
 log-slow-slave-statements FALSE
 log-tc tc.log
 log-tc-size 24576
@@ -1125,6 +1166,7 @@ myisam-sort-buffer-size 8388608
 myisam-stats-method nulls_unequal
 myisam-use-mmap FALSE
 net-buffer-length 16384
+net-compression-level 6
 net-read-timeout 30
 net-retry-count 10
 net-write-timeout 60
@@ -1141,6 +1183,8 @@ optimizer-trace-features greedy_search=on,range_optimizer=on,dynamic_range=on,re
 optimizer-trace-limit 1
 optimizer-trace-max-mem-size 16384
 optimizer-trace-offset -1
+peak-lag-sample-rate 100
+peak-lag-time 60
 performance-schema TRUE
 performance-schema-accounts-size -1
 performance-schema-consumer-events-stages-current FALSE
@@ -1188,7 +1232,7 @@ performance-schema-users-size -1
 port ####
 port-open-timeout 0
 preload-buffer-size 32768
-profiling-history-size 15
+process-can-disable-bin-log TRUE
 query-alloc-block-size 8192
 query-cache-limit 1048576
 query-cache-min-res-unit 4096
@@ -1212,7 +1256,9 @@ report-host (No default value)
 report-password (No default value)
 report-port 0
 report-user (No default value)
-rpl-stop-slave-timeout 31536000
+reset-seconds-behind-master TRUE
+rpl-event-buffer-size 1048576
+rpl-read-size 8192
 safe-user-create FALSE
 secure-auth TRUE
 secure-file-priv (No default value)
@@ -1239,11 +1285,13 @@ slave-sql-verify-checksum TRUE
 slave-transaction-retries 10
 slave-type-conversions 
 slow-launch-time 2
+slow-log-if-rows-examined-exceed 0
 slow-query-log FALSE
 sort-buffer-size 262144
 sporadic-binlog-dump-fail FALSE
 sql-mode NO_ENGINE_SUBSTITUTION
 stored-program-cache 256
+super-read-only FALSE
 symbolic-links FALSE
 sync-binlog 0
 sync-frm TRUE
@@ -1267,6 +1315,7 @@ updatable-views-with-limit YES
 validate-user-plugins TRUE
 verbose TRUE
 wait-timeout 28800
+working-duration 3600
 
 To see what values a running MySQL server is using, type
 'mysqladmin variables' instead of 'mysqld --verbose --help'.

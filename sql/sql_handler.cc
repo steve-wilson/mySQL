@@ -134,7 +134,7 @@ static void mysql_ha_close_table(THD *thd, TABLE_LIST *tables)
     /* Non temporary table. */
     tables->table->file->ha_index_or_rnd_end();
     tables->table->open_by_handler= 0;
-    close_thread_table(thd, &tables->table);
+    close_thread_table(thd, &tables->table, true);
     thd->mdl_context.release_lock(tables->mdl_request.ticket);
   }
   else if (tables->table)
@@ -616,10 +616,7 @@ retry:
     /*
       Always close statement transaction explicitly,
       so that the engine doesn't have to count locks.
-      There should be no need to perform transaction
-      rollback due to deadlock.
     */
-    DBUG_ASSERT(! thd->transaction_rollback_request);
     trans_rollback_stmt(thd);
     mysql_ha_close_table(thd, hash_tables);
     goto retry;

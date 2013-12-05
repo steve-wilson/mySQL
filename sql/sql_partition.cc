@@ -178,8 +178,7 @@ int get_part_iter_for_interval_via_walking(partition_info *part_info,
 static int cmp_rec_and_tuple(part_column_list_val *val, uint32 nvals_in_rec);
 static int cmp_rec_and_tuple_prune(part_column_list_val *val,
                                    uint32 n_vals_in_rec,
-                                   bool is_left_endpoint,
-                                   bool include_endpoint);
+                                   bool tail_is_min);
 
 /*
   Convert constants in VALUES definition to the character set the
@@ -959,7 +958,6 @@ init_lex_with_single_table(THD *thd, TABLE *table, LEX *lex)
   table->map= 1; //To ensure correct calculation of const item
   table->get_fields_in_item_tree= TRUE;
   table_list->table= table;
-  table_list->cacheable_table= false;
   return FALSE;
 }
 
@@ -3230,6 +3228,44 @@ notfound:
 }
 
 
+/*
+  Find the sub-array part_info->list_array that corresponds to given interval
+
+  SYNOPSIS 
+    get_list_array_idx_for_endpoint()
+      part_info         Partitioning info (partitioning type must be LIST)
+      left_endpoint     TRUE  - the interval is [a; +inf) or (a; +inf)
+                        FALSE - the interval is (-inf; a] or (-inf; a)
+      include_endpoint  TRUE iff the interval includes the endpoint
+
+  DESCRIPTION
+    This function finds the sub-array of part_info->list_array where values of
+    list_array[idx].list_value are contained within the specifed interval.
+    list_array is ordered by list_value, so
+    1. For [a; +inf) or (a; +inf)-type intervals (left_endpoint==TRUE), the 
+       sought sub-array starts at some index idx and continues till array end.
+       The function returns first number idx, such that 
+       list_array[idx].list_value is contained within the passed interval.
+       
+    2. For (-inf; a] or (-inf; a)-type intervals (left_endpoint==FALSE), the
+       sought sub-array starts at array start and continues till some last 
+       index idx.
+       The function returns first number idx, such that 
+       list_array[idx].list_value is NOT contained within the passed interval.
+       If all array elements are contained, part_info->num_list_values is
+       returned.
+
+  NOTE
+    The caller will call this function and then will run along the sub-array of
+    list_array to collect partition ids. If the number of list values is 
+    significantly higher then number of partitions, this could be slow and
+    we could invent some other approach. The "run over list array" part is
+    already wrapped in a get_next()-like function.
+
+  RETURN
+    The edge of corresponding sub-array of part_info->list_array
+*/
+
 uint32 get_partition_id_cols_list_for_endpoint(partition_info *part_info,
                                                bool left_endpoint,
                                                bool include_endpoint,
@@ -3237,80 +3273,36 @@ uint32 get_partition_id_cols_list_for_endpoint(partition_info *part_info,
 {
   part_column_list_val *list_col_array= part_info->list_col_array;
   uint num_columns= part_info->part_field_list.elements;
-  uint list_index;
+  int list_index, cmp;
   uint min_list_index= 0;
-  uint max_list_index= part_info->num_list_values;
+  uint max_list_index= part_info->num_list_values - 1;
+  bool tailf= !(left_endpoint ^ include_endpoint);
   DBUG_ENTER("get_partition_id_cols_list_for_endpoint");
 
-  /* Find the matching partition (including taking endpoint into account). */
   do
   {
-    /* Midpoint, adjusted down, so it can never be > last index. */
     list_index= (max_list_index + min_list_index) >> 1;
-    if (cmp_rec_and_tuple_prune(list_col_array + list_index*num_columns,
-                                nparts, left_endpoint, include_endpoint) > 0)
+    cmp= cmp_rec_and_tuple_prune(list_col_array + list_index*num_columns,
+                                 nparts, tailf);
+    if (cmp > 0)
       min_list_index= list_index + 1;
-    else
-      max_list_index= list_index;
-  } while (max_list_index > min_list_index);
-  list_index= max_list_index;
-
-  /* Given value must be LESS THAN or EQUAL to the found partition. */
-  DBUG_ASSERT(list_index == part_info->num_list_values ||
-              (0 >= cmp_rec_and_tuple_prune(list_col_array +
-                                              list_index*num_columns,
-                                            nparts, left_endpoint,
-                                            include_endpoint)));
-  /* Given value must be GREATER THAN the previous partition. */
-  DBUG_ASSERT(list_index == 0 ||
-              (0 < cmp_rec_and_tuple_prune(list_col_array +
-                                            (list_index - 1)*num_columns,
-                                           nparts, left_endpoint,
-                                           include_endpoint)));
-
-  if (!left_endpoint)
-  {
-    /* Set the end after this list tuple if not already after the last. */
-    if (list_index < part_info->num_parts)
-      list_index++;
-  }
-
+    else if (cmp < 0)
+    {
+      if (!list_index)
+        goto notfound;
+      max_list_index= list_index - 1;
+    }
+    else 
+    {
+      DBUG_RETURN(list_index + test(!tailf));
+    }
+  } while (max_list_index >= min_list_index);
+  if (cmp > 0)
+    list_index++;
+notfound:
   DBUG_RETURN(list_index);
 }
 
-
-/**
-  Find the sub-array part_info->list_array that corresponds to given interval.
-
-  @param part_info         Partitioning info (partitioning type must be LIST)
-  @param left_endpoint     TRUE  - the interval is [a; +inf) or (a; +inf)
-                           FALSE - the interval is (-inf; a] or (-inf; a)
-  @param include_endpoint  TRUE iff the interval includes the endpoint
-
-  This function finds the sub-array of part_info->list_array where values of
-  list_array[idx].list_value are contained within the specifed interval.
-  list_array is ordered by list_value, so
-  1. For [a; +inf) or (a; +inf)-type intervals (left_endpoint==TRUE), the
-     sought sub-array starts at some index idx and continues till array end.
-     The function returns first number idx, such that
-     list_array[idx].list_value is contained within the passed interval.
-
-  2. For (-inf; a] or (-inf; a)-type intervals (left_endpoint==FALSE), the
-     sought sub-array starts at array start and continues till some last
-     index idx.
-     The function returns first number idx, such that
-     list_array[idx].list_value is NOT contained within the passed interval.
-     If all array elements are contained, part_info->num_list_values is
-     returned.
-
-  @note The caller will call this function and then will run along the
-  sub-array of list_array to collect partition ids. If the number of list
-  values is significantly higher then number of partitions, this could be slow
-  and we could invent some other approach. The "run over list array" part is
-  already wrapped in a get_next()-like function.
-
-  @return The index of corresponding sub-array of part_info->list_array.
-*/
 
 uint32 get_list_array_idx_for_endpoint_charset(partition_info *part_info,
                                                bool left_endpoint,
@@ -6719,7 +6711,7 @@ err_exclusive_lock:
     */
     mysql_lock_remove(thd, thd->lock, table);
     part_info= lpt->part_info->get_clone();
-    close_thread_table(thd, &thd->open_tables);
+    close_thread_table(thd, &thd->open_tables, false);
     lpt->table_list->table= NULL;
   }
 
@@ -7582,17 +7574,15 @@ uint32 store_tuple_to_record(Field **pfield,
   return nparts;
 }
 
-/**
-  RANGE(columns) partitioning: compare partition value bound and probe tuple.
+/*
+  RANGE(columns) partitioning: compare value bound and probe tuple.
 
-  @param val           Partition column values.
-  @param nvals_in_rec  Number of (prefix) fields to compare.
+  The value bound always is a full tuple (but may include the MAXVALUE
+  special value).
 
-  @return Less than/Equal to/Greater than 0 if the record is L/E/G than val.
-
-  @note The partition value bound is always a full tuple (but may include the
-  MAXVALUE special value). The probe tuple may be a prefix of partitioning
-  tuple.
+  The probe tuple may be a prefix of partitioning tuple. The tail_is_min
+  parameter specifies whether the suffix components should be assumed to
+  hold MAXVALUE
 */
 
 static int cmp_rec_and_tuple(part_column_list_val *val, uint32 nvals_in_rec)
@@ -7622,73 +7612,25 @@ static int cmp_rec_and_tuple(part_column_list_val *val, uint32 nvals_in_rec)
 }
 
 
-/**
-  Compare record and columns partition tuple including endpoint handling.
-
-  @param  val               Columns partition tuple
-  @param  n_vals_in_rec     Number of columns to compare
-  @param  is_left_endpoint  True if left endpoint (part_tuple < rec or
-                            part_tuple <= rec)
-  @param  include_endpoint  If endpoint is included (part_tuple <= rec or
-                            rec <= part_tuple)
-
-  @return Less than/Equal to/Greater than 0 if the record is L/E/G than
-  the partition tuple.
-
-  @see get_list_array_idx_for_endpoint() and
-  get_partition_id_range_for_endpoint().
-*/
-
 static int cmp_rec_and_tuple_prune(part_column_list_val *val,
                                    uint32 n_vals_in_rec,
-                                   bool is_left_endpoint,
-                                   bool include_endpoint)
+                                   bool tail_is_min)
 {
   int cmp;
   Field **field;
+  partition_info *part_info;
   if ((cmp= cmp_rec_and_tuple(val, n_vals_in_rec)))
     return cmp;
-  field= val->part_info->part_field_array + n_vals_in_rec;
-  if (!(*field))
+  part_info= val->part_info;
+  field= part_info->part_field_array + n_vals_in_rec;
+  for (; *field; field++, val++)
   {
-    /*
-      Full match, if right endpoint and not including the endpoint,
-      (rec < part) return lesser.
-    */
-    if (!is_left_endpoint && !include_endpoint)
-      return -4;
-
-    /* Otherwise they are equal! */
-    return 0;
+    if (tail_is_min)
+      return -1;
+    if (!tail_is_min && !val->max_value)
+      return +1;
   }
-  /*
-    The prefix is equal and there are more partition columns to compare.
-
-    If including left endpoint or not including right endpoint
-    then the record is considered lesser compared to the partition.
-
-    i.e:
-    part(10, x) <= rec(10, unknown) and rec(10, unknown) < part(10, x)
-    part <= rec -> lesser (i.e. this or previous partitions)
-    rec < part -> lesser (i.e. this or previous partitions)
-  */
-  if (is_left_endpoint == include_endpoint)
-    return -2;
-
-  /*
-    If right endpoint and the first additional partition value
-    is MAXVALUE, then the record is lesser.
-  */
-  if (!is_left_endpoint && (val + n_vals_in_rec)->max_value)
-    return -3;
-
-  /*
-    Otherwise the record is considered greater.
-
-    rec <= part -> greater (i.e. does not match this partition, seek higher).
-    part < rec -> greater (i.e. does not match this partition, seek higher).
-  */
-  return 2;
+  return 0;
 }
 
 
@@ -7699,64 +7641,90 @@ typedef uint32 (*get_col_endpoint_func)(partition_info*, bool left_endpoint,
                                         bool include_endpoint,
                                         uint32 num_parts);
 
-/**
-  Get partition for RANGE COLUMNS endpoint.
+/*
+  Partitioning Interval Analysis: Initialize the iterator for "mapping" case
 
-  @param part_info         Partitioning metadata.
-  @param is_left_endpoint     True if left endpoint (const <=/< cols)
-  @param include_endpoint  True if range includes the endpoint (<=/>=)
-  @param nparts            Total number of partitions
+  SYNOPSIS
+    get_part_iter_for_interval_via_mapping()
+      part_info   Partition info
+      is_subpart  TRUE  - act for subpartitioning
+                  FALSE - act for partitioning
+      min_value   minimum field value, in opt_range key format.
+      max_value   minimum field value, in opt_range key format.
+      flags       Some combination of NEAR_MIN, NEAR_MAX, NO_MIN_RANGE,
+                  NO_MAX_RANGE.
+      part_iter   Iterator structure to be initialized
 
-  @return Partition id of matching partition.
+  DESCRIPTION
+    Initialize partition set iterator to walk over the interval in
+    ordered-array-of-partitions (for RANGE partitioning) or 
+    ordered-array-of-list-constants (for LIST partitioning) space.
 
-  @see get_partition_id_cols_list_for_endpoint and
-  get_partition_id_range_for_endpoint.
+  IMPLEMENTATION
+    This function is used when partitioning is done by
+    <RANGE|LIST>(ascending_func(t.field)), and we can map an interval in
+    t.field space into a sub-array of partition_info::range_int_array or
+    partition_info::list_array (see get_partition_id_range_for_endpoint,
+    get_list_array_idx_for_endpoint for details).
+    
+    The function performs this interval mapping, and sets the iterator to
+    traverse the sub-array and return appropriate partitions.
+    
+  RETURN
+    0 - No matching partitions (iterator not initialized)
+    1 - Ok, iterator intialized for traversal of matching partitions.
+   -1 - All partitions would match (iterator not initialized)
 */
 
 uint32 get_partition_id_cols_range_for_endpoint(partition_info *part_info,
-                                                bool is_left_endpoint,
+                                                bool left_endpoint,
                                                 bool include_endpoint,
                                                 uint32 nparts)
 {
-  uint min_part_id= 0, max_part_id= part_info->num_parts, loc_part_id;
+  uint max_partition= part_info->num_parts - 1;
+  uint min_part_id= 0, max_part_id= max_partition, loc_part_id;
   part_column_list_val *range_col_array= part_info->range_col_array;
   uint num_columns= part_info->part_field_list.elements;
+  bool tailf= !(left_endpoint ^ include_endpoint);
   DBUG_ENTER("get_partition_id_cols_range_for_endpoint");
 
-  /* Find the matching partition (including taking endpoint into account). */
-  do
+  /* Get the partitioning function value for the endpoint */
+  while (max_part_id > min_part_id)
   {
-    /* Midpoint, adjusted down, so it can never be > last partition. */
-    loc_part_id= (max_part_id + min_part_id) >> 1;
-    if (0 <= cmp_rec_and_tuple_prune(range_col_array +
-                                       loc_part_id * num_columns,
-                                     nparts,
-                                     is_left_endpoint,
-                                     include_endpoint))
+    loc_part_id= (max_part_id + min_part_id + 1) >> 1;
+    if (cmp_rec_and_tuple_prune(range_col_array + loc_part_id*num_columns,
+                                nparts, tailf) >= 0)
       min_part_id= loc_part_id + 1;
     else
-      max_part_id= loc_part_id;
-  } while (max_part_id > min_part_id);
+      max_part_id= loc_part_id - 1;
+  }
   loc_part_id= max_part_id;
-
-  /* Given value must be LESS THAN the found partition. */
-  DBUG_ASSERT(loc_part_id == part_info->num_parts ||
-              (0 > cmp_rec_and_tuple_prune(range_col_array +
-                                             loc_part_id * num_columns,
-                                           nparts, is_left_endpoint,
-                                           include_endpoint)));
-  /* Given value must be GREATER THAN or EQUAL to the previous partition. */
-  DBUG_ASSERT(loc_part_id == 0 ||
-              (0 <= cmp_rec_and_tuple_prune(range_col_array +
-                                              (loc_part_id - 1) * num_columns,
-                                            nparts, is_left_endpoint,
-                                            include_endpoint)));
-
-  if (!is_left_endpoint)
+  if (loc_part_id < max_partition && 
+      cmp_rec_and_tuple_prune(range_col_array + (loc_part_id+1)*num_columns,
+                              nparts, tailf) >= 0
+      )
   {
-    /* Set the end after this partition if not already after the last. */
-    if (loc_part_id < part_info->num_parts)
+     loc_part_id++;
+  }
+  if (left_endpoint)
+  {
+    if (cmp_rec_and_tuple_prune(range_col_array + loc_part_id*num_columns,
+                                nparts, tailf) >= 0)
       loc_part_id++;
+  }
+  else 
+  {
+    if (loc_part_id < max_partition)
+    {
+      int res= cmp_rec_and_tuple_prune(range_col_array +
+                                       loc_part_id * num_columns,
+                                       nparts, tailf);
+      if (!res)
+        loc_part_id += test(include_endpoint);
+      else if (res > 0)
+        loc_part_id++;
+    }
+    loc_part_id++;
   }
   DBUG_RETURN(loc_part_id);
 }
@@ -7787,7 +7755,10 @@ int get_part_iter_for_interval_cols_via_map(partition_info *part_info,
     DBUG_ASSERT(part_info->num_list_values);
   }
   else
+  {
+    get_col_endpoint= NULL;
     assert(0);
+  }
 
   if (flags & NO_MIN_RANGE)
     part_iter->part_nums.start= part_iter->part_nums.cur= 0;
@@ -7828,40 +7799,6 @@ int get_part_iter_for_interval_cols_via_map(partition_info *part_info,
   DBUG_RETURN(1);
 }
 
-
-/**
-  Partitioning Interval Analysis: Initialize the iterator for "mapping" case
-
-  @param part_info   Partition info
-  @param is_subpart  TRUE  - act for subpartitioning
-                     FALSE - act for partitioning
-  @param store_length_array  Ignored.
-  @param min_value   minimum field value, in opt_range key format.
-  @param max_value   minimum field value, in opt_range key format.
-  @param min_len     Ignored.
-  @param max_len     Ignored.
-  @param flags       Some combination of NEAR_MIN, NEAR_MAX, NO_MIN_RANGE,
-                     NO_MAX_RANGE.
-  @param part_iter   Iterator structure to be initialized
-
-  @details Initialize partition set iterator to walk over the interval in
-  ordered-array-of-partitions (for RANGE partitioning) or
-  ordered-array-of-list-constants (for LIST partitioning) space.
-
-  This function is used when partitioning is done by
-  <RANGE|LIST>(ascending_func(t.field)), and we can map an interval in
-  t.field space into a sub-array of partition_info::range_int_array or
-  partition_info::list_array (see get_partition_id_range_for_endpoint,
-  get_list_array_idx_for_endpoint for details).
-
-  The function performs this interval mapping, and sets the iterator to
-  traverse the sub-array and return appropriate partitions.
-
-  @return Status of iterator
-    @retval 0   No matching partitions (iterator not initialized)
-    @retval 1   Ok, iterator intialized for traversal of matching partitions.
-    @retval -1  All partitions would match (iterator not initialized)
-*/
 
 int get_part_iter_for_interval_via_mapping(partition_info *part_info,
                                            bool is_subpart,

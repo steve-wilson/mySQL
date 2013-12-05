@@ -24,7 +24,7 @@ Created July 18, 2007 Vasil Dimov
 *******************************************************/
 
 #include <mysqld_error.h>
-#include <sql_acl.h>
+#include <sql_acl.h>				// PROCESS_ACL
 
 #include <m_ctype.h>
 #include <hash.h>
@@ -35,19 +35,18 @@ Created July 18, 2007 Vasil Dimov
 #include <sql_plugin.h>
 #include <mysql/innodb_priv.h>
 
-#include "btr0pcur.h"
+#include "btr0pcur.h"	/* for file sys_tables related info. */
 #include "btr0types.h"
-#include "dict0dict.h"
-#include "dict0load.h"
-#include "buf0buddy.h"
-#include "buf0buf.h"
-#include "ibuf0ibuf.h"
+#include "buf0buddy.h"	/* for i_s_cmpmem */
+#include "buf0buf.h"	/* for buf_pool */
+#include "dict0dict.h"	/* for dict_table_stats_lock() */
+#include "dict0load.h"	/* for file sys_tables related info. */
 #include "dict0mem.h"
 #include "dict0types.h"
-#include "ha_prototypes.h"
-#include "srv0start.h"
+#include "ha_prototypes.h" /* for innobase_convert_name() */
+#include "srv0start.h"	/* for srv_was_started */
 #include "trx0i_s.h"
-#include "trx0trx.h"
+#include "trx0trx.h"	/* for TRX_QUE_STATE_STR_MAX_LEN */
 #include "srv0mon.h"
 #include "fut0fut.h"
 #include "pars0pars.h"
@@ -65,12 +64,8 @@ struct buf_page_desc_t{
 	ulint		type_value;	/*!< Page type or page state */
 };
 
-/** Change buffer B-tree page */
-#define	I_S_PAGE_TYPE_IBUF		(FIL_PAGE_TYPE_LAST + 1)
-
-/** Any states greater than I_S_PAGE_TYPE_IBUF would be treated as
-unknown. */
-#define	I_S_PAGE_TYPE_UNKNOWN		(I_S_PAGE_TYPE_IBUF + 1)
+/** Any states greater than FIL_PAGE_TYPE_LAST would be treated as unknown. */
+#define	I_S_PAGE_TYPE_UNKNOWN		(FIL_PAGE_TYPE_LAST + 1)
 
 /** We also define I_S_PAGE_TYPE_INDEX as the Index Page's position
 in i_s_page_type[] array */
@@ -91,7 +86,7 @@ static buf_page_desc_t	i_s_page_type[] = {
 	{"BLOB", FIL_PAGE_TYPE_BLOB},
 	{"COMPRESSED_BLOB", FIL_PAGE_TYPE_ZBLOB},
 	{"COMPRESSED_BLOB2", FIL_PAGE_TYPE_ZBLOB2},
-	{"IBUF_INDEX", I_S_PAGE_TYPE_IBUF},
+	{"DBLWR_HEADER", FIL_PAGE_TYPE_DBLWR_HEADER},
 	{"UNKNOWN", I_S_PAGE_TYPE_UNKNOWN}
 };
 
@@ -806,6 +801,270 @@ UNIV_INTERN struct st_mysql_plugin	i_s_innodb_trx =
 	STRUCT_FLD(flags, 0UL),
 };
 
+/* Fields of the dynamic table information_schema.innodb_file_status. */
+static ST_FIELD_INFO i_s_file_status_fields_info[]=
+{
+	{STRUCT_FLD(field_name,		"FILE"),
+	 STRUCT_FLD(field_length,	FN_REFLEN),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_STRING),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"File"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"OPERATION"),
+	 STRUCT_FLD(field_length,	FN_REFLEN),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_STRING),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Operation"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"REQUESTS"),
+	 STRUCT_FLD(field_length,	MY_INT64_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONGLONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
+	 STRUCT_FLD(old_name,		"Requests"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"SLOW"),
+	 STRUCT_FLD(field_length,	MY_INT64_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONGLONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
+	 STRUCT_FLD(old_name,		"Slow"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"BYTES"),
+	 STRUCT_FLD(field_length,	MY_INT64_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONGLONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
+	 STRUCT_FLD(old_name,		"Bytes"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"BYTES/R"),
+	 STRUCT_FLD(field_length,	0),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_FLOAT),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Bytes/r"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"SVC:SECS"),
+	 STRUCT_FLD(field_length,	0),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_FLOAT),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Svc:secs"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"SVC:MSECS/R"),
+	 STRUCT_FLD(field_length,	0),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_FLOAT),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Svc:msecs/r"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"SVC:MAX_MSECS"),
+	 STRUCT_FLD(field_length,	MY_INT64_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONGLONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
+	 STRUCT_FLD(old_name,		"Svc:max_msecs"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"WAIT:SECS"),
+	 STRUCT_FLD(field_length,	0),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_FLOAT),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Wait:secs"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"WAIT:MSECS/R"),
+	 STRUCT_FLD(field_length,	0),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_FLOAT),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Wait:msecs/r"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"WAIT:MAX_MSECS"),
+	 STRUCT_FLD(field_length,	MY_INT64_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONGLONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
+	 STRUCT_FLD(old_name,		"Wait:max_msecs"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	END_OF_ST_FIELD_INFO
+};
+
+/************************************************************************//**
+Fill in a single row for the dynamic table
+information_schema.innodb_file_status.
+@return	0 on success */
+static
+int
+i_s_file_status_fill_low(
+/*=====================*/
+	THD*		thd,	  /*!< in: thread */
+	TABLE*		table,	  /*!< in/out: table to fill */
+	const char*	file_name,/*!< in: file name for this record */
+	const char*	operation,/*!< in: either "read" or "write" */
+	my_io_perf_t*	io_perf)  /*!< in: stats collected for the table */
+{
+	DBUG_ENTER("i_s_file_status_fill_low");
+
+	restore_record(table, s->default_values);
+
+	double nzero_requests = io_perf->requests;
+	if (nzero_requests < 1.0) nzero_requests = 1.0;
+
+	OK(field_store_string(table->field[0], file_name));
+	OK(field_store_string(table->field[1], operation));
+	OK(table->field[2]->store(io_perf->requests));
+	OK(table->field[3]->store(io_perf->slow_ios));
+	OK(table->field[4]->store(io_perf->bytes));
+	OK(table->field[5]->store((double) io_perf->bytes / nzero_requests));
+	OK(table->field[6]->store(my_timer_to_seconds(io_perf->svc_time)));
+	OK(table->field[7]->store(my_timer_to_milliseconds(io_perf->svc_time) / nzero_requests));
+	OK(table->field[8]->store((ulonglong)(my_timer_to_milliseconds(io_perf->svc_time_max))));
+	OK(table->field[9]->store(my_timer_to_seconds(io_perf->wait_time)));
+	OK(table->field[10]->store(my_timer_to_milliseconds(io_perf->wait_time) / nzero_requests));
+	OK(table->field[11]->store((ulonglong)(my_timer_to_milliseconds(io_perf->wait_time_max))));
+
+	DBUG_RETURN(schema_table_store_record(thd, table));
+}
+
+/************************************************************************//**
+Populates the FILE_STATUS information_schema table.
+@return	0 on success */
+static
+int
+i_s_file_status_fill(
+/*=================*/
+	THD*		thd,	/*!< in: thread */
+	TABLE_LIST*	tables,	/*!< in/out: tables to fill */
+	Item*		cond)	/*!< in: condition (not used) */
+{
+	TABLE *table = tables->table;
+	fil_system_t*	system	= fil_system;
+	fil_space_t*	space;
+
+	DBUG_ENTER("i_s_file_status");
+
+	/* deny access to non-superusers */
+	if (check_global_access(thd, PROCESS_ACL)) {
+
+		DBUG_RETURN(0);
+	}
+
+	RETURN_IF_INNODB_NOT_STARTED(tables->schema_table_name);
+
+	mutex_enter(&(system->mutex));
+
+	space = UT_LIST_GET_FIRST(system->space_list);
+
+	while (space != NULL) {
+		if (space->io_perf2.read.requests) {
+			if (i_s_file_status_fill_low(thd, table, space->name, "read",
+							&(space->io_perf2.read)))
+			{
+				mutex_exit(&(system->mutex));
+				DBUG_RETURN(1);
+			}
+		}
+		if (space->io_perf2.write.requests) {
+			if (i_s_file_status_fill_low(thd, table, space->name, "write",
+							&(space->io_perf2.write)))
+			{
+				mutex_exit(&(system->mutex));
+				DBUG_RETURN(1);
+			}
+		}
+		space = UT_LIST_GET_NEXT(space_list, space);
+	}
+
+	mutex_exit(&(system->mutex));
+
+	DBUG_RETURN(0);
+}
+
+/*******************************************************************//**
+Bind the dynamic table information_schema.innodb_file_status.
+@return	0 on success */
+static
+int
+i_s_file_status_init(
+/*=========*/
+	void*	p)	/*!< in/out: table schema object */
+{
+	DBUG_ENTER("i_s_file_status_init");
+	ST_SCHEMA_TABLE* schema = (ST_SCHEMA_TABLE*) p;
+
+	schema->fields_info = i_s_file_status_fields_info;
+	schema->fill_table = i_s_file_status_fill;
+
+	DBUG_RETURN(0);
+}
+
+UNIV_INTERN struct st_mysql_plugin	i_s_innodb_file_status =
+{
+	/* the plugin type (a MYSQL_XXX_PLUGIN value) */
+	/* int */
+	STRUCT_FLD(type, MYSQL_INFORMATION_SCHEMA_PLUGIN),
+
+	/* pointer to type-specific plugin descriptor */
+	/* void* */
+	STRUCT_FLD(info, &i_s_info),
+
+	/* plugin name */
+	/* const char* */
+	STRUCT_FLD(name, "INNODB_FILE_STATUS"),
+
+	/* plugin author (for SHOW PLUGINS) */
+	/* const char* */
+	STRUCT_FLD(author, plugin_author),
+
+	/* general descriptive text (for SHOW PLUGINS) */
+	/* const char* */
+	STRUCT_FLD(descr, "Per-file statistics for the InnoDB file IO"),
+
+	/* the plugin license (PLUGIN_LICENSE_XXX) */
+	/* int */
+	STRUCT_FLD(license, PLUGIN_LICENSE_GPL),
+
+	/* the function to invoke when plugin is loaded */
+	/* int (*)(void*); */
+	STRUCT_FLD(init, i_s_file_status_init),
+
+	/* the function to invoke when plugin is unloaded */
+	/* int (*)(void*); */
+	STRUCT_FLD(deinit, i_s_common_deinit),
+
+	/* plugin version (for SHOW PLUGINS) */
+	/* unsigned int */
+	STRUCT_FLD(version, INNODB_VERSION_SHORT),
+
+	/* struct st_mysql_show_var* */
+	STRUCT_FLD(status_vars, NULL),
+
+	/* struct st_mysql_sys_var** */
+	STRUCT_FLD(system_vars, NULL),
+
+	/* reserved for dependency checking */
+	/* void* */
+	STRUCT_FLD(__reserved1, NULL),
+
+	/* Plugin flags */
+	/* unsigned long */
+	STRUCT_FLD(flags, 0UL),
+};
+
 /* Fields of the dynamic table INFORMATION_SCHEMA.innodb_locks */
 static ST_FIELD_INFO	innodb_locks_fields_info[] =
 {
@@ -1397,6 +1656,85 @@ static ST_FIELD_INFO	i_s_cmp_fields_info[] =
 		    " in Seconds"),
 	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
 
+	{STRUCT_FLD(field_name,		"compress_ok_time"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Duration of Successful "
+		    "Compressions, in Seconds"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"compress_primary_ops"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Number of Compressions in primary indexes"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"compress_primary_ops_ok"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Number of"
+					" Successful Compressions in primary indexes"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"compress_primary_time"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Duration of Primary Index Compressions,"
+		    " in Seconds"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"compress_primary_ok_time"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Duration of Successful Primary Index "
+		    "Compressions, in Seconds"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"compress_secondary_ops"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Number of Secondary Index Compressions"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"compress_secondary_ops_ok"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Number of"
+					" Successful Secondary Index Compressions"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"compress_secondary_time"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Duration of Secondary Index Compressions,"
+		    " in Seconds"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"compress_secondary_ok_time"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Duration of Successful Secondary Index "
+		    "Compressions, in Seconds"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
 	{STRUCT_FLD(field_name,		"uncompress_ops"),
 	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
 	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
@@ -1411,6 +1749,40 @@ static ST_FIELD_INFO	i_s_cmp_fields_info[] =
 	 STRUCT_FLD(value,		0),
 	 STRUCT_FLD(field_flags,	0),
 	 STRUCT_FLD(old_name,		"Total Duration of Decompressions,"
+		    " in Seconds"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"uncompress_primary_ops"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Number of Primary Index Decompressions"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"uncompress_primary_time"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Duration of Primary Index Decompressions,"
+		    " in Seconds"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"uncompress_secondary_ops"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Number of Secondary Index Decompressions"),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"uncompress_secondary_time"),
+	 STRUCT_FLD(field_length,	MY_INT32_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	0),
+	 STRUCT_FLD(old_name,		"Total Duration of Secondary Index Decompressions,"
 		    " in Seconds"),
 	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
 
@@ -1447,7 +1819,8 @@ i_s_cmp_fill_low(
 	for (uint i = 0; i < PAGE_ZIP_SSIZE_MAX; i++) {
 		page_zip_stat_t*	zip_stat = &page_zip_stat[i];
 
-		table->field[0]->store(UNIV_ZIP_SIZE_MIN << i);
+		int col = -1;
+		table->field[++col]->store(UNIV_ZIP_SIZE_MIN << i);
 
 		/* The cumulated counts are not protected by any
 		mutex.  Thus, some operation in page0zip.cc could
@@ -1455,13 +1828,42 @@ i_s_cmp_fill_low(
 		clear it.  We could introduce mutex protection, but it
 		could cause a measureable performance hit in
 		page0zip.cc. */
-		table->field[1]->store(zip_stat->compressed);
-		table->field[2]->store(zip_stat->compressed_ok);
-		table->field[3]->store(
-			(ulong) (zip_stat->compressed_usec / 1000000));
-		table->field[4]->store(zip_stat->decompressed);
-		table->field[5]->store(
-			(ulong) (zip_stat->decompressed_usec / 1000000));
+		table->field[++col]->store(zip_stat->compressed);
+		table->field[++col]->store(zip_stat->compressed_ok);
+		table->field[++col]->store(
+			(ulong) my_timer_to_microseconds(
+				zip_stat->compressed_time));
+		table->field[++col]->store(
+			(ulong) my_timer_to_microseconds(
+				zip_stat->compressed_ok_time));
+		table->field[++col]->store(zip_stat->compressed_primary);
+		table->field[++col]->store(zip_stat->compressed_primary_ok);
+		table->field[++col]->store(
+			(ulong) my_timer_to_microseconds(
+				zip_stat->compressed_primary_time));
+		table->field[++col]->store(
+			(ulong) my_timer_to_microseconds(
+				zip_stat->compressed_primary_ok_time));
+		table->field[++col]->store(zip_stat->compressed_secondary);
+		table->field[++col]->store(zip_stat->compressed_secondary_ok);
+		table->field[++col]->store(
+			(ulong) my_timer_to_microseconds(
+				zip_stat->compressed_secondary_time));
+		table->field[++col]->store(
+			(ulong) my_timer_to_microseconds(
+				zip_stat->compressed_secondary_ok_time));
+		table->field[++col]->store(zip_stat->decompressed);
+		table->field[++col]->store(
+			(ulong) my_timer_to_microseconds(
+				zip_stat->decompressed_time));
+		table->field[++col]->store(zip_stat->decompressed_primary);
+		table->field[++col]->store(
+			(ulong) my_timer_to_microseconds(
+			zip_stat->decompressed_primary_time));
+		table->field[++col]->store(zip_stat->decompressed_secondary);
+		table->field[++col]->store(
+			(ulong) my_timer_to_microseconds(
+			zip_stat->decompressed_secondary_time));
 
 		if (reset) {
 			memset(zip_stat, 0, sizeof *zip_stat);
@@ -1802,13 +2204,15 @@ i_s_cmp_per_index_fill_low(
 			iter->second.compressed_ok);
 
 		fields[IDX_COMPRESS_TIME]->store(
-			(long) (iter->second.compressed_usec / 1000000));
+			(long) (my_timer_to_seconds(
+				iter->second.compressed_time)));
 
 		fields[IDX_UNCOMPRESS_OPS]->store(
 			iter->second.decompressed);
 
 		fields[IDX_UNCOMPRESS_TIME]->store(
-			(long) (iter->second.decompressed_usec / 1000000));
+			(long) (my_timer_to_seconds(
+				iter->second.decompressed_time)));
 
 		if (schema_table_store_record(thd, table)) {
 			status = 1;
@@ -4886,21 +5290,14 @@ i_s_innodb_set_page_type(
 	if (page_type == FIL_PAGE_INDEX) {
 		const page_t*	page = (const page_t*) frame;
 
-		page_info->index_id = btr_page_get_index_id(page);
-
 		/* FIL_PAGE_INDEX is a bit special, its value
 		is defined as 17855, so we cannot use FIL_PAGE_INDEX
 		to index into i_s_page_type[] array, its array index
 		in the i_s_page_type[] array is I_S_PAGE_TYPE_INDEX
-		(1) for index pages or I_S_PAGE_TYPE_IBUF for
-		change buffer index pages */
-		if (page_info->index_id
-		    == static_cast<index_id_t>(DICT_IBUF_ID_MIN
-					       + IBUF_SPACE_ID)) {
-			page_info->page_type = I_S_PAGE_TYPE_IBUF;
-		} else {
-			page_info->page_type = I_S_PAGE_TYPE_INDEX;
-		}
+		(1) */
+		page_info->page_type = I_S_PAGE_TYPE_INDEX;
+
+		page_info->index_id = btr_page_get_index_id(page);
 
 		page_info->data_size = (ulint)(page_header_get_field(
 			page, PAGE_HEAP_TOP) - (page_is_comp(page)
@@ -4909,7 +5306,7 @@ i_s_innodb_set_page_type(
 			- page_header_get_field(page, PAGE_GARBAGE));
 
 		page_info->num_recs = page_get_n_recs(page);
-	} else if (page_type > FIL_PAGE_TYPE_LAST) {
+	} else if (page_type >= I_S_PAGE_TYPE_UNKNOWN) {
 		/* Encountered an unknown page type */
 		page_info->page_type = I_S_PAGE_TYPE_UNKNOWN;
 	} else {
@@ -4980,16 +5377,6 @@ i_s_innodb_buffer_page_get_info(
 		page_info->is_old = bpage->old;
 
 		page_info->freed_page_clock = bpage->freed_page_clock;
-
-		switch (buf_page_get_io_fix(bpage)) {
-		case BUF_IO_NONE:
-		case BUF_IO_WRITE:
-		case BUF_IO_PIN:
-			break;
-		case BUF_IO_READ:
-			page_info->page_type = I_S_PAGE_TYPE_UNKNOWN;
-			return;
-		}
 
 		if (page_info->page_state == BUF_BLOCK_FILE_PAGE) {
 			const buf_block_t*block;

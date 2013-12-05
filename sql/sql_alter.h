@@ -16,6 +16,8 @@
 #ifndef SQL_ALTER_TABLE_H
 #define SQL_ALTER_TABLE_H
 
+#include "sql_class.h"
+
 class Alter_drop;
 class Alter_column;
 class Key;
@@ -171,6 +173,12 @@ public:
   List<Key>                     key_list;
   // List of columns, used by both CREATE and ALTER TABLE.
   List<Create_field>            create_list;
+  // List of keys, which creation is delayed to benefit from fast index creation
+  List<Key>                     delayed_key_list;
+  // Keys, which creation is delayed to benefit from fast index creation
+  KEY                           *delayed_key_info;
+  // Count of keys, which creation is delayed to benefit from fast index creation
+  uint                          delayed_key_count;
   // Type of ALTER TABLE operation.
   uint                          flags;
   // Enable or disable keys.
@@ -183,14 +191,16 @@ public:
   enum_alter_table_algorithm    requested_algorithm;
   // Type of ALTER TABLE lock.
   enum_alter_table_lock         requested_lock;
-
+  // Defragment index.
+  LEX_STRING                    defrag_index;
 
   Alter_info() :
     flags(0),
     keys_onoff(LEAVE_AS_IS),
     num_parts(0),
     requested_algorithm(ALTER_TABLE_ALGORITHM_DEFAULT),
-    requested_lock(ALTER_TABLE_LOCK_DEFAULT)
+    requested_lock(ALTER_TABLE_LOCK_DEFAULT),
+    defrag_index(EMPTY_STR)
   {}
 
   void reset()
@@ -205,6 +215,7 @@ public:
     partition_names.empty();
     requested_algorithm= ALTER_TABLE_ALGORITHM_DEFAULT;
     requested_lock= ALTER_TABLE_LOCK_DEFAULT;
+    defrag_index = EMPTY_STR;
   }
 
 
@@ -423,6 +434,21 @@ public:
 
 private:
   const enum_tablespace_op_type m_tablespace_op;
+};
+
+/**
+  Sql_cmd_defragment_table represents ALTER TABLE DEFRAGMENT statements.
+*/
+class Sql_cmd_defragment_table : public Sql_cmd_common_alter_table
+{
+public:
+  Sql_cmd_defragment_table()
+  {}
+
+  ~Sql_cmd_defragment_table()
+  {}
+
+  bool execute(THD *thd);
 };
 
 #endif

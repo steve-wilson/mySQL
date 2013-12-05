@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -135,6 +135,12 @@ TABLE *open_ltable(THD *thd, TABLE_LIST *table_list, thr_lock_type update,
   table flush, wait on thr_lock.c locks) while opening and locking table.
 */
 #define MYSQL_OPEN_IGNORE_KILLED                0x4000
+/**
+  When opening/locking table, acquire global and schema-scope IX locks
+  when acquiring S on table being created. After checking for the existence
+  of table S lock acquired on table being created will be upgraded to "X".
+*/
+#define MYSQL_OPEN_TABLE_FOR_CREATE             0x8000
 
 /** Please refer to the internals manual. */
 #define MYSQL_OPEN_REOPEN  (MYSQL_OPEN_IGNORE_FLUSH |\
@@ -171,7 +177,7 @@ TABLE *find_temporary_table(THD *thd, const char *db, const char *table_name);
 TABLE *find_temporary_table(THD *thd, const TABLE_LIST *tl);
 TABLE *find_temporary_table(THD *thd, const char *table_key,
                             uint table_key_length);
-void close_thread_tables(THD *thd);
+void close_thread_tables(THD *thd, bool async_commit=FALSE);
 bool fill_record_n_invoke_before_triggers(THD *thd, List<Item> &fields,
                                           List<Item> &values,
                                           bool ignore_errors,
@@ -253,22 +259,81 @@ TABLE *open_n_lock_single_table(THD *thd, TABLE_LIST *table_l,
                                 thr_lock_type lock_type, uint flags,
                                 Prelocking_strategy *prelocking_strategy);
 bool open_normal_and_derived_tables(THD *thd, TABLE_LIST *tables, uint flags);
+bool upgrade_lock_from_S_to_X_for_create(THD *thd,
+                                         bool &close_and_reopen_tables);
 bool lock_tables(THD *thd, TABLE_LIST *tables, uint counter, uint flags);
 void free_io_cache(TABLE *entry);
 void intern_close_table(TABLE *entry);
-void close_thread_table(THD *thd, TABLE **table_ptr);
+void close_thread_table(THD *thd, TABLE **table_ptr, bool update_stats);
 bool close_temporary_tables(THD *thd);
 TABLE_LIST *unique_table(THD *thd, TABLE_LIST *table, TABLE_LIST *table_list,
                          bool check_alias);
 int drop_temporary_table(THD *thd, TABLE_LIST *table_list, bool *is_trans);
 void close_temporary_table(THD *thd, TABLE *table, bool free_share,
                            bool delete_table);
-void close_temporary(TABLE *table, bool free_share, bool delete_table);
+void close_temporary(THD* thd, TABLE *table, bool free_share,
+		     bool delete_table);
 bool rename_temporary_table(THD* thd, TABLE *table, const char *new_db,
 			    const char *table_name);
 bool open_temporary_tables(THD *thd, TABLE_LIST *tl_list);
 bool open_temporary_table(THD *thd, TABLE_LIST *tl);
 bool is_equal(const LEX_STRING *a, const LEX_STRING *b);
+
+/* for SHOW GLOBAL TABLE STATUS */
+void update_table_stats(THD* thd, TABLE *table_ptr, bool follow_next);
+extern HASH global_table_stats;
+extern mysql_mutex_t LOCK_global_table_stats;
+void init_global_table_stats(void);
+void free_global_table_stats(void);
+void reset_global_table_stats(void);
+extern ST_FIELD_INFO table_stats_fields_info[];
+extern ST_FIELD_INFO index_stats_fields_info[];
+int fill_table_stats(THD *thd, TABLE_LIST *tables, Item *cond);
+int fill_index_stats(THD *thd, TABLE_LIST *tables, Item *cond);
+typedef void (*table_stats_cb)(const char *db, const char *table,
+			       bool is_partition,
+			       my_io_perf_t* r, my_io_perf_t* w,
+			       my_io_perf_t *r_blob,
+			       my_io_perf_t *r_primary,
+			       my_io_perf_t *r_secondary,
+			       page_stats_t* page_stats,
+			       comp_stat_t* comp_stat,
+			       int n_lock_wait,
+			       int n_lock_wait_timeout,
+			       const char *engine);
+void fill_table_stats_cb(const char *db, const char *table, bool is_partition,
+			 my_io_perf_t *r, my_io_perf_t *w, my_io_perf_t *r_blob,
+			 my_io_perf_t *r_primary, my_io_perf_t *r_secondary,
+			 int n_lock_wait, int n_lock_wait_timeout,
+			 const char *engine);
+
+/* For information_schema.db_statistics */
+void update_global_db_stats_access(unsigned char db_stats_index,
+                                   uint64 space,
+                                   uint64 offset);
+void init_global_db_stats(void);
+void free_global_db_stats(void);
+void reset_global_db_stats(void);
+extern ST_FIELD_INFO db_stats_fields_info[];
+int fill_db_stats(THD *thd, TABLE_LIST *tables, Item *cond);
+
+
+/* For information_schema.user_statistics */
+extern ST_FIELD_INFO user_stats_fields_info[];
+void init_user_stats(USER_STATS *user_stats);
+void reset_global_user_stats();
+int fill_user_stats(THD *thd, TABLE_LIST *tables, Item *cond);
+void
+update_user_stats_after_statement(USER_STATS *us,
+                                  THD *thd,
+                                  ulonglong wall_time,
+                                  bool is_other_command,
+                                  bool is_xid_event,
+                                  my_io_perf_t *start_perf_read,
+                                  my_io_perf_t *start_perf_read_blob,
+                                  my_io_perf_t *start_perf_read_primary,
+                                  my_io_perf_t *start_perf_read_secondary);
+
 
 /* Functions to work with system tables. */
 bool open_system_tables_for_read(THD *thd, TABLE_LIST *table_list,
@@ -491,7 +556,7 @@ public:
   };
   Open_table_context(THD *thd, uint flags);
 
-  bool recover_from_failed_open();
+  bool recover_from_failed_open(THD *thd);
   bool request_backoff_action(enum_open_table_action action_arg,
                               TABLE_LIST *table);
 
@@ -514,6 +579,9 @@ public:
     return m_timeout;
   }
 
+  enum_open_table_action get_action() const
+  { return m_action; }
+
   uint get_flags() const { return m_flags; }
 
   /**
@@ -531,8 +599,6 @@ public:
   }
 
 private:
-  /* THD for which tables are opened. */
-  THD *m_thd;
   /**
     For OT_DISCOVER and OT_REPAIR actions, the table list element for
     the table which definition should be re-discovered or which

@@ -43,20 +43,19 @@ Created 9/20/1997 Heikki Tuuri
 #include "trx0undo.h"
 #include "trx0rec.h"
 #include "fil0fil.h"
-#ifndef UNIV_HOTBACKUP
 # include "buf0rea.h"
 # include "srv0srv.h"
 # include "srv0start.h"
 # include "trx0roll.h"
 # include "row0merge.h"
 # include "sync0sync.h"
-#else /* !UNIV_HOTBACKUP */
 
+#ifdef XTRABACKUP
 /** This is set to FALSE if the backup was originally taken with the
 ibbackup --include regexp option: then we do not want to create tables in
 directories which were not included */
 UNIV_INTERN ibool	recv_replay_file_ops	= TRUE;
-#endif /* !UNIV_HOTBACKUP */
+#endif /* XTRABACKUP */
 
 /** Log records are stored in the hash table in chunks at most of this size;
 this must be less than UNIV_PAGE_SIZE as it is stored in the buffer pool */
@@ -399,7 +398,12 @@ recv_sys_init(
 	/* Set appropriate value of recv_n_pool_free_frames. */
 	if (buf_pool_get_curr_size() >= (10 * 1024 * 1024)) {
 		/* Buffer pool of size greater than 10 MB. */
-		recv_n_pool_free_frames = 512;
+
+		/* Total number of pending ios when using aio request buffering,
+		is 8 * OS_AIO_N_PENDING_IOS_PER_THREAD * srv_n_read_io_threads
+		Set number of free frames to be 4 times that. */
+		recv_n_pool_free_frames = 32 * OS_AIO_N_PENDING_IOS_PER_THREAD
+		                          * srv_n_read_io_threads;
 	}
 
 	recv_sys->buf = static_cast<byte*>(ut_malloc(RECV_PARSING_BUF_SIZE));
@@ -703,7 +707,7 @@ recv_synchronize_groups(
 /***********************************************************************//**
 Checks the consistency of the checkpoint info
 @return	TRUE if ok */
-static
+UNIV_INTERN
 ibool
 recv_check_cp_is_consistent(
 /*========================*/
@@ -733,7 +737,7 @@ recv_check_cp_is_consistent(
 /********************************************************//**
 Looks for the maximum consistent checkpoint from the log groups.
 @return	error code or DB_SUCCESS */
-static __attribute__((nonnull, warn_unused_result))
+UNIV_INTERN __attribute__((nonnull, warn_unused_result))
 dberr_t
 recv_find_max_checkpoint(
 /*=====================*/
@@ -893,7 +897,7 @@ block.  We also accept a log block in the old format before
 InnoDB-3.23.52 where the checksum field contains the log block number.
 @return TRUE if ok, or if the log block may be in the format of InnoDB
 version predating 3.23.52 */
-static
+UNIV_INTERN
 ibool
 log_block_checksum_is_ok_or_old_format(
 /*===================================*/
@@ -1368,14 +1372,25 @@ recv_parse_or_apply_log_rec_body(
 Calculates the fold value of a page file address: used in inserting or
 searching for a log record in the hash table.
 @return	folded value */
-UNIV_INLINE
+UNIV_INTERN
 ulint
 recv_fold(
 /*======*/
 	ulint	space,	/*!< in: space */
 	ulint	page_no)/*!< in: page number */
 {
-	return(ut_fold_ulint_pair(space, page_no));
+	/* We require a hash value of the pair (space, page_no) which has the
+	following properties:
+	(1) as few collisions as possible.
+	(2) the hash value order should match physical page order as closely as
+	possible. Pages will be read in later on in the hash value order, and
+	having this order match physical page order closely is a big win on disk
+	based machines.
+	The easiest way to achieve the above two properties is,
+	generate a random ulint from the space value (so that the results are
+	spaced out) and then add the page_no, so that pairs with the same space
+	and consecutive page_no have consecutive hash values.*/
+	return(ut_rnd_gen_next_ulint(space) + page_no);
 }
 
 /*********************************************************************//**
@@ -1588,6 +1603,10 @@ recv_recover_page_func(
 					     buf_block_get_page_no(block));
 
 	if ((recv_addr == NULL)
+#ifdef XTRABACKUP
+	    /* Fix for http://bugs.mysql.com/bug.php?id=44140 */
+	    || (recv_addr->state == RECV_BEING_READ && !just_read_in)
+#endif /* XTRABACKUP */
 	    || (recv_addr->state == RECV_BEING_PROCESSED)
 	    || (recv_addr->state == RECV_PROCESSED)) {
 
@@ -1721,14 +1740,16 @@ recv_recover_page_func(
 		recv = UT_LIST_GET_NEXT(rec_list, recv);
 	}
 
-#ifdef UNIV_ZIP_DEBUG
-	if (fil_page_get_type(page) == FIL_PAGE_INDEX) {
-		page_zip_des_t*	page_zip = buf_block_get_page_zip(block);
+	if (UNIV_UNLIKELY(page_zip_debug)) {
+		if (fil_page_get_type(page) == FIL_PAGE_INDEX) {
+			page_zip_des_t*	page_zip
+				= buf_block_get_page_zip(block);
 
-		ut_a(!page_zip
-		     || page_zip_validate_low(page_zip, page, NULL, FALSE));
+			ut_a(!page_zip
+			     || page_zip_validate_low(page_zip, page, NULL,
+			     			      FALSE));
+		}
 	}
-#endif /* UNIV_ZIP_DEBUG */
 
 #ifndef UNIV_HOTBACKUP
 	if (modification_to_page) {
@@ -1832,6 +1853,10 @@ recv_apply_hashed_log_recs(
 	ulint	i;
 	ibool	has_printed	= FALSE;
 	mtr_t	mtr;
+#ifdef XTRABACKUP
+	ulint	last_n_addrs = ULINT_MAX;
+	ulint	loops_since_change = 0;
+#endif /* XTRABACKUP */
 loop:
 	mutex_enter(&(recv_sys->mutex));
 
@@ -1914,6 +1939,24 @@ loop:
 	/* Wait until all the pages have been processed */
 
 	while (recv_sys->n_addrs != 0) {
+#ifdef XTRABACKUP
+		if (recv_sys->n_addrs == last_n_addrs) {
+			loops_since_change++;
+			if (loops_since_change > 1000) {
+				fprintf(stderr, "\n"
+						"InnoDB: Error: %lu pages with log records are left\n"
+						"InnoDB: unprocessed, but no new log records have\n"
+						"InnoDB: been processed in the last 500 seconds.\n"
+						"InnoDB: This may happen if tables were dropped or\n"
+						"InnoDB: .ibd files were deleted before recovery\n",
+						(ulong) recv_sys->n_addrs);
+				ut_error;
+			}
+		} else {
+			last_n_addrs = recv_sys->n_addrs;
+			loops_since_change = 0;
+		}
+#endif /* XTRABACKUP */
 
 		mutex_exit(&(recv_sys->mutex));
 
@@ -2406,7 +2449,7 @@ loop:
 			   || type == MLOG_FILE_RENAME
 			   || type == MLOG_FILE_DELETE) {
 			ut_a(space);
-#ifdef UNIV_HOTBACKUP
+#ifdef XTRABACKUP
 			if (recv_replay_file_ops) {
 
 				/* In ibbackup --apply-log, replay an .ibd file
@@ -2429,7 +2472,7 @@ loop:
 					ut_error;
 				}
 			}
-#endif
+#endif /* XTRABACKUP */
 			/* In normal mysqld crash recovery we do not try to
 			replay file operations */
 #ifdef UNIV_LOG_LSN_DEBUG
@@ -2852,8 +2895,19 @@ recv_scan_log_recs(
 
 			fprintf(stderr,
 				"InnoDB: Doing recovery: scanned up to"
+#ifdef XTRABACKUP
+				" log sequence number " LSN_PF " (%lu%%)\n",
+				*group_scanned_lsn,
+				(ulong) ((*group_scanned_lsn
+					  - recv_sys->parse_start_lsn)
+					 / (8 * log_group_get_capacity(
+						UT_LIST_GET_FIRST(
+						    log_sys->log_groups))
+					    / 900)));
+#else /* XTRABACKUP */
 				" log sequence number " LSN_PF "\n",
 				*group_scanned_lsn);
+#endif /* XTRABACKUP */
 		}
 	}
 
@@ -3006,8 +3060,13 @@ recv_recovery_from_checkpoint_start_func(
 	lsn_t		archived_lsn;
 #endif /* UNIV_LOG_ARCHIVE */
 	byte*		buf;
-	byte		log_hdr_buf[LOG_FILE_HDR_SIZE];
+	byte*           log_hdr_buf;
+	byte            log_hdr_mem[LOG_FILE_HDR_SIZE + OS_FILE_LOG_BLOCK_SIZE];
 	dberr_t		err;
+
+	log_hdr_buf = (byte*)ut_align(log_hdr_mem, OS_FILE_LOG_BLOCK_SIZE);
+	ut_a(log_hdr_buf >= log_hdr_mem);
+	ut_a(log_hdr_buf <= (log_hdr_mem + OS_FILE_LOG_BLOCK_SIZE));
 
 #ifdef UNIV_LOG_ARCHIVE
 	ut_ad(type != LOG_CHECKPOINT || limit_lsn == LSN_MAX);
@@ -3435,7 +3494,12 @@ recv_recovery_from_checkpoint_finish(void)
 	that the data dictionary tables will be free of any locks.
 	The data dictionary latch should guarantee that there is at
 	most one data dictionary transaction active at a time. */
+#ifdef XTRABACKUP
+	if (srv_force_recovery < SRV_FORCE_NO_TRX_UNDO
+	    && !srv_apply_log_only) {
+#else /* XTRABACKUP */
 	if (srv_force_recovery < SRV_FORCE_NO_TRX_UNDO) {
+#endif /* XTRABACKUP */
 		trx_rollback_or_clean_recovered(FALSE);
 	}
 }

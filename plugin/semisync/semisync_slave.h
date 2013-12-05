@@ -47,6 +47,10 @@ public:
     slave_enabled_ = enabled;
   }
 
+  void setKillConnTimeout(unsigned int timeout) {
+    kill_conn_timeout_ = timeout;
+  }
+
   /* A slave reads the semi-sync packet header and separate the metadata
    * from the payload data.
    * 
@@ -78,13 +82,18 @@ public:
   int slaveReply(MYSQL *mysql, const char *binlog_filename,
                  my_off_t binlog_filepos);
 
+  int slaveRequestDump(MYSQL *mysql);
+#ifndef MYSQL_CLIENT
   int slaveStart(Binlog_relay_IO_param *param);
   int slaveStop(Binlog_relay_IO_param *param);
+#endif
+  void killConnection(MYSQL *mysql);
 
 private:
   /* True when initObject has been called */
   bool init_done_;
   bool slave_enabled_;        /* semi-sycn is enabled on the slave */
+  unsigned int kill_conn_timeout_;
   MYSQL *mysql_reply;         /* connection to send reply */
 };
 
@@ -93,5 +102,6 @@ private:
 extern char rpl_semi_sync_slave_enabled;
 extern unsigned long rpl_semi_sync_slave_trace_level;
 extern char rpl_semi_sync_slave_status;
+extern unsigned int rpl_semi_sync_slave_kill_conn_timeout;
 
 #endif /* SEMISYNC_SLAVE_H */

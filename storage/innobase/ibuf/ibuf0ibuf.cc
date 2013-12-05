@@ -61,7 +61,6 @@ UNIV_INTERN my_bool	srv_ibuf_disable_background_merge;
 #include "que0que.h"
 #include "srv0start.h" /* srv_shutdown_state */
 #include "ha_prototypes.h"
-#include "rem0cmp.h"
 
 /*	STRUCTURE OF AN INSERT BUFFER RECORD
 
@@ -2806,6 +2805,9 @@ ibuf_contract_in_background(
 	ulint	n_pag2;
 	ulint	n_pages;
 
+	if (!SRV_ALLOW_IBUF_MERGES)
+		return 0;
+
 #if defined UNIV_DEBUG || defined UNIV_IBUF_DEBUG
 	if (srv_ibuf_disable_background_merge && table_id == 0) {
 		return(0);
@@ -3456,7 +3458,23 @@ ibuf_insert_low(
 	ulint		space,	/*!< in: space id where to insert */
 	ulint		zip_size,/*!< in: compressed page size in bytes, or 0 */
 	ulint		page_no,/*!< in: page number where to insert */
-	que_thr_t*	thr)	/*!< in: query thread */
+	que_thr_t*	thr,	/*!< in: query thread */
+	ulint*	ibuf_page_no,	/*!< *page_no and *modify_clock are used to decide
+	                    whether to call btr_cur_optimistic_insert() during
+	                    pessimistic descent down the index tree.
+	                    in: If this is optimistic descent, then *page_no
+	                    must be ULINT_UNDEFINED. If it is pessimistic
+	                    descent, *page_no must be the page_no to which an
+	                    optimistic insert was attempted last time
+	                    ibuf_insert_low() was called.
+	                    out: If this is the optimistic descent, *page_no is set
+	                    to the page_no to which an optimistic insert was
+	                    attempted. If it is pessimistic descent, this value is
+	                    not changed. */
+	ullint*	modify_clock) /*!< in/out: *modify_clock == ULLINT_UNDEFINED
+	                             during optimistic descent, and the modify_clock
+	                             value for the page that was used for optimistic
+	                             insert during pessimistic descent */
 {
 	big_rec_t*	dummy_big_rec;
 	btr_pcur_t	pcur;
@@ -3486,6 +3504,7 @@ ibuf_insert_low(
 	ut_ad(ut_is_2pow(zip_size));
 	ut_ad(!no_counter || op == IBUF_OP_INSERT);
 	ut_a(op < IBUF_OP_COUNT);
+	ut_ad(!(thr_get_trx(thr)->fake_changes));
 
 	do_merge = FALSE;
 
@@ -3682,11 +3701,18 @@ fail_exit:
 	cursor = btr_pcur_get_btr_cur(&pcur);
 
 	if (mode == BTR_MODIFY_PREV) {
+		ut_a(*ibuf_page_no == ULINT_UNDEFINED);
+		ut_a(*modify_clock == ULLINT_UNDEFINED);
 		err = btr_cur_optimistic_insert(
 			BTR_NO_LOCKING_FLAG,
 			cursor, &offsets, &offsets_heap,
 			ibuf_entry, &ins_rec,
 			&dummy_big_rec, 0, thr, &mtr);
+		if (err != DB_SUCCESS) {
+			*ibuf_page_no = buf_block_get_page_no(btr_cur_get_block(cursor));
+			*modify_clock = buf_block_get_modify_clock(
+					btr_cur_get_block(cursor));
+		}
 		block = btr_cur_get_block(cursor);
 		ut_ad(buf_block_get_space(block) == IBUF_SPACE_ID);
 
@@ -3711,11 +3737,17 @@ fail_exit:
 
 		root = ibuf_tree_root_get(&mtr);
 
-		err = btr_cur_optimistic_insert(
-			BTR_NO_LOCKING_FLAG | BTR_NO_UNDO_LOG_FLAG,
-			cursor, &offsets, &offsets_heap,
-			ibuf_entry, &ins_rec,
-			&dummy_big_rec, 0, thr, &mtr);
+		if ((*ibuf_page_no != buf_block_get_page_no(btr_cur_get_block(cursor)))
+			|| (*modify_clock != buf_block_get_modify_clock(
+					btr_cur_get_block(cursor)))) {
+			err = btr_cur_optimistic_insert(
+				BTR_NO_LOCKING_FLAG | BTR_NO_UNDO_LOG_FLAG,
+				cursor, &offsets, &offsets_heap,
+				ibuf_entry, &ins_rec,
+				&dummy_big_rec, 0, thr, &mtr);
+		} else {
+			err = DB_FAIL;
+		}
 
 		if (err == DB_FAIL) {
 			err = btr_cur_pessimistic_insert(
@@ -3800,10 +3832,8 @@ ibuf_insert(
 	/* Read the settable global variable ibuf_use only once in
 	this function, so that we will have a consistent view of it. */
 	ibuf_use_t	use		= ibuf_use;
-	DBUG_ENTER("ibuf_insert");
-
-	DBUG_PRINT("ibuf", ("op: %d, space: %ld, page_no: %ld",
-			    op, space, page_no));
+	ulint	ibuf_page_no = ULINT_UNDEFINED;
+	ullint	modify_clock = ULLINT_UNDEFINED;
 
 	ut_ad(dtuple_check_typed(entry));
 	ut_ad(ut_is_2pow(zip_size));
@@ -3818,7 +3848,7 @@ ibuf_insert(
 		case IBUF_USE_NONE:
 		case IBUF_USE_DELETE:
 		case IBUF_USE_DELETE_MARK:
-			DBUG_RETURN(FALSE);
+			return(FALSE);
 		case IBUF_USE_INSERT:
 		case IBUF_USE_INSERT_DELETE_MARK:
 		case IBUF_USE_ALL:
@@ -3831,7 +3861,7 @@ ibuf_insert(
 		switch (use) {
 		case IBUF_USE_NONE:
 		case IBUF_USE_INSERT:
-			DBUG_RETURN(FALSE);
+			return(FALSE);
 		case IBUF_USE_DELETE_MARK:
 		case IBUF_USE_DELETE:
 		case IBUF_USE_INSERT_DELETE_MARK:
@@ -3847,7 +3877,7 @@ ibuf_insert(
 		case IBUF_USE_NONE:
 		case IBUF_USE_INSERT:
 		case IBUF_USE_INSERT_DELETE_MARK:
-			DBUG_RETURN(FALSE);
+			return(FALSE);
 		case IBUF_USE_DELETE_MARK:
 		case IBUF_USE_DELETE:
 		case IBUF_USE_ALL:
@@ -3889,7 +3919,7 @@ check_watch:
 			is being buffered, have this request executed
 			directly on the page in the buffer pool after the
 			buffered entries for this page have been merged. */
-			DBUG_RETURN(FALSE);
+			return(FALSE);
 		}
 	}
 
@@ -3900,16 +3930,18 @@ skip_watch:
 	    >= page_get_free_space_of_empty(dict_table_is_comp(index->table))
 	    / 2) {
 
-		DBUG_RETURN(FALSE);
+		return(FALSE);
 	}
 
 	err = ibuf_insert_low(BTR_MODIFY_PREV, op, no_counter,
 			      entry, entry_size,
-			      index, space, zip_size, page_no, thr);
+			      index, space, zip_size, page_no, thr,
+			      &ibuf_page_no, &modify_clock);
 	if (err == DB_FAIL) {
 		err = ibuf_insert_low(BTR_MODIFY_TREE, op, no_counter,
 				      entry, entry_size,
-				      index, space, zip_size, page_no, thr);
+				      index, space, zip_size, page_no, thr,
+				      &ibuf_page_no, &modify_clock);
 	}
 
 	if (err == DB_SUCCESS) {
@@ -3917,21 +3949,20 @@ skip_watch:
 		/* fprintf(stderr, "Ibuf insert for page no %lu of index %s\n",
 		page_no, index->name); */
 #endif
-		DBUG_RETURN(TRUE);
+		return(TRUE);
 
 	} else {
 		ut_a(err == DB_STRONG_FAIL || err == DB_TOO_BIG_RECORD);
 
-		DBUG_RETURN(FALSE);
+		return(FALSE);
 	}
 }
 
 /********************************************************************//**
 During merge, inserts to an index page a secondary index entry extracted
-from the insert buffer. 
-@return	newly inserted record */
+from the insert buffer. */
 static __attribute__((nonnull))
-rec_t*
+void
 ibuf_insert_to_index_page_low(
 /*==========================*/
 	const dtuple_t*	entry,	/*!< in: buffered entry to insert */
@@ -3950,13 +3981,10 @@ ibuf_insert_to_index_page_low(
 	ulint		zip_size;
 	const page_t*	bitmap_page;
 	ulint		old_bits;
-	rec_t*		rec;
-	DBUG_ENTER("ibuf_insert_to_index_page_low");
 
-	rec = page_cur_tuple_insert(page_cur, entry, index,
-				    offsets, &heap, 0, mtr);
-	if (rec != NULL) {
-		DBUG_RETURN(rec);
+	if (page_cur_tuple_insert(
+		    page_cur, entry, index, offsets, &heap, 0, mtr) != NULL) {
+		return;
 	}
 
 	/* Page reorganization or recompression should already have
@@ -3971,10 +3999,9 @@ ibuf_insert_to_index_page_low(
 
 	/* This time the record must fit */
 
-	rec = page_cur_tuple_insert(page_cur, entry, index,
-				    offsets, &heap, 0, mtr);
-	if (rec != NULL) {
-		DBUG_RETURN(rec);
+	if (page_cur_tuple_insert(page_cur, entry, index,
+				  offsets, &heap, 0, mtr) != NULL) {
+		return;
 	}
 
 	page = buf_block_get_frame(block);
@@ -4008,7 +4035,6 @@ ibuf_insert_to_index_page_low(
 	fputs("InnoDB: Submit a detailed bug report"
 	      " to http://bugs.mysql.com\n", stderr);
 	ut_ad(0);
-	DBUG_RETURN(NULL);
 }
 
 /************************************************************************
@@ -4030,13 +4056,6 @@ ibuf_insert_to_index_page(
 	rec_t*		rec;
 	ulint*		offsets;
 	mem_heap_t*	heap;
-
-	DBUG_ENTER("ibuf_insert_to_index_page");
-
-	DBUG_PRINT("ibuf", ("page_no: %ld", buf_block_get_page_no(block)));
-	DBUG_PRINT("ibuf", ("index name: %s", index->name));
-	DBUG_PRINT("ibuf", ("online status: %d",
-			    dict_index_get_online_status(index)));
 
 	ut_ad(ibuf_inside(mtr));
 	ut_ad(dtuple_check_typed(entry));
@@ -4081,7 +4100,7 @@ dump:
 		      "InnoDB: Submit a detailed bug report to"
 		      " http://bugs.mysql.com!\n", stderr);
 
-		DBUG_VOID_RETURN;
+		return;
 	}
 
 	low_match = page_cur_search(block, index, entry,
@@ -4130,12 +4149,29 @@ dump:
 							    update)
 		    && (!page_zip || btr_cur_update_alloc_zip(
 				page_zip, &page_cur, index, offsets,
-				rec_offs_size(offsets), false, mtr))) {
+				rec_offs_size(offsets), false,
+				mtr, mtr->trx))) {
 			/* This is the easy case. Do something similar
 			to btr_cur_update_in_place(). */
 			rec = page_cur_get_rec(&page_cur);
 			row_upd_rec_in_place(rec, index, offsets,
 					     update, page_zip);
+
+			/* Log the update in place operation. During recovery
+			MLOG_COMP_REC_UPDATE_IN_PLACE/MLOG_REC_UPDATE_IN_PLACE
+			expects trx_id, roll_ptr for secondary indexes. So we
+			just write dummy trx_id(0), roll_ptr(0) */
+			btr_cur_update_in_place_log(BTR_KEEP_SYS_FLAG, rec,
+						    index, update, 0, 0, mtr);
+			DBUG_EXECUTE_IF(
+				"crash_after_log_ibuf_upd_inplace",
+				log_buffer_flush_to_disk();
+				ib_logf(IB_LOG_LEVEL_INFO,
+					"Wrote log record for ibuf update in "
+					"place operation");
+				DBUG_SUICIDE();
+			);
+
 			goto updated_in_place;
 		}
 
@@ -4164,11 +4200,10 @@ dump:
 		lock_rec_store_on_page_infimum(block, rec);
 		page_cur_delete_rec(&page_cur, index, offsets, mtr);
 		page_cur_move_to_prev(&page_cur);
-		rec = ibuf_insert_to_index_page_low(entry, block, index,
-				      		    &offsets, heap, mtr,
-						    &page_cur);
 
-		ut_ad(!cmp_dtuple_rec(entry, rec, offsets));
+		ibuf_insert_to_index_page_low(entry, block, index,
+					      &offsets, heap, mtr,
+					      &page_cur);
 		lock_rec_restore_from_page_infimum(block, rec, block);
 	} else {
 		offsets = NULL;
@@ -4176,10 +4211,9 @@ dump:
 					      &offsets, heap, mtr,
 					      &page_cur);
 	}
+
 updated_in_place:
 	mem_heap_free(heap);
-
-	DBUG_VOID_RETURN;
 }
 
 /****************************************************************//**
@@ -4320,13 +4354,18 @@ ibuf_delete(
 				= page_get_max_insert_size_after_reorganize(
 					page, 1);
 		}
-#ifdef UNIV_ZIP_DEBUG
-		ut_a(!page_zip || page_zip_validate(page_zip, page, index));
-#endif /* UNIV_ZIP_DEBUG */
+
+		if (UNIV_UNLIKELY(page_zip_debug)) {
+			ut_a(!page_zip
+			     || page_zip_validate(page_zip, page, index));
+		}
+
 		page_cur_delete_rec(&page_cur, index, offsets, mtr);
-#ifdef UNIV_ZIP_DEBUG
-		ut_a(!page_zip || page_zip_validate(page_zip, page, index));
-#endif /* UNIV_ZIP_DEBUG */
+
+		if (UNIV_UNLIKELY(page_zip_debug)) {
+			ut_a(!page_zip
+			     || page_zip_validate(page_zip, page, index));
+		}
 
 		if (page_zip) {
 			ibuf_update_free_bits_zip(block, mtr);
@@ -4441,7 +4480,8 @@ ibuf_delete_rec(
 		btr_cur_set_deleted_flag_for_ibuf(
 			btr_pcur_get_rec(pcur), NULL, TRUE, mtr);
 		ibuf_mtr_commit(mtr);
-		log_write_up_to(LSN_MAX, LOG_WAIT_ALL_GROUPS, TRUE);
+		log_write_up_to(LSN_MAX, LOG_WAIT_ALL_GROUPS, TRUE,
+				LOG_WRITE_FROM_DIRTY_BUFFER);
 		DBUG_SUICIDE();
 	}
 #endif /* UNIV_DEBUG || UNIV_IBUF_DEBUG */
@@ -4498,6 +4538,7 @@ ibuf_delete_rec(
 			      BTR_MODIFY_TREE, pcur, mtr)) {
 
 		mutex_exit(&ibuf_mutex);
+		ut_ad(!ibuf_inside(mtr));
 		ut_ad(mtr->state == MTR_COMMITTED);
 		goto func_exit;
 	}
@@ -4518,6 +4559,7 @@ ibuf_delete_rec(
 	ibuf_btr_pcur_commit_specify_mtr(pcur, mtr);
 
 func_exit:
+	ut_ad(!ibuf_inside(mtr));
 	ut_ad(mtr->state == MTR_COMMITTED);
 	btr_pcur_close(pcur);
 
@@ -4848,6 +4890,7 @@ loop:
 						      BTR_MODIFY_LEAF,
 						      &pcur, &mtr)) {
 
+					ut_ad(!ibuf_inside(&mtr));
 					ut_ad(mtr.state == MTR_COMMITTED);
 					mops[op]++;
 					ibuf_dummy_index_free(dummy_index);

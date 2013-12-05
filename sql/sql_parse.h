@@ -47,6 +47,8 @@ bool mysql_insert_select_prepare(THD *thd);
 bool update_precheck(THD *thd, TABLE_LIST *tables);
 bool delete_precheck(THD *thd, TABLE_LIST *tables);
 bool insert_precheck(THD *thd, TABLE_LIST *tables);
+bool block_myisam_tables(HA_CREATE_INFO *create_info,
+                         TABLE_LIST *table_list);
 bool create_table_precheck(THD *thd, TABLE_LIST *tables,
                            TABLE_LIST *create_table);
 
@@ -89,7 +91,8 @@ bool is_log_table_write_query(enum enum_sql_command command);
 bool alloc_query(THD *thd, const char *packet, uint packet_length);
 void mysql_init_select(LEX *lex);
 void mysql_parse(THD *thd, char *rawbuf, uint length,
-                 Parser_state *parser_state);
+                 Parser_state *parser_state, ulonglong *last_timer,
+                 my_bool *async_commit);
 void mysql_reset_thd_for_next_command(THD *thd);
 bool mysql_new_select(LEX *lex, bool move_down);
 void create_select_for_variable(const char *var_name);
@@ -98,14 +101,17 @@ void mysql_init_multi_delete(LEX *lex);
 bool multi_delete_set_locks_and_link_aux_tables(LEX *lex);
 void create_table_set_open_action_and_adjust_tables(LEX *lex);
 pthread_handler_t handle_bootstrap(void *arg);
-int mysql_execute_command(THD *thd);
+int mysql_execute_command(THD *thd, ulonglong *statement_start_time,
+                          ulonglong *post_parse);
 bool do_command(THD *thd);
 void do_handle_bootstrap(THD *thd);
 bool dispatch_command(enum enum_server_command command, THD *thd,
 		      char* packet, uint packet_length);
-void log_slow_statement(THD *thd);
+void log_slow_statement(THD *thd, struct system_status_var* query_start_status);
+void log_to_datagram(THD *thd, ulonglong end_utime_of_query);
+bool write_log_to_socket(int sockfd, THD *thd, ulonglong end_utime_of_query);
 bool log_slow_applicable(THD *thd);
-void log_slow_do(THD *thd);
+void log_slow_do(THD *thd, struct system_status_var* query_start_status);
 bool append_file_to_dir(THD *thd, const char **filename_ptr,
                         const char *table_name);
 bool append_file_to_dir(THD *thd, const char **filename_ptr,

@@ -1798,12 +1798,7 @@ static void create_file_v1(PSI_file_key key, const char *name, File file)
 */
 struct PFS_spawn_thread_arg
 {
-  ulonglong m_thread_internal_id;
-  char m_username[USERNAME_LENGTH];
-  uint m_username_length;
-  char m_hostname[HOSTNAME_LENGTH];
-  uint m_hostname_length;
-
+  PFS_thread *m_parent_thread;
   PSI_thread_key m_child_key;
   const void *m_child_identity;
   void *(*m_user_start_routine)(void*);
@@ -1825,15 +1820,17 @@ void* pfs_spawn_thread(void *arg)
     pfs= create_thread(klass, typed_arg->m_child_identity, 0);
     if (likely(pfs != NULL))
     {
+      PFS_thread *parent= typed_arg->m_parent_thread;
+
       clear_thread_account(pfs);
 
-      pfs->m_parent_thread_internal_id= typed_arg->m_thread_internal_id;
+      pfs->m_parent_thread_internal_id= parent->m_thread_internal_id;
 
-      memcpy(pfs->m_username, typed_arg->m_username, sizeof(pfs->m_username));
-      pfs->m_username_length= typed_arg->m_username_length;
+      memcpy(pfs->m_username, parent->m_username, sizeof(pfs->m_username));
+      pfs->m_username_length= parent->m_username_length;
 
-      memcpy(pfs->m_hostname, typed_arg->m_hostname, sizeof(pfs->m_hostname));
-      pfs->m_hostname_length= typed_arg->m_hostname_length;
+      memcpy(pfs->m_hostname, parent->m_hostname, sizeof(pfs->m_hostname));
+      pfs->m_hostname_length= parent->m_hostname_length;
 
       set_thread_account(pfs);
     }
@@ -1869,7 +1866,6 @@ static int spawn_thread_v1(PSI_thread_key key,
                            void *(*start_routine)(void*), void *arg)
 {
   PFS_spawn_thread_arg *psi_arg;
-  PFS_thread *parent;
 
   /* psi_arg can not be global, and can not be a local variable. */
   psi_arg= (PFS_spawn_thread_arg*) my_malloc(sizeof(PFS_spawn_thread_arg),
@@ -1877,33 +1873,11 @@ static int spawn_thread_v1(PSI_thread_key key,
   if (unlikely(psi_arg == NULL))
     return EAGAIN;
 
+  psi_arg->m_parent_thread= my_pthread_getspecific_ptr(PFS_thread*, THR_PFS);
   psi_arg->m_child_key= key;
   psi_arg->m_child_identity= (arg ? arg : thread);
   psi_arg->m_user_start_routine= start_routine;
   psi_arg->m_user_arg= arg;
-
-  parent= my_pthread_getspecific_ptr(PFS_thread*, THR_PFS);
-  if (parent != NULL)
-  {
-    /*
-      Make a copy of the parent attributes.
-      This is required, because instrumentation for this thread (the parent)
-      may be destroyed before the child thread instrumentation is created.
-    */
-    psi_arg->m_thread_internal_id= parent->m_thread_internal_id;
-
-    memcpy(psi_arg->m_username, parent->m_username, sizeof(psi_arg->m_username));
-    psi_arg->m_username_length= parent->m_username_length;
-
-    memcpy(psi_arg->m_hostname, parent->m_hostname, sizeof(psi_arg->m_hostname));
-    psi_arg->m_hostname_length= parent->m_hostname_length;
-  }
-  else
-  {
-    psi_arg->m_thread_internal_id= 0;
-    psi_arg->m_username_length= 0;
-    psi_arg->m_hostname_length= 0;
-  }
 
   int result= pthread_create(thread, attr, pfs_spawn_thread, psi_arg);
   if (unlikely(result != 0))
@@ -1967,9 +1941,9 @@ static void set_thread_user_v1(const char *user, int user_len)
   if (unlikely(pfs == NULL))
     return;
 
-  aggregate_thread(pfs, pfs->m_account, pfs->m_user, pfs->m_host);
+  aggregate_thread(pfs);
 
-  pfs->m_session_lock.allocated_to_dirty();
+  pfs->m_lock.allocated_to_dirty();
 
   clear_thread_account(pfs);
 
@@ -1999,7 +1973,7 @@ static void set_thread_user_v1(const char *user, int user_len)
 
   pfs->m_enabled= enabled;
 
-  pfs->m_session_lock.dirty_to_allocated();
+  pfs->m_lock.dirty_to_allocated();
 }
 
 /**
@@ -2021,7 +1995,7 @@ static void set_thread_account_v1(const char *user, int user_len,
   if (unlikely(pfs == NULL))
     return;
 
-  pfs->m_session_lock.allocated_to_dirty();
+  pfs->m_lock.allocated_to_dirty();
 
   clear_thread_account(pfs);
 
@@ -2054,7 +2028,7 @@ static void set_thread_account_v1(const char *user, int user_len,
   }
   pfs->m_enabled= enabled;
 
-  pfs->m_session_lock.dirty_to_allocated();
+  pfs->m_lock.dirty_to_allocated();
 }
 
 /**
@@ -2071,11 +2045,11 @@ static void set_thread_db_v1(const char* db, int db_len)
 
   if (likely(pfs != NULL))
   {
-    pfs->m_stmt_lock.allocated_to_dirty();
+    pfs->m_lock.allocated_to_dirty();
     if (db_len > 0)
       memcpy(pfs->m_dbname, db, db_len);
     pfs->m_dbname_length= db_len;
-    pfs->m_stmt_lock.dirty_to_allocated();
+    pfs->m_lock.dirty_to_allocated();
   }
 }
 
@@ -2092,7 +2066,9 @@ static void set_thread_command_v1(int command)
 
   if (likely(pfs != NULL))
   {
+    pfs->m_lock.allocated_to_dirty();
     pfs->m_command= command;
+    pfs->m_lock.dirty_to_allocated();
   }
 }
 
@@ -2106,7 +2082,9 @@ static void set_thread_start_time_v1(time_t start_time)
 
   if (likely(pfs != NULL))
   {
+    pfs->m_lock.allocated_to_dirty();
     pfs->m_start_time= start_time;
+    pfs->m_lock.dirty_to_allocated();
   }
 }
 
@@ -2136,16 +2114,16 @@ static void set_thread_info_v1(const char* info, uint info_len)
       if (info_len > sizeof(pfs->m_processlist_info))
         info_len= sizeof(pfs->m_processlist_info);
 
-      pfs->m_stmt_lock.allocated_to_dirty();
+      pfs->m_processlist_info_lock.allocated_to_dirty();
       memcpy(pfs->m_processlist_info, info, info_len);
       pfs->m_processlist_info_length= info_len;
-      pfs->m_stmt_lock.dirty_to_allocated();
+      pfs->m_processlist_info_lock.dirty_to_allocated();
     }
     else
     {
-      pfs->m_stmt_lock.allocated_to_dirty();
+      pfs->m_processlist_info_lock.allocated_to_dirty();
       pfs->m_processlist_info_length= 0;
-      pfs->m_stmt_lock.dirty_to_allocated();
+      pfs->m_processlist_info_lock.dirty_to_allocated();
     }
   }
 }
@@ -2169,7 +2147,7 @@ static void delete_current_thread_v1(void)
   PFS_thread *thread= my_pthread_getspecific_ptr(PFS_thread*, THR_PFS);
   if (thread != NULL)
   {
-    aggregate_thread(thread, thread->m_account, thread->m_user, thread->m_host);
+    aggregate_thread(thread);
     my_pthread_setspecific_ptr(THR_PFS, NULL);
     destroy_thread(thread);
   }
@@ -2185,7 +2163,7 @@ static void delete_thread_v1(PSI_thread *thread)
 
   if (pfs != NULL)
   {
-    aggregate_thread(pfs, pfs->m_account, pfs->m_user, pfs->m_host);
+    aggregate_thread(pfs);
     destroy_thread(pfs);
   }
 }
@@ -3327,8 +3305,6 @@ start_idle_wait_v1(PSI_idle_locker_state* state, const char *src_file, uint src_
       return NULL;
     state->m_thread= reinterpret_cast<PSI_thread *> (pfs_thread);
     flags= STATE_FLAG_THREAD;
-
-    DBUG_ASSERT(pfs_thread->m_events_statements_count == 0);
 
     if (global_idle_class.m_timed)
     {
@@ -4526,23 +4502,20 @@ refine_statement_v1(PSI_statement_locker *locker,
   klass= reinterpret_cast<PFS_statement_class*> (state->m_class);
   DBUG_ASSERT(klass->m_flags & PSI_FLAG_MUTABLE);
   klass= find_statement_class(key);
-
-  uint flags= state->m_flags;
-
-  if (unlikely(klass == NULL) || !klass->m_enabled)
+  if (unlikely(klass == NULL))
   {
-    /* pop statement stack */
-    if (flags & STATE_FLAG_THREAD)
-    {
-      PFS_thread *pfs_thread= reinterpret_cast<PFS_thread *> (state->m_thread);
-      DBUG_ASSERT(pfs_thread != NULL);
-      if (pfs_thread->m_events_statements_count > 0)
-        pfs_thread->m_events_statements_count--;
-    }
-
+    /* FIXME : pop statement stack */
     state->m_discarded= true;
     return NULL;
   }
+  if (! klass->m_enabled)
+  {
+    /* FIXME : pop statement stack */
+    state->m_discarded= true;
+    return NULL;
+  }
+
+  register uint flags= state->m_flags;
 
   if ((flags & STATE_FLAG_TIMED) && ! klass->m_timed)
     flags= flags & ~STATE_FLAG_TIMED;
@@ -5117,17 +5090,19 @@ static int set_thread_connect_attrs_v1(const char *buffer, uint length,
     /* copy from the input buffer as much as we can fit */
     uint copy_size= (uint)(length < session_connect_attrs_size_per_thread ?
                            length : session_connect_attrs_size_per_thread);
-    thd->m_session_lock.allocated_to_dirty();
+    thd->m_lock.allocated_to_dirty();
     memcpy(thd->m_session_connect_attrs, buffer, copy_size);
     thd->m_session_connect_attrs_length= copy_size;
     thd->m_session_connect_attrs_cs= (const CHARSET_INFO *) from_cs;
-    thd->m_session_lock.dirty_to_allocated();
-
+    thd->m_lock.dirty_to_allocated();
+    
     if (copy_size == length)
       return 0;
-
-    session_connect_attrs_lost++;
-    return 1;
+    else
+    {
+      session_connect_attrs_lost++;
+      return 1;
+    }
   }
   return 0;
 }

@@ -1135,7 +1135,8 @@ innobase_rec_to_mysql(
 
 		field->reset();
 
-		ipos = dict_index_get_nth_col_or_prefix_pos(index, i, TRUE);
+		ipos = dict_index_get_nth_col_or_prefix_pos(index, i, TRUE,
+							    NULL);
 
 		if (ipos == ULINT_UNDEFINED
 		    || rec_offs_nth_extern(offsets, ipos)) {
@@ -1183,7 +1184,8 @@ innobase_fields_to_mysql(
 
 		field->reset();
 
-		ipos = dict_index_get_nth_col_or_prefix_pos(index, i, TRUE);
+		ipos = dict_index_get_nth_col_or_prefix_pos(index, i, TRUE,
+							    NULL);
 
 		if (ipos == ULINT_UNDEFINED
 		    || dfield_is_ext(&fields[ipos])
@@ -2573,6 +2575,9 @@ prepare_inplace_alter_table_dict(
 	/* Create a background transaction for the operations on
 	the data dictionary tables. */
 	ctx->trx = innobase_trx_allocate(ctx->prebuilt->trx->mysql_thd);
+	/* No need to check trx->fake_changes, it is already
+	checked within prepare_inplace_alter_table*/
+	DBUG_ASSERT(!ctx->trx->fake_changes);
 
 	trx_start_for_ddl(ctx->trx, TRX_DICT_OP_INDEX);
 
@@ -2954,9 +2959,7 @@ prepare_inplace_alter_table_dict(
 			error = DB_OUT_OF_MEMORY;
 			goto error_handling;
 		}
-	}
 
-	if (ctx->online) {
 		/* Assign a consistent read view for
 		row_merge_read_clustered_index(). */
 		trx_assign_read_view(ctx->prebuilt->trx);
@@ -3047,6 +3050,8 @@ op_ok:
 	dict_locked = false;
 
 	ut_a(ctx->trx->lock.n_active_thrs == 0);
+
+	DBUG_EXECUTE_IF("crash_innodb_add_index_after", DBUG_SUICIDE(););
 
 error_handling:
 	/* After an error, remove all those index definitions from the
@@ -3180,6 +3185,8 @@ innobase_check_foreign_key_index(
 {
 	dict_foreign_t*	foreign;
 
+	ut_ad(!index->to_be_dropped);
+
 	/* Check if the index is referenced. */
 	foreign = dict_table_get_referenced_constraint(indexed_table, index);
 
@@ -3277,6 +3284,10 @@ ha_innobase::prepare_inplace_alter_table(
 	DBUG_ASSERT(!ha_alter_info->handler_ctx);
 	DBUG_ASSERT(ha_alter_info->create_info);
 	DBUG_ASSERT(!srv_read_only_mode);
+
+	if (UNIV_UNLIKELY(prebuilt->trx->fake_changes)) {
+		DBUG_RETURN(true);
+	}
 
 	MONITOR_ATOMIC_INC(MONITOR_PENDING_ALTER_TABLE);
 
@@ -3600,16 +3611,6 @@ check_if_can_drop_indexes:
 		CREATE TABLE adding FOREIGN KEY constraints. */
 		row_mysql_lock_data_dictionary(prebuilt->trx);
 
-		if (!n_drop_index) {
-			drop_index = NULL;
-		} else {
-			/* Flag all indexes that are to be dropped. */
-			for (ulint i = 0; i < n_drop_index; i++) {
-				ut_ad(!drop_index[i]->to_be_dropped);
-				drop_index[i]->to_be_dropped = 1;
-			}
-		}
-
 		if (prebuilt->trx->check_foreigns) {
 			for (uint i = 0; i < n_drop_index; i++) {
 			     dict_index_t*	index = drop_index[i];
@@ -3637,6 +3638,16 @@ check_if_can_drop_indexes:
 				row_mysql_unlock_data_dictionary(prebuilt->trx);
 				print_error(HA_ERR_DROP_INDEX_FK, MYF(0));
 				goto err_exit;
+			}
+		}
+
+		if (!n_drop_index) {
+			drop_index = NULL;
+		} else {
+			/* Flag all indexes that are to be dropped. */
+			for (ulint i = 0; i < n_drop_index; i++) {
+				ut_ad(!drop_index[i]->to_be_dropped);
+				drop_index[i]->to_be_dropped = 1;
 			}
 		}
 
@@ -3865,6 +3876,7 @@ ok_exit:
 	DBUG_ASSERT(ctx);
 	DBUG_ASSERT(ctx->trx);
 	DBUG_ASSERT(ctx->prebuilt == prebuilt);
+	DBUG_ASSERT(!ctx->trx->fake_changes);
 
 	if (prebuilt->table->ibd_file_missing
 	    || dict_table_is_discarded(prebuilt->table)) {
@@ -5430,6 +5442,7 @@ ha_innobase::commit_inplace_alter_table(
 		mtr_t	mtr;
 		mtr_start(&mtr);
 
+#ifndef XTRABACKUP
 		for (inplace_alter_handler_ctx** pctx = ctx_array;
 		     *pctx; pctx++) {
 			ha_innobase_inplace_ctx*	ctx
@@ -5447,6 +5460,7 @@ ha_innobase::commit_inplace_alter_table(
 			DBUG_INJECT_CRASH("ib_commit_inplace_crash",
 					  crash_inject_count++);
 		}
+#endif /* !XTRABACKUP */
 
 		/* Test what happens on crash if the redo logs
 		are flushed to disk here. The log records
@@ -5467,7 +5481,7 @@ ha_innobase::commit_inplace_alter_table(
 		log_buffer_flush_to_disk() returns. In the
 		logical sense the commit in the file-based
 		data structures happens here. */
-		trx_commit_low(trx, &mtr);
+		trx_commit_low(trx, &mtr, commit);
 
 		/* If server crashes here, the dictionary in
 		InnoDB and MySQL will differ.  The .ibd files

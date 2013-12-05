@@ -1,4 +1,4 @@
-/* Copyright (c) 2012, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or
    modify it under the terms of the GNU General Public License as
@@ -760,6 +760,10 @@ struct Gtid
 
   /// Set both components to 0.
   void clear() { sidno= 0; gno= 0; }
+  // Set both components to input values.
+  void set(rpl_sidno sno, rpl_gno gtidno) { sidno = sno; gno = gtidno; }
+  // check if both components are zero or not.
+  bool empty() const { return (sidno == 0) && (gno == 0); }
   /**
     The maximal length of the textual representation of a SID, not
     including the terminating '\0'.
@@ -899,6 +903,16 @@ public:
     Free_intervals_lock lock(this);
     enum_return_status ret= add_gno_interval(&ivit, gno, gno + 1, &lock);
     DBUG_RETURN(ret);
+  }
+  /**
+    Removes the given GTID from this Gtid_set.
+
+    @param gtid Gtid to remove.
+    @return RETURN_STATUS_OK or RETURN_STATUS_REPORTED_ERROR.
+  */
+  enum_return_status _remove_gtid(const Gtid &gtid)
+  {
+    return _remove_gtid(gtid.sidno, gtid.gno);
   }
   /**
     Removes the given GTID from this Gtid_set.
@@ -1392,6 +1406,11 @@ public:
 
 public:
 
+  /**
+     Returns this Gtid_set as a binary string and stores the length
+     of the binary string in encoded_length.
+  */
+  uchar* encode(uint *encoded_length) const;
   /**
     Encodes this Gtid_set as a binary string.
   */
@@ -2362,6 +2381,17 @@ enum enum_group_type
     It is important that AUTOMATIC_GROUP==0 so that the default value
     for thd->variables->gtid_next.type is AUTOMATIC_GROUP.
   */
+  /**
+    AUTOMATIC_GROUP indicates that a new GTID will be allocated by this server
+    for the current transaction.
+    GTID_GROUP indicates that a GTID was already allocated for this transaction
+    possibly by another server.
+    ANONYMOUS_GROUP indicates that the current transaction will not be assigned
+    a GTID. This is set by using 'set @@gtid_next='ANONYMOUS'' and will create
+    a new log event called ANONYMOUS_GTID_LOG_EVENT.
+    INVALID_GROUP indicates that the GTID is not valid.
+    UNDEFINE_GROUP indicates that no other group type is still assigned.
+  */
   AUTOMATIC_GROUP= 0, GTID_GROUP, ANONYMOUS_GROUP, INVALID_GROUP, UNDEFINED_GROUP
 };
 
@@ -2661,6 +2691,7 @@ private:
   /// List of all groups in this cache, of type Cached_group.
   DYNAMIC_ARRAY groups;
 
+public:
   /**
     Return a pointer to the last group, or NULL if this Group_cache is
     empty.
@@ -2671,6 +2702,7 @@ private:
     return n_groups == 0 ? NULL : get_unsafe_pointer(n_groups - 1);
   }
 
+private:
   /**
     Allocate space for one more group and return a pointer to it, or
     NULL on error.
@@ -2751,15 +2783,7 @@ gtid_before_statement(THD *thd, Group_cache *gsc, Group_cache *gtc);
 
   @param thd THD object for the session.
 */
-enum_gtid_statement_status gtid_pre_statement_checks(const THD *thd);
-
-/**
-  Check if the current statement terminates a transaction, and if so
-  set GTID_NEXT.type to UNDEFINED_GROUP.
-
-  @param thd THD object for the session.
-*/
-void gtid_post_statement_checks(THD *thd);
+enum_gtid_statement_status gtid_pre_statement_checks(THD *thd);
 
 /**
   When a transaction is rolled back, this function releases ownership

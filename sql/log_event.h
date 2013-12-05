@@ -37,6 +37,7 @@
 #include "rpl_utility.h"
 #include "hash.h"
 #include "rpl_tblmap.h"
+#include "rpl_tblmap.cc"
 #endif
 
 #ifdef MYSQL_SERVER
@@ -45,6 +46,7 @@
 #include "sql_class.h"                          /* THD */
 #include "rpl_utility.h"                        /* Hash_slave_rows */
 #include "rpl_filter.h"
+#include "rpl_gtid_info.h"
 #endif
 
 /* Forward declarations */
@@ -90,6 +92,7 @@ typedef struct st_db_worker_hash_entry db_worker_hash_entry;
 #define LOG_READ_TRUNC  -6
 #define LOG_READ_TOO_LARGE -7
 #define LOG_READ_CHECKSUM_FAILURE -8
+#define LOG_READ_BINLOG_LAST_VALID_POS -9
 
 #define LOG_EVENT_OFFSET 4
 
@@ -456,6 +459,7 @@ struct sql_ex_info
 
 /* 4 bytes which all binlogs should begin with */
 #define BINLOG_MAGIC        "\xfe\x62\x69\x6e"
+#define SIZEOF_BINLOG_MAGIC 4
 
 /*
   The 2 flags below were useless :
@@ -718,6 +722,14 @@ enum Log_event_type
 
   ENUM_END_EVENT /* end marker */
 };
+
+/* Count binlog events by type processed by the SQL slave */
+extern ulonglong repl_event_counts[ENUM_END_EVENT];
+extern ulonglong repl_event_count_other;
+
+/* Time binlog events by type processed by the SQL slave */
+extern ulonglong repl_event_times[ENUM_END_EVENT];
+extern ulonglong repl_event_time_other;
 
 /*
    The number of types we handle in Format_description_log_event (UNKNOWN_EVENT
@@ -996,7 +1008,6 @@ public:
     EVENT_SKIP_COUNT
   };
 
-protected:
   enum enum_event_cache_type 
   {
     EVENT_INVALID_CACHE= 0,
@@ -1170,7 +1181,8 @@ public:
                                    mysql_mutex_t* log_lock,
                                    const Format_description_log_event
                                    *description_event,
-                                   my_bool crc_check);
+                                   my_bool crc_check,
+                                   int *read_length);
 
   /**
     Reads an event from a binlog or relay log. Used by the dump thread
@@ -1197,7 +1209,6 @@ public:
     @retval LOG_READ_TOO_LARGE  event too large
    */
   static int read_log_event(IO_CACHE* file, String* packet,
-                            mysql_mutex_t* log_lock,
                             uint8 checksum_alg_arg,
                             const char *log_file_name_arg= NULL,
                             bool* is_binlog_active= NULL);
@@ -1312,9 +1323,21 @@ public:
   {
     return(event_cache_type == EVENT_STMT_CACHE);
   }
+  inline void set_using_trans_cache()
+  {
+    event_cache_type = EVENT_TRANSACTIONAL_CACHE;
+  }
+  inline void set_using_stmt_cache()
+  {
+    event_cache_type = EVENT_STMT_CACHE;
+  }
   inline bool is_using_immediate_logging() const
   {
     return(event_logging_type == EVENT_IMMEDIATE_LOGGING);
+  }
+  inline void set_immediate_logging()
+  {
+    event_logging_type = EVENT_IMMEDIATE_LOGGING;
   }
   Log_event(const char* buf, const Format_description_log_event
             *description_event);
@@ -1643,6 +1666,16 @@ protected:
      non-zero. The caller shall decrease the counter by one.
    */
   virtual enum_skip_reason do_shall_skip(Relay_log_info *rli);
+
+public:
+  void apply_query_event(char *query, uint32 query_length_arg);
+  bool is_row_log_event();
+  inline void reset_log_pos()
+  {
+    // Reset log_pos while writing a relay log event to the binlog.
+    // This ensures log_pos is calculated relative to slave's binlog.
+    log_pos = 0;
+  }
 #endif
 };
 
@@ -2099,6 +2132,8 @@ public:
   */
   uchar mts_accessed_dbs;
   char mts_accessed_db_names[MAX_DBS_IN_EVENT_MTS][NAME_LEN];
+  void set_bit_flags2(uint32 flag_set) { flags2 |= flag_set; }
+  void clear_bit_flags2(uint32 flag_set) { flags2 &= ~flag_set; }
 
 #ifdef MYSQL_SERVER
 
@@ -4905,6 +4940,7 @@ public:
 #if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
   int do_apply_event(Relay_log_info const *rli);
   int do_update_pos(Relay_log_info *rli);
+  void set_last_gtid(char *last_gtid);
 #endif
 
   /**
@@ -5130,6 +5166,9 @@ size_t my_strmov_quoted_identifier(char *buffer, const char* identifier);
 size_t my_strmov_quoted_identifier_helper(int q, char *buffer,
                                           const char* identifier,
                                           uint length);
+
+my_off_t find_gtid_pos_in_log(const char* log_name, const Gtid &gtid,
+                              Sid_map *sid_map);
 
 /**
   @} (end of group Replication)

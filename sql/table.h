@@ -1111,6 +1111,8 @@ public:
   uint          temp_pool_slot;		/* Used by intern temp tables */
   uint		db_stat;		/* mode of file as in handler.h */
   int		current_lock;           /* Type of lock on table */
+  ulonglong count_comment_bytes;        /* Count of Bytes of Comments
+                                           in the Query using this table */
 
   /*
     0 or JOIN_TYPE_{LEFT|RIGHT}. Currently this is only compared to 0.
@@ -1806,11 +1808,6 @@ public:
     OPEN_NORMAL= 0,
     /* Associate a table share only if the the table exists. */
     OPEN_IF_EXISTS,
-    /*
-      Associate a table share only if the the table exists.
-      Also upgrade metadata lock to exclusive if table doesn't exist.
-    */
-    OPEN_FOR_CREATE,
     /* Don't associate a table share. */
     OPEN_STUB
   } open_strategy;
@@ -2395,6 +2392,7 @@ extern LEX_STRING MYSQL_SCHEMA_NAME;
 extern LEX_STRING RLI_INFO_NAME;
 extern LEX_STRING MI_INFO_NAME;
 extern LEX_STRING WORKER_INFO_NAME;
+extern LEX_STRING GTID_INFO_NAME;
 
 inline bool is_infoschema_db(const char *name, size_t len)
 {
@@ -2424,7 +2422,6 @@ inline void mark_as_null_row(TABLE *table)
 {
   table->null_row=1;
   table->status|=STATUS_NULL_ROW;
-  memset(table->null_flags, 255, table->s->null_bytes);
 }
 
 bool is_simple_order(ORDER *order);

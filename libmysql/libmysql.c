@@ -1125,8 +1125,8 @@ my_bool STDCALL mysql_embedded(void)
 void my_net_local_init(NET *net)
 {
   net->max_packet=   (uint) net_buffer_length;
-  my_net_set_read_timeout(net, CLIENT_NET_READ_TIMEOUT);
-  my_net_set_write_timeout(net, CLIENT_NET_WRITE_TIMEOUT);
+  my_net_set_read_timeout(net, timeout_from_seconds(CLIENT_NET_READ_TIMEOUT));
+  my_net_set_write_timeout(net, timeout_from_seconds(CLIENT_NET_WRITE_TIMEOUT));
   net->retry_count=  1;
   net->max_packet_size= MY_MAX(net_buffer_length, max_allowed_packet);
 }
@@ -4891,3 +4891,26 @@ my_bool STDCALL mysql_read_query_result(MYSQL *mysql)
   return (*mysql->methods->read_query_result)(mysql);
 }
 
+
+net_async_status STDCALL mysql_next_result_nonblocking(MYSQL *mysql, int* error)
+{
+  my_bool err;
+  if (mysql->status != MYSQL_STATUS_READY)
+  {
+    set_mysql_error(mysql, CR_COMMANDS_OUT_OF_SYNC, unknown_sqlstate);
+    *error = 1;
+    return NET_ASYNC_COMPLETE;
+  }
+  net_clear_error(&mysql->net);
+  mysql->affected_rows = ~(my_ulonglong) 0;
+  if (mysql->server_status & SERVER_MORE_RESULTS_EXISTS)
+  {
+    if ((*mysql->methods->next_result_nonblocking)(mysql, &err) ==
+        NET_ASYNC_NOT_READY)
+      return NET_ASYNC_NOT_READY;
+    *error = (int) err;
+    return NET_ASYNC_COMPLETE;
+  }
+  *error = -1;
+  return NET_ASYNC_COMPLETE;
+}

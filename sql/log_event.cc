@@ -44,6 +44,7 @@
 #include <my_dir.h>
 #include "rpl_rli_pdb.h"
 #include "sql_show.h"    // append_identifier
+#include "rpl_info_factory.h"
 #include <mysql/psi/mysql_statement.h>
 
 #endif /* MYSQL_CLIENT */
@@ -106,6 +107,9 @@ template bool valid_buffer_range<unsigned int>(unsigned int,
                                                const char*,
                                                const char*,
                                                unsigned int);
+
+/* Time executing SQL for replication */
+ulonglong command_slave_seconds = 0;
 
 /* 
    replication event checksum is introduced in the following "checksum-home" version.
@@ -178,7 +182,6 @@ static const char *HA_ERR(int i)
   case HA_ERR_LOGGING_IMPOSSIBLE: return "HA_ERR_LOGGING_IMPOSSIBLE";
   case HA_ERR_CORRUPT_EVENT: return "HA_ERR_CORRUPT_EVENT";
   case HA_ERR_ROWS_EVENT_APPLY : return "HA_ERR_ROWS_EVENT_APPLY";
-  case HA_ERR_INNODB_READ_ONLY: return "HA_ERR_INNODB_READ_ONLY";
   }
   return "No Error!";
 }
@@ -835,6 +838,43 @@ Log_event::Log_event(const char* buf,
 }
 
 #ifndef MYSQL_CLIENT
+#define my_b_event_read my_b_read
+#else
+/**
+ * Wrapper around my_b_read to skip over any binlog_magic numbers
+ * we may see in the middle of stream. This can only happen if we
+ * are reading from stdin and input stream contains multiple binlog
+ * files. The first 4 bytes of an event are timestamp. It is possible
+ * that by coincidence the timestamp is same as binlog magic number
+ * (0xfe62696e i.e 4267862382) but that would only happen for one second
+ at Mon Mar 30 05:19:42 2105. We ignore that coincidence for now.
+ */
+int my_b_event_read(IO_CACHE* file, uchar *buf, int buflen)
+{
+  int read_status = 0; // assume success
+  int nbytes_already_read = 0;
+  if (file->file == fileno(stdin))
+  {
+    read_status = my_b_read(file, buf, SIZEOF_BINLOG_MAGIC);
+    if (!read_status)
+    {
+      // read succeeded
+      if (memcmp(buf, BINLOG_MAGIC, SIZEOF_BINLOG_MAGIC))
+      {
+        // does not match binlog magic number
+        nbytes_already_read = SIZEOF_BINLOG_MAGIC;
+      }
+      // else we got binlog magic number in middle of stream. Ignore.
+    }
+  }
+  if (!read_status) {
+    read_status = my_b_read(file, buf + nbytes_already_read,
+                            buflen - nbytes_already_read);
+  }
+  return read_status;
+}
+#endif
+#ifndef MYSQL_CLIENT
 #ifdef HAVE_REPLICATION
 inline int Log_event::do_apply_event_worker(Slave_worker *w)
 { 
@@ -1177,7 +1217,6 @@ bool Log_event::write_header(IO_CACHE* file, ulong event_data_length)
 */
 
 int Log_event::read_log_event(IO_CACHE* file, String* packet,
-                              mysql_mutex_t* log_lock,
                               uint8 checksum_alg_arg,
                               const char *log_file_name_arg,
                               bool* is_binlog_active)
@@ -1188,11 +1227,36 @@ int Log_event::read_log_event(IO_CACHE* file, String* packet,
   uchar ev_offset= packet->length();
   DBUG_ENTER("Log_event::read_log_event(IO_CACHE *, String *, mysql_mutex_t, uint8)");
 
-  if (log_lock)
-    mysql_mutex_lock(log_lock);
-
-  if (log_file_name_arg)
+  if (log_file_name_arg && is_binlog_active)
     *is_binlog_active= mysql_bin_log.is_active(log_file_name_arg);
+  /*
+    If the log_file_name_arg is active and we have read up to
+    binlog_end_pos, return LOG_READ_BINLOG_LAST_VALID_POS so that IO
+    thread will wait until binlog is updated
+  */
+  /*
+    Note that even though is_active can give stale value, it doesn't cause
+    problems. Let's say is_active is true although it's actually false
+    this may or may not give LOG_READ_BINLOG_LAST_VALID_POS depending on
+    second condition. If it doesn't give LOG_READ_BINLOG_LAST_VALID_POS,
+    it's fine because we should anyway need to read.
+
+    If it gives LOG_READ_BINLOG_LAST_VALID_POS, there is is_active check
+    after acquiring lock_binlog_end_pos in mysql_binlog_send before going to
+    wait for binlog update. Acquiring lock_binlog_end_pos each time we
+    read an event increases mutex contention. This corner case occurs
+    rarely only during binlog is rotated.
+
+    mysql_bin_log.binlog_end_pos() == my_b_tell(file) ensures that we don't read
+    past the last valid position in binlog.
+  */
+  if (mysql_bin_log.is_active(log_file_name_arg) &&
+      mysql_bin_log.get_binlog_end_pos_without_lock()
+        == my_b_tell(file))
+  {
+    result= LOG_READ_BINLOG_LAST_VALID_POS;
+    goto end;
+  }
 
   if (my_b_read(file, (uchar*) buf, sizeof(buf)))
   {
@@ -1279,8 +1343,6 @@ int Log_event::read_log_event(IO_CACHE* file, String* packet,
   }
 
 end:
-  if (log_lock)
-    mysql_mutex_unlock(log_lock);
   DBUG_PRINT("info", ("read_log_event returns %d", result));
   DBUG_RETURN(result);
 }
@@ -1303,7 +1365,8 @@ Log_event* Log_event::read_log_event(IO_CACHE* file,
                                      mysql_mutex_t* log_lock,
                                      const Format_description_log_event
                                      *description_event,
-                                     my_bool crc_check)
+                                     my_bool crc_check,
+                                     int *read_length)
 #else
 Log_event* Log_event::read_log_event(IO_CACHE* file,
                                      const Format_description_log_event
@@ -1326,7 +1389,7 @@ Log_event* Log_event::read_log_event(IO_CACHE* file,
 
   LOCK_MUTEX;
   DBUG_PRINT("info", ("my_b_tell: %lu", (ulong) my_b_tell(file)));
-  if (my_b_read(file, (uchar *) head, header_size))
+  if (my_b_event_read(file, (uchar *) head, header_size))
   {
     DBUG_PRINT("info", ("Log_event::read_log_event(IO_CACHE*,Format_desc*) "
                         "failed in my_b_read((IO_CACHE*)%p, (uchar*)%p, %u)",
@@ -1346,6 +1409,11 @@ Log_event* Log_event::read_log_event(IO_CACHE* file,
 #ifndef max_allowed_packet
   THD *thd=current_thd;
   uint max_allowed_packet= thd ? slave_max_allowed_packet : ~0U;
+#endif
+
+#ifndef MYSQL_CLIENT
+  if (read_length)
+    *read_length = data_len;
 #endif
 
   ulong const max_size=
@@ -2657,7 +2725,7 @@ bool Log_event::contains_partition_info(bool end_group_sets_max_dbs)
 
 Slave_worker *Log_event::get_slave_worker(Relay_log_info *rli)
 {
-  Slave_job_group group, *ptr_group= NULL;
+  Slave_job_group group, *ptr_group;
   bool is_s_event;
   int  num_dbs= 0;
   Slave_worker *ret_worker= NULL;
@@ -2686,13 +2754,14 @@ Slave_worker *Log_event::get_slave_worker(Relay_log_info *rli)
   {
     if (!rli->curr_group_seen_gtid && !rli->curr_group_seen_begin)
     {
-      ulong gaq_idx;
+      ulong DBUG_ONLY gaq_idx;
       rli->mts_groups_assigned++;
 
       rli->curr_group_isolated= FALSE;
       group.reset(log_pos, rli->mts_groups_assigned);
       // the last occupied GAQ's array index
-      gaq_idx= gaq->assigned_group_index= gaq->en_queue((void *) &group);
+      gaq_idx=
+        gaq->assigned_group_index= gaq->en_queue((void *) &group);
     
       DBUG_ASSERT(gaq_idx != MTS_WORKER_UNDEF && gaq_idx < gaq->size);
       DBUG_ASSERT(gaq->get_job_group(rli->gaq->assigned_group_index)->
@@ -2860,35 +2929,15 @@ Slave_worker *Log_event::get_slave_worker(Relay_log_info *rli)
     }
   }
 
-  DBUG_ASSERT(ret_worker);
-
-  /*
-    Preparing event physical coordinates info for Worker before any
-    event got scheduled so when Worker error-stopped at the first
-    event it would be aware of where exactly in the event stream.
-  */
-  if (!ret_worker->master_log_change_notified)
-  {
-    if (!ptr_group)
-      ptr_group= gaq->get_job_group(rli->gaq->assigned_group_index);
-    ptr_group->group_master_log_name=
-      my_strdup(rli->get_group_master_log_name(), MYF(MY_WME));
-    ret_worker->master_log_change_notified= true;
-
-    DBUG_ASSERT(!ptr_group->notified);
-#ifndef DBUG_OFF
-    ptr_group->notified= true;
-#endif
-  }
-
   // T-event: Commit, Xid, a DDL query or dml query of B-less group.
   if (ends_group() || !rli->curr_group_seen_begin)
   {
+    // index of GAQ that this terminal event belongs to
+    mts_group_idx= gaq->assigned_group_index;
     rli->mts_group_status= Relay_log_info::MTS_END_GROUP;
     if (rli->curr_group_isolated)
       set_mts_isolate_group();
-    if (!ptr_group)
-      ptr_group= gaq->get_job_group(rli->gaq->assigned_group_index);
+    ptr_group= gaq->get_job_group(rli->gaq->assigned_group_index);
 
     DBUG_ASSERT(ret_worker != NULL);
     
@@ -2923,13 +2972,17 @@ Slave_worker *Log_event::get_slave_worker(Relay_log_info *rli)
 
     if (!ret_worker->checkpoint_notified)
     {
-      if (!ptr_group)
-        ptr_group= gaq->get_job_group(rli->gaq->assigned_group_index);
-      ptr_group->checkpoint_log_name=
-        my_strdup(rli->get_group_master_log_name(), MYF(MY_WME));
+      ptr_group->checkpoint_log_name= (char *)
+        my_malloc(strlen(rli->
+                         get_group_master_log_name()) + 1, MYF(MY_WME));
+      strcpy(ptr_group->checkpoint_log_name,
+             rli->get_group_master_log_name());
       ptr_group->checkpoint_log_pos= rli->get_group_master_log_pos();
-      ptr_group->checkpoint_relay_log_name=
-        my_strdup(rli->get_group_relay_log_name(), MYF(MY_WME));
+      ptr_group->checkpoint_relay_log_name= (char *)
+        my_malloc(strlen(rli->
+                         get_group_relay_log_name()) + 1, MYF(MY_WME));
+      strcpy(ptr_group->checkpoint_relay_log_name,
+             rli->get_group_relay_log_name());
       ptr_group->checkpoint_relay_log_pos= rli->get_group_relay_log_pos();
       ptr_group->shifted= ret_worker->bitmap_shifted;
       ret_worker->bitmap_shifted= 0;
@@ -2949,6 +3002,45 @@ Slave_worker *Log_event::get_slave_worker(Relay_log_info *rli)
   }
   
   return ret_worker;
+}
+
+/**
+   Executes a simple query. This is only used to write an empty gtid event
+   into the binlog. This should not be used elsewhere.
+
+   @param[in]  query         Query to be executed
+   @paramp[in] query_arg_len Length of the query
+*/
+void Log_event::apply_query_event(char *query, uint32 query_arg_len)
+{
+  thd->set_time(&when);
+  thd->set_query(query, query_arg_len, thd->charset());
+  Parser_state parser_state;
+  if (!parser_state.init(thd, thd->query(), thd->query_length()))
+  {
+    ulonglong init_timer, last_timer;
+    init_timer = my_timer_now();
+    last_timer = init_timer;
+    mysql_parse(thd, thd->query(), thd->query_length(), &parser_state,
+                &last_timer, NULL);
+    thd->update_server_status();
+  }
+  thd->reset_query();
+  thd->lex->sql_command = SQLCOM_END;
+}
+
+bool Log_event::is_row_log_event()
+{
+  switch (get_type_code())
+  {
+    case WRITE_ROWS_EVENT:
+    case UPDATE_ROWS_EVENT:
+    case DELETE_ROWS_EVENT:
+      return true;
+    default:
+      return false;
+  }
+  return false;
 }
 
 /**
@@ -2972,13 +3064,99 @@ int Log_event::apply_event(Relay_log_info *rli)
 
   worker= rli;
 
+  parallel= rli->is_parallel_exec();
+  actual_exec_mode = get_mts_execution_mode(::server_id,
+                       rli->mts_group_status == Relay_log_info::MTS_IN_GROUP);
+
+  bool seq_execution = (!parallel || actual_exec_mode != EVENT_EXEC_PARALLEL);
+
+  rli->ends_group = ends_group();
+  /**
+     Check if the current event changes any databases. Last gtid executed per
+     database are stored in slave_gtid_info table for crash safe slave.
+  */
+  if ((rli->part_event = contains_partition_info(false)) && gtid_mode > 0)
+  {
+    List_iterator<char> it(*get_mts_dbs(&rli->gtid_info_mem_root));
+    it++;
+    do
+    {
+      char **db_name =it.ref();
+      Gtid_info *gtid_info = NULL;
+      rli->gtid_info_hash_rdlock();
+      gtid_info = (Gtid_info *)my_hash_search(&rli->map_db_to_gtid_info,
+                                              (const uchar*) *db_name,
+                                              strlen(*db_name));
+      rli->gtid_info_hash_unlock();
+      if (!gtid_info)
+      {
+        /**
+           This is the first event in the replication stream on the database
+           db_name. Create a new repository for this database.
+        */
+        if (!(gtid_info = Rpl_info_factory::create_gtid_info(
+                            rli->map_db_to_gtid_info.records)))
+        {
+          sql_print_error("Error creating gtid_info\n");
+          break;
+        }
+        // Set the gtid_info database and insert into the global hash.
+        gtid_info->set_database_name(*db_name);
+        rli->gtid_info_hash_wrlock();
+        my_hash_insert(&rli->map_db_to_gtid_info, (uchar*) gtid_info);
+        rli->gtid_info_hash_unlock();
+      }
+      else
+      {
+        DBUG_ASSERT(gtid_info);
+        /**
+           Events are passed to worker threads and filtered there if necessary
+           in case of MTS.
+        */
+        if (seq_execution && gtid_info->skip_event(rli->last_gtid))
+        {
+          reset_log_pos();
+          if (!rli->curr_group_seen_begin)
+          {
+            /**
+               This is a case where we are skipping a non-transactional event
+               which require a commit for skipped gtid to be written into the
+               binlog.
+            */
+            apply_query_event((char *)"BEGIN", 5);
+            mysql_bin_log.write_event(this, Log_event::EVENT_STMT_CACHE);
+            apply_query_event((char *)"COMMIT", 6);
+          }
+          else if (get_type_code() != TABLE_MAP_EVENT)
+          {
+            mysql_bin_log.write_event(this,
+                                      Log_event::EVENT_TRANSACTIONAL_CACHE);
+            thd->transaction.all.ha_list = NULL;
+            thd->transaction.stmt.ha_list = NULL;
+          }
+          reset_dynamic(&rli->gtid_infos);
+          DBUG_RETURN(0);
+        }
+      }
+      insert_dynamic_set(&rli->gtid_infos, (uchar *) &gtid_info);
+    } while(it++);
+    free_root(&rli->gtid_info_mem_root, MYF(MY_KEEP_PREALLOC));
+  }
+
+  /**
+     Rows_log_event which come after a Table_map event doesn't contain any
+     partition info. They should be skipped if the table_map event was
+     skipped.
+  */
+  if (seq_execution && !rli->gtid_infos.elements &&
+      gtid_mode > 0 && is_row_log_event())
+    DBUG_RETURN(0);
+
   if (rli->is_mts_recovery())
   {
     bool skip= 
       bitmap_is_set(&rli->recovery_groups, rli->mts_recovery_index) &&
-      (get_mts_execution_mode(::server_id,
-       rli->mts_group_status == Relay_log_info::MTS_IN_GROUP)
-       == EVENT_EXEC_PARALLEL);
+      (actual_exec_mode == EVENT_EXEC_PARALLEL);
     if (skip)
     {
       DBUG_RETURN(0);
@@ -2989,11 +3167,7 @@ int Log_event::apply_event(Relay_log_info *rli)
     }
   }
 
-  if (!(parallel= rli->is_parallel_exec()) ||
-      ((actual_exec_mode= 
-        get_mts_execution_mode(::server_id, 
-                           rli->mts_group_status == Relay_log_info::MTS_IN_GROUP))
-       != EVENT_EXEC_PARALLEL))
+  if (seq_execution)
   {
     if (parallel)
     {
@@ -3006,30 +3180,39 @@ int Log_event::apply_event(Relay_log_info *rli)
       */
 
       if (actual_exec_mode != EVENT_EXEC_ASYNC)
-      {     
-        /*
-          this  event does not split the current group but is indeed
-          a separator beetwen two master's binlog therefore requiring
-          Workers to sync.
-        */
-        if (rli->curr_group_da.elements > 0)
+      {
+        if (get_type_code() == FORMAT_DESCRIPTION_EVENT)
         {
-          char llbuff[22];
-          /* 
-             Possible reason is a old version binlog sequential event
-             wrappped with BEGIN/COMMIT or preceeded by User|Int|Random- var.
-             MTS has to stop to suggest restart in the permanent sequential mode.
-          */
-          llstr(rli->get_event_relay_log_pos(), llbuff);
-          my_error(ER_MTS_CANT_PARALLEL, MYF(0),
-                   get_type_str(), rli->get_event_relay_log_name(), llbuff,
-                   "possible malformed group of events from an old master");
-
-          /* Coordinator cant continue, it marks MTS group status accordingly */
-          rli->mts_group_status= Relay_log_info::MTS_KILLED_GROUP;
-
-          goto err;
+          if (rli->last_assigned_worker != NULL)
+          {
+            /*
+              Possbile reason is a partial transaction at the end of the relay
+              log due to a stop slave command or due to master failure.
+              The partial transaction should get rollbacked if MTS is on.
+              This is done by appending a rollback event to the slave worker
+              queue.
+            */
+            rli->report(INFORMATION_LEVEL, 0,
+                        "Rolling back unfinished transaction (no COMMIT "
+                        "or ROLLBACK in relay log). A probable cause is that "
+                        "the master died while sending a transaction to slave "
+                        "or a stop slave with GTIDs resulted in a partial "
+                        "transaction in the relay log.");
+            // To make valgrind happy by updating group assigned queue.
+            rli->rollback_ev->get_slave_worker(rli);
+            Slave_job_item item = {(void*)rli->rollback_ev}, *job_item= &item;
+            append_item_to_jobs(job_item, rli->last_assigned_worker, rli);
+          }
+          // Clean rli state to avoid assertions.
+          for (uint i= 0; i < rli->curr_group_da.elements; i++)
+            delete *(Log_event**) dynamic_array_ptr(&rli->curr_group_da, i);
+          delete_dynamic(&rli->curr_group_da);
+          delete_dynamic(&rli->curr_group_assigned_parts);
+          rli->curr_group_seen_gtid = rli->curr_group_seen_begin = false;
+          rli->last_gtid[0] = 0;
+          rli->last_assigned_worker = NULL;
         }
+
         /*
           Marking sure the event will be executed in sequential mode.
         */
@@ -3064,7 +3247,19 @@ int Log_event::apply_event(Relay_log_info *rli)
         DBUG_ASSERT(actual_exec_mode == EVENT_EXEC_ASYNC);
       }
     }
-    DBUG_RETURN(do_apply_event(rli));
+    int error = do_apply_event(rli);
+    if (is_gtid_event(this))
+    {
+      // Reset gtid_infos at the start of the group.
+      reset_dynamic(&rli->gtid_infos);
+      Gtid_log_event *gtid_ev = (Gtid_log_event *) this;
+      gtid_ev->set_last_gtid(rli->last_gtid);
+    }
+    else if (starts_group())
+      rli->curr_group_seen_begin = true;
+    else if (rli->ends_group)
+      rli->curr_group_seen_begin = false;
+    DBUG_RETURN(error);
   }
 
   DBUG_ASSERT(actual_exec_mode == EVENT_EXEC_PARALLEL);
@@ -3097,7 +3292,6 @@ int Log_event::apply_event(Relay_log_info *rli)
                rli->last_assigned_worker->id));
 #endif
 
-err:
   if (thd->is_error())
   {
     DBUG_ASSERT(!worker);
@@ -3369,7 +3563,7 @@ bool Query_log_event::write(IO_CACHE* file)
       *start++= Q_INVOKER;
 
       /*
-        Store user length and user. The max length of use is 16, so 1 byte is
+        Store user length and user. The max length of user is 32, so 1 byte is
         enough to store the user's length.
        */
       *start++= (uchar)user.length;
@@ -4555,11 +4749,15 @@ int Query_log_event::do_apply_event(Relay_log_info const *rli,
   /*
     Setting the character set and collation of the current database thd->db.
    */
-  load_db_opt_by_name(thd, thd->db, &db_options);
-  if (db_options.default_table_charset)
-    thd->db_charset= db_options.default_table_charset;
-  thd->variables.auto_increment_increment= auto_increment_increment;
-  thd->variables.auto_increment_offset=    auto_increment_offset;
+  // Avoid seg faults by checking thd->db.
+  if (thd->db)
+  {
+    load_db_opt_by_name(thd, thd->db, &db_options);
+    if (db_options.default_table_charset)
+      thd->db_charset= db_options.default_table_charset;
+    thd->variables.auto_increment_increment= auto_increment_increment;
+    thd->variables.auto_increment_offset=    auto_increment_offset;
+  }
 
   /*
     InnoDB internally stores the master log position it has executed so far,
@@ -4656,6 +4854,10 @@ int Query_log_event::do_apply_event(Relay_log_info const *rli,
         thd->variables.sql_mode=
           (sql_mode_t) ((thd->variables.sql_mode & MODE_NO_DIR_IN_CREATE) |
                        (sql_mode & ~(ulonglong) MODE_NO_DIR_IN_CREATE));
+        // Force NO_UNSIGNED_SUBTRACTION for replication if it is set for
+        // this server, even if it isn't set on the master.
+        if (global_system_variables.sql_mode & MODE_NO_UNSIGNED_SUBTRACTION)
+          thd->variables.sql_mode |= MODE_NO_UNSIGNED_SUBTRACTION;
       if (charset_inited)
       {
         if (rli->cached_charset_compare(charset))
@@ -4750,17 +4952,22 @@ int Query_log_event::do_apply_event(Relay_log_info const *rli,
       Parser_state parser_state;
       if (!parser_state.init(thd, thd->query(), thd->query_length()))
       {
-        thd->m_statement_psi= MYSQL_START_STATEMENT(&thd->m_statement_state,
-                                                    stmt_info_rpl.m_key,
-                                                    thd->db, thd->db_length,
-                                                    thd->charset());
-        THD_STAGE_INFO(thd, stage_init);
-        MYSQL_SET_STATEMENT_TEXT(thd->m_statement_psi, thd->query(), thd->query_length());
-
-        mysql_parse(thd, thd->query(), thd->query_length(), &parser_state);
+        struct system_status_var query_start_status;
+        struct system_status_var *query_start_status_ptr= NULL;
+        if (opt_log_slow_extra)
+        {
+          query_start_status_ptr= &query_start_status;
+          query_start_status= thd->status_var;
+        }
+        ulonglong init_timer, last_timer;
+        init_timer = my_timer_now();
+        last_timer = init_timer;
+        mysql_parse(thd, thd->query(), thd->query_length(), &parser_state,
+                    &last_timer, NULL);
         /* Finalize server status flags after executing a statement. */
         thd->update_server_status();
-        log_slow_statement(thd);
+        command_slave_seconds += my_timer_since(init_timer);
+        log_slow_statement(thd, query_start_status_ptr);
       }
 
       thd->variables.option_bits&= ~OPTION_MASTER_SQL_ERROR;
@@ -4952,11 +5159,6 @@ end:
   thd->reset_query();
   thd->lex->sql_command= SQLCOM_END;
   DBUG_PRINT("info", ("end: query= 0"));
-
-  /* Mark the statement completed. */
-  MYSQL_END_STATEMENT(thd->m_statement_psi, thd->get_stmt_da());
-  thd->m_statement_psi= NULL;
-
   /*
     As a disk space optimization, future masters will not log an event for
     LAST_INSERT_ID() if that function returned 0 (and thus they will be able
@@ -6497,7 +6699,7 @@ int Load_log_event::do_apply_event(NET* net, Relay_log_info const *rli,
       List<Item> tmp_list;
       if (open_temporary_tables(thd, &tables) ||
           mysql_load(thd, &ex, &tables, field_list, tmp_list, tmp_list,
-                     handle_dup, ignore, net != 0, thd->lex->schema_merge))
+                     handle_dup, ignore, net != 0, thd->lex->schema_merge, thd->lex->relaxed_schema_inference, thd->lex->inference_sample_size))
         thd->is_slave_error= 1;
       if (thd->cuted_fields)
       {
@@ -6537,8 +6739,6 @@ error:
   thd->get_stmt_da()->set_overwrite_status(false);
   close_thread_tables(thd);
   /*
-    - If transaction rollback was requested due to deadlock
-      perform it and release metadata locks.
     - If inside a multi-statement transaction,
     defer the release of metadata locks until the current
     transaction is either committed or rolled back. This prevents
@@ -6548,12 +6748,7 @@ error:
     - If in autocommit mode, or outside a transactional context,
     automatically release metadata locks of the current statement.
   */
-  if (thd->transaction_rollback_request)
-  {
-    trans_rollback_implicit(thd);
-    thd->mdl_context.release_transactional_locks();
-  }
-  else if (! thd->in_multi_stmt_transaction_mode())
+  if (! thd->in_multi_stmt_transaction_mode())
     thd->mdl_context.release_transactional_locks();
   else
     thd->mdl_context.release_statement_locks();
@@ -7329,6 +7524,9 @@ int Xid_log_event::do_apply_event(Relay_log_info const *rli)
     rli_ptr->get_group_relay_log_pos(),
     rli_ptr->get_event_relay_log_name(),
     rli_ptr->get_event_relay_log_pos()));
+
+  if ((error = rli_ptr->flush_gtid_infos(true)))
+    goto err;
 
   DBUG_EXECUTE_IF("crash_after_update_pos_before_apply",
                   sql_print_information("Crashing crash_after_update_pos_before_apply.");
@@ -8635,7 +8833,8 @@ int Execute_load_log_event::do_apply_event(Relay_log_info const *rli)
         Log_event::read_log_event(&file,
                                   (mysql_mutex_t*) 0,
                                   rli->get_rli_description_event(),
-                                  opt_slave_sql_verify_checksum)) ||
+                                  opt_slave_sql_verify_checksum,
+                                  NULL)) ||
       lev->get_type_code() != NEW_LOAD_EVENT)
   {
     rli->report(ERROR_LEVEL, 0, "Error in Exec_load event: "
@@ -11294,10 +11493,7 @@ static int rows_event_stmt_cleanup(Relay_log_info const *rli, THD * thd)
       Xid_log_event will come next which will, if some transactional engines
       are involved, commit the transaction and flush the pending event to the
       binlog.
-      If there was a deadlock the transaction should have been rolled back
-      already. So there should be no need to rollback the transaction.
     */
-    DBUG_ASSERT(! thd->transaction_rollback_request);
     error|= (error ? trans_rollback_stmt(thd) : trans_commit_stmt(thd));
 
     /*
@@ -13262,6 +13458,11 @@ int Gtid_log_event::do_apply_event(Relay_log_info const *rli)
   DBUG_RETURN(0);
 }
 
+void Gtid_log_event::set_last_gtid(char *last_gtid)
+{
+  spec.to_string(&sid, last_gtid);
+}
+
 int Gtid_log_event::do_update_pos(Relay_log_info *rli)
 {
   /*
@@ -13510,3 +13711,77 @@ size_t my_strmov_quoted_identifier_helper(int q, char *buffer,
   return ++written;
 }
 
+/**
+  Finds the position of given gtid by scanning through the given file
+  and comparing the given gtid with gtid in each Gtid_log_event.
+
+  @param log_name File to look in.
+  @param gtid     GTID to search for.
+  @param sid_map  Sid_map used when parsing Gtid_log_event.
+
+  @retval 0 if GTID is not found.
+  @retval starting offset of the corresponding Gtid_log_event in the file,
+          if GTID is found.
+*/
+my_off_t find_gtid_pos_in_log(const char* log_name, const Gtid &gtid,
+                              Sid_map *sid_map)
+{
+  DBUG_ENTER("find_gtid_pos_in_log");
+  DBUG_PRINT("info", ("Scanning log: %s", log_name));
+
+  IO_CACHE log;
+  File file = -1;
+  Log_event *ev = NULL;
+  my_off_t pos = BIN_LOG_HEADER_SIZE;
+  /*
+    Create a Format_description_log_event that is used to read the
+    first event of the log.
+  */
+  Format_description_log_event fd_ev(BINLOG_VERSION), *fd_ev_p= &fd_ev;
+
+#ifndef MYSQL_CLIENT
+  const char *errmsg = NULL;
+  if (!fd_ev.is_valid())
+    goto err;
+
+  if ((file = open_binlog_file(&log, log_name, &errmsg)) < 0)
+  {
+    sql_print_error("%s", errmsg);
+    goto err;
+  }
+#else
+  if ((file = my_open(log_name, O_RDONLY, MYF(MY_WME))) < 0)
+  {
+    error("Error opening binlog file");
+    goto err;
+  }
+
+  if (init_io_cache(&log, file, IO_SIZE, READ_CACHE, 0, 0, MYF(MY_WME)))
+  {
+    error("Error initializing binlog file cache");
+    goto err;
+  }
+#endif
+
+  my_b_seek(&log, BIN_LOG_HEADER_SIZE);
+#ifndef MYSQL_CLIENT
+  while ((ev = Log_event::read_log_event(&log, 0, fd_ev_p, false, NULL)) !=
+         NULL)
+#else
+  while ((ev = Log_event::read_log_event(&log, fd_ev_p, false)) != NULL)
+#endif
+  {
+    if (ev->get_type_code() == GTID_LOG_EVENT)
+    {
+      Gtid_log_event *gtid_ev = (Gtid_log_event *) ev;
+      if (gtid_ev->get_sidno(sid_map) == gtid.sidno &&
+            gtid_ev->get_gno() == gtid.gno)
+        DBUG_RETURN(pos);
+    }
+    if (ev != fd_ev_p)
+      delete ev;
+    pos = my_b_tell(&log);
+  }
+err:
+  DBUG_RETURN(0);
+}

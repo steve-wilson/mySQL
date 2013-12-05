@@ -1,7 +1,7 @@
 #ifndef FIELD_INCLUDED
 #define FIELD_INCLUDED
 
-/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -872,26 +872,18 @@ public:
   bool is_null(my_ptrdiff_t row_offset= 0) const
   {
     /*
-      if the field is NULLable, it returns NULLity based
-      on null_ptr[row_offset] value. Otherwise it returns
-      NULL flag depending on TABLE::null_row value.
-
       The table may have been marked as containing only NULL values
       for all fields if it is a NULL-complemented row of an OUTER JOIN
       or if the query is an implicitly grouped query (has aggregate
       functions but no GROUP BY clause) with no qualifying rows. If
-      this is the case (in which TABLE::null_row is true) and the
-      field is not nullable, the field is considered to be NULL.
+      this is the case (in which TABLE::null_row is true), the field
+      is considered to be NULL.
 
-      Do not change the order of testing. Fields may be associated
-      with a TABLE object without being part of the current row.
-      For NULL value check to work for these fields, they must
-      have a valid null_ptr, and this pointer must be checked before
-      TABLE::null_row. 
-
+      Otherwise, if the field is NULLable, it has a valid null_ptr
+      pointer, and its NULLity is recorded in the "null_bit" bit of
+      null_ptr[row_offset].
     */
-    return real_maybe_null() ?
-      test(null_ptr[row_offset] & null_bit) : table->null_row;
+    return table->null_row ? true : is_real_null(row_offset);
   }
 
   bool is_real_null(my_ptrdiff_t row_offset= 0) const
@@ -1229,10 +1221,6 @@ public:
     DBUG_ASSERT(column_format() == COLUMN_FORMAT_TYPE_DEFAULT);
     flags |= (column_format_arg << FIELD_FLAGS_COLUMN_FORMAT);
   }
-
-  /* Validate the value stored in a field */
-  virtual type_conversion_status validate_stored_val(THD *thd)
-  { return TYPE_OK; }
 
   /* Hash value */
   virtual void hash(ulong *nr, ulong *nr2);
@@ -2386,8 +2374,6 @@ public:
   {
     return get_date(ltime, TIME_FUZZY_DATE);
   }
-  /* Validate the value stored in a field */
-  virtual type_conversion_status validate_stored_val(THD *thd);
 };
 
 
@@ -2559,8 +2545,6 @@ public:
   {
     return unpack_int32(to, from, low_byte_first);
   }
-  /* Validate the value stored in a field */
-  virtual type_conversion_status validate_stored_val(THD *thd);
 };
 
 
@@ -2629,8 +2613,6 @@ public:
   void sql_type(String &str) const;
 
   bool get_timestamp(struct timeval *tm, int *warnings);
-  /* Validate the value stored in a field */
-  virtual type_conversion_status validate_stored_val(THD *thd);
 };
 
 

@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -98,9 +98,12 @@ uchar* dboptions_get_key(my_dbopt_t *opt, size_t *length,
 */
 
 static inline int write_to_binlog(THD *thd, char *query, uint q_len,
-                                  char *db, uint db_len)
+                                  char *db, uint db_len,
+                                  bool set_no_foreign_key_check)
 {
   Query_log_event qinfo(thd, query, q_len, FALSE, TRUE, FALSE, 0);
+  if (set_no_foreign_key_check)
+    qinfo.set_bit_flags2(OPTION_NO_FOREIGN_KEY_CHECKS);
   qinfo.db= db;
   qinfo.db_len= db_len;
   return mysql_bin_log.write_event(&qinfo);
@@ -974,7 +977,7 @@ update_binlog:
           These DDL methods and logging are protected with the exclusive
           metadata lock on the schema.
         */
-        if (write_to_binlog(thd, query, query_pos -1 - query, db, db_len))
+        if (write_to_binlog(thd, query, query_pos -1 - query, db, db_len, true))
         {
           error= true;
           goto exit;
@@ -995,7 +998,7 @@ update_binlog:
         These DDL methods and logging are protected with the exclusive
         metadata lock on the schema.
       */
-      if (write_to_binlog(thd, query, query_pos -1 - query, db, db_len))
+      if (write_to_binlog(thd, query, query_pos -1 - query, db, db_len, true))
       {
         error= true;
         goto exit;
@@ -1312,12 +1315,9 @@ static void mysql_change_db_impl(THD *thd,
       we just call THD::reset_db(). Since THD::reset_db() does not releases
       the previous database name, we should do it explicitly.
     */
-    mysql_mutex_lock(&thd->LOCK_thd_data);
-    if (thd->db)
-      my_free(thd->db);
-    DEBUG_SYNC(thd, "after_freeing_thd_db");
+    my_free(thd->db);
+
     thd->reset_db(new_db_name->str, new_db_name->length);
-    mysql_mutex_unlock(&thd->LOCK_thd_data);
   }
 
   /* 2. Update security context. */
@@ -1540,8 +1540,8 @@ bool mysql_change_db(THD *thd, const LEX_STRING *new_db_name, bool force_switch)
   db_access=
     test_all_bits(sctx->master_access, DB_ACLS) ?
     DB_ACLS :
-    acl_get(sctx->get_host()->ptr(),
-            sctx->get_ip()->ptr(),
+    acl_get(sctx->host,
+            sctx->ip,
             sctx->priv_user,
             new_db_file_name.str,
             FALSE) | sctx->master_access;

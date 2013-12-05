@@ -202,7 +202,8 @@ trx_sys_update_mysql_binlog_offset(
 	ib_int64_t	offset,	/*!< in: position in that log file */
 	ulint		field,	/*!< in: offset of the MySQL log info field in
 				the trx sys header */
-	mtr_t*		mtr)	/*!< in: mtr */
+	mtr_t*		mtr,	/*!< in: mtr */
+	const char* 	gtid)	/*!< in: Gtid of the transaction */
 {
 	trx_sysf_t*	sys_header;
 
@@ -248,6 +249,18 @@ trx_sys_update_mysql_binlog_offset(
 			 + TRX_SYS_MYSQL_LOG_OFFSET_LOW,
 			 (ulint)(offset & 0xFFFFFFFFUL),
 			 MLOG_4BYTES, mtr);
+	if (gtid)
+	{
+		size_t gtid_length = ut_strlen(gtid);
+		if (gtid_length >= TRX_SYS_MYSQL_GTID_LEN) {
+			/* This should not happen */
+			DBUG_ASSERT(0);
+			return;
+		}
+		/* Write Gtid string */
+		mlog_write_string(sys_header + field + TRX_SYS_MYSQL_GTID,
+				  (byte*)gtid, 1 + gtid_length, mtr);
+	}
 }
 
 /*****************************************************************//**
@@ -297,6 +310,10 @@ trx_sys_print_mysql_binlog_offset(void)
 		trx_sys_mysql_bin_log_pos_high, trx_sys_mysql_bin_log_pos_low,
 		trx_sys_mysql_bin_log_name);
 
+	fprintf(stderr,
+		"InnoDB: Last MySQL Gtid %s\n",
+		sys_header + TRX_SYS_MYSQL_LOG_INFO +
+		TRX_SYS_MYSQL_GTID);
 	mtr_commit(&mtr);
 }
 
@@ -592,6 +609,7 @@ trx_sys_create(void)
 	trx_sys = static_cast<trx_sys_t*>(mem_zalloc(sizeof(*trx_sys)));
 
 	mutex_create(trx_sys_mutex_key, &trx_sys->mutex, SYNC_TRX_SYS);
+  mutex_create(trx_sys_mutex_key, &trx_sys->trx_memory_mutex, SYNC_TRX);
 }
 
 /*****************************************************************//**
@@ -1191,12 +1209,18 @@ trx_sys_close(void)
 
 	ut_a(UT_LIST_GET_LEN(trx_sys->ro_trx_list) == 0);
 
+#ifdef XTRABACKUP
+	if (!srv_apply_log_only) {
+#endif /* XTRABACKUP */
 	/* Only prepared transactions may be left in the system. Free them. */
 	ut_a(UT_LIST_GET_LEN(trx_sys->rw_trx_list) == trx_sys->n_prepared_trx);
 
 	while ((trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list)) != NULL) {
 		trx_free_prepared(trx);
 	}
+#ifdef XTRABACKUP
+	}
+#endif /* XTRABACKUP */
 
 	/* There can't be any active transactions. */
 	for (i = 0; i < TRX_SYS_N_RSEGS; ++i) {
@@ -1223,16 +1247,27 @@ trx_sys_close(void)
 		UT_LIST_REMOVE(view_list, trx_sys->view_list, prev_view);
 	}
 
+#ifdef XTRABACKUP
+	if (!srv_apply_log_only) {
+#endif /* XTRABACKUP */
 	ut_a(UT_LIST_GET_LEN(trx_sys->view_list) == 0);
 	ut_a(UT_LIST_GET_LEN(trx_sys->ro_trx_list) == 0);
 	ut_a(UT_LIST_GET_LEN(trx_sys->rw_trx_list) == 0);
 	ut_a(UT_LIST_GET_LEN(trx_sys->mysql_trx_list) == 0);
+#ifdef XTRABACKUP
+	}
+#endif /* XTRABACKUP */
 
 	mutex_exit(&trx_sys->mutex);
 
 	mutex_free(&trx_sys->mutex);
+	mutex_free(&trx_sys->trx_memory_mutex);
 
 	mem_free(trx_sys);
+
+#ifdef UNIV_DEBUG_VALGRIND
+	trx_free_trx_pool();
+#endif
 
 	trx_sys = NULL;
 }
@@ -1246,6 +1281,12 @@ trx_sys_any_active_transactions(void)
 /*=================================*/
 {
 	ulint	total_trx = 0;
+
+#ifdef XTRABACKUP
+	if (srv_apply_log_only) {
+		return(0);
+	}
+#endif /* XTRABACKUP */
 
 	mutex_enter(&trx_sys->mutex);
 

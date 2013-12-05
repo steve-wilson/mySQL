@@ -45,6 +45,12 @@
 #include "sql_optimizer.h"       // JOIN
 #include "sql_tmp_table.h"       // tmp tables
 
+#ifdef TARGET_OS_LINUX
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include "flashcache_ioctl.h"
+#endif /* TARGET_OS_LINUX */
+
 #include <algorithm>
 using std::max;
 using std::min;
@@ -75,6 +81,7 @@ bool handle_select(THD *thd, select_result *result,
                    ulong setup_tables_done_option)
 {
   bool res;
+  pid_t pid;
   LEX *lex= thd->lex;
   register SELECT_LEX *select_lex = &lex->select_lex;
   DBUG_ENTER("handle_select");
@@ -85,6 +92,14 @@ bool handle_select(THD *thd, select_result *result,
     my_error(ER_WRONG_USAGE, MYF(0), "PROCEDURE", "non-SELECT");
     DBUG_RETURN(true);
   }
+
+#ifdef TARGET_OS_LINUX
+  if (lex->disable_flashcache && cachedev_fd > 0)
+  {
+    pid = syscall(SYS_gettid);
+    ioctl(cachedev_fd, FLASHCACHEADDNCPID, &pid);
+  }
+#endif /* TARGET_OS_LINUX */
 
   if (select_lex->master_unit()->is_union() || 
       select_lex->master_unit()->fake_select_lex)
@@ -116,6 +131,12 @@ bool handle_select(THD *thd, select_result *result,
     result->abort_result_set();
 
   MYSQL_SELECT_DONE((int) res, (ulong) thd->limit_found_rows);
+#ifdef TARGET_OS_LINUX
+  if (lex->disable_flashcache && cachedev_fd > 0)
+  {
+    ioctl(cachedev_fd, FLASHCACHEDELNCPID, &pid);
+  }
+#endif /* TARGET_OS_LINUX */
   DBUG_RETURN(res);
 }
 
@@ -1339,16 +1360,13 @@ bool JOIN::get_best_combination()
       # of semi-join nests for materialization +
       1? + // For GROUP BY
       1? + // For DISTINCT
-      1? + // For aggregation functions aggregated in outer query
-           // when used with distinct
       1? + // For ORDER BY
       1?   // buffer result
     Up to 2 tmp tables are actually used, but it's hard to tell exact number
     at this stage.
   */
   uint tmp_tables= (group_list ? 1 : 0) +
-                   (select_distinct ?
-                    (tmp_table_param.outer_sum_func_count ? 2 : 1) : 0) +
+                   (select_distinct ? 1 : 0) +
                    (order ? 1 : 0) +
        (select_options & (SELECT_BIG_RESULT | OPTION_BUFFER_RESULT) ? 1 : 0) ;
   if (tmp_tables > 2)
@@ -1363,25 +1381,22 @@ bool JOIN::get_best_combination()
     table, and will later be used to track the position of any materialized
     temporary tables. 
   */
-  const bool has_semijoin= !select_lex->sj_nests.is_empty();
   uint outer_target= 0;                   
   uint inner_target= primary_tables + tmp_tables;
   uint sjm_nests= 0;
 
-  if (has_semijoin)
+  for (uint tableno= 0; tableno < primary_tables; )
   {
-    for (uint tableno= 0; tableno < primary_tables; )
+    if (sj_is_materialize_strategy(best_positions[tableno].sj_strategy))
     {
-      if (sj_is_materialize_strategy(best_positions[tableno].sj_strategy))
-      {
-        sjm_nests++;
-        inner_target-= (best_positions[tableno].n_sj_tables - 1);
-        tableno+= best_positions[tableno].n_sj_tables;
-      }
-      else
-        tableno++;
+      sjm_nests++;
+      inner_target-= (best_positions[tableno].n_sj_tables - 1);
+      tableno+= best_positions[tableno].n_sj_tables;
     }
+    else
+      tableno++;
   }
+
   if (!(join_tab= new(thd->mem_root) JOIN_TAB[tables + sjm_nests + tmp_tables]))
     DBUG_RETURN(true);
 
@@ -1389,8 +1404,7 @@ bool JOIN::get_best_combination()
   int remaining_sjm_inner= 0;
   for (uint tableno= 0; tableno < tables; tableno++)
   {
-    if (has_semijoin &&
-        sj_is_materialize_strategy(best_positions[tableno].sj_strategy))
+    if (sj_is_materialize_strategy(best_positions[tableno].sj_strategy))
     {
       DBUG_ASSERT(outer_target < inner_target);
 
@@ -1445,14 +1459,12 @@ bool JOIN::get_best_combination()
   // Set the number of non-materialized tables:
   primary_tables= outer_target;
 
-  if (has_semijoin)
-  {
-    set_semijoin_info();
+  set_semijoin_info();
 
-    // Update equalities and keyuses after having added SJ materialization
-    if (update_equalities_for_sjm())
-      DBUG_RETURN(true);
-  }
+  // Update equalities and keyuses after having added semi-join materialization
+  if (update_equalities_for_sjm())
+    DBUG_RETURN(true);
+
   // sjm is no longer needed, trash it. To reuse it, reset its members!
   List_iterator<TABLE_LIST> sj_list_it(select_lex->sj_nests);
   TABLE_LIST *sj_nest;
@@ -1485,7 +1497,7 @@ bool JOIN::set_access_methods()
 
   full_join= false;
 
-  for (uint tableno= const_tables; tableno < tables; tableno++)
+  for (uint tableno= 0; tableno < tables; tableno++)
   {
     JOIN_TAB *const tab= join_tab + tableno;
 
@@ -3471,8 +3483,8 @@ const_expression_in_where(Item *cond, Item *comp_item, Field *comp_field,
     -1   Reverse key can be used
 */
 
-int test_if_order_by_key(ORDER *order, TABLE *table, uint idx,
-                         uint *used_key_parts)
+static int test_if_order_by_key(ORDER *order, TABLE *table, uint idx,
+				uint *used_key_parts= NULL)
 {
   KEY_PART_INFO *key_part,*key_part_end;
   key_part=table->key_info[idx].key_part;
@@ -3485,16 +3497,7 @@ int test_if_order_by_key(ORDER *order, TABLE *table, uint idx,
 
   for (; order ; order=order->next, const_key_parts>>=1)
   {
-
-    /*
-      Since only fields can be indexed, ORDER BY <something> that is
-      not a field cannot be resolved by using an index.
-    */
-    Item *real_itm= (*order->item)->real_item();
-    if (real_itm->type() != Item::FIELD_ITEM)
-      DBUG_RETURN(0);
-
-    Field *field= static_cast<Item_field*>(real_itm)->field;
+    Field *field=((Item_field*) (*order->item)->real_item())->field;
     int flag;
 
     /*
@@ -4374,11 +4377,8 @@ count_field_types(SELECT_LEX *select_lex, TMP_TABLE_PARAM *param,
   List_iterator<Item> li(fields);
   Item *field;
 
-  param->field_count= 0;
-  param->sum_func_count= 0;
-  param->func_count= 0;
-  param->hidden_field_count= 0;
-  param->outer_sum_func_count= 0;
+  param->field_count=param->sum_func_count=param->func_count=
+    param->hidden_field_count=0;
   param->quick_group=1;
   while ((field=li++))
   {
@@ -4413,8 +4413,6 @@ count_field_types(SELECT_LEX *select_lex, TMP_TABLE_PARAM *param,
       param->func_count++;
       if (reset_with_sum_func)
 	field->with_sum_func=0;
-      if (field->with_sum_func)
-        param->outer_sum_func_count++;
     }
   }
 }
@@ -4842,12 +4840,12 @@ bool JOIN::rollup_make_fields(List<Item> &fields_arg, List<Item> &sel_fields,
 
 void JOIN::clear()
 {
-  /* 
-    must clear only the non-const tables, as const tables
-    are not re-calculated.
-  */
-  for (uint tableno= const_tables; tableno < primary_tables; tableno++)
-    mark_as_null_row(join_tab[tableno].table);  // All fields are NULL
+  for (uint tableno= 0; tableno < primary_tables; tableno++)
+  {
+    TABLE *const table= (join_tab+tableno)->table;
+    if (table)
+      mark_as_null_row(table);
+  }
 
   copy_fields(&tmp_table_param);
 
@@ -5055,9 +5053,9 @@ bool JOIN::make_tmp_tables_info()
       like SEC_TO_TIME(SUM(...)).
     */
 
-    if ((group_list &&
+    if ((group_list && 
          (!test_if_subpart(group_list, order) || select_distinct)) ||
-        (select_distinct && tmp_table_param.using_outer_summary_function))
+        (select_distinct && tmp_table_param.using_indirect_summary_function))
     {					/* Must copy to another table */
       DBUG_PRINT("info",("Creating group table"));
       

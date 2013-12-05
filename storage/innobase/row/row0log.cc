@@ -531,7 +531,6 @@ row_log_table_delete(
 		ut_ad(dfield_get_type(dfield)->prtype
 		      == (DATA_NOT_NULL | DATA_TRX_ID));
 		ut_ad(dfield_get_len(dfield) == DATA_TRX_ID_LEN);
-		dfield_dup(dfield, heap);
 		trx_write_trx_id(static_cast<byte*>(dfield->data), trx_id);
 	}
 
@@ -647,8 +646,7 @@ row_log_table_low_redundant(
 
 	ut_ad(!page_is_comp(page_align(rec)));
 	ut_ad(dict_index_get_n_fields(index) == rec_get_n_fields_old(rec));
-	ut_ad(dict_tf_is_valid(index->table->flags));
-	ut_ad(!dict_table_is_comp(index->table));  /* redundant row format */
+	ut_ad(!index->table->flags);
 	ut_ad(dict_index_is_clust(new_index));
 
 	heap = mem_heap_create(DTUPLE_EST_ALLOC(index->n_fields));
@@ -939,7 +937,7 @@ row_log_table_get_pk_col(
 			mem_heap_alloc(heap, field_len));
 
 		len = btr_copy_externally_stored_field_prefix(
-			blob_field, field_len, zip_size, field, len);
+			blob_field, field_len, zip_size, field, len, NULL);
 		if (len >= max_len + 1) {
 			return(DB_TOO_BIG_INDEX_COL);
 		}
@@ -1257,7 +1255,7 @@ row_log_table_apply_convert_mrec(
 		dfield_t*		dfield
 			= dtuple_get_nth_field(row, col_no);
 		ulint			len;
-		const byte*		data= NULL;
+		const byte*		data;
 
 		if (rec_offs_nth_extern(offsets, i)) {
 			ut_ad(rec_offs_any_extern(offsets));
@@ -1285,7 +1283,7 @@ row_log_table_apply_convert_mrec(
 				data = btr_rec_copy_externally_stored_field(
 					mrec, offsets,
 					dict_table_zip_size(index->table),
-					i, &len, heap);
+					i, &len, heap, NULL);
 				ut_a(data);
 			}
 
@@ -1354,6 +1352,8 @@ row_log_table_apply_insert_low(
 	dtuple_t*	entry;
 	const row_log_t*log	= dup->index->online_log;
 	dict_index_t*	index	= dict_table_get_first_index(log->table);
+	ulint	page_no = ULINT_UNDEFINED;
+	ullint	modify_clock = ULLINT_UNDEFINED;
 
 	ut_ad(dtuple_validate(row));
 	ut_ad(trx_id);
@@ -1376,7 +1376,8 @@ row_log_table_apply_insert_low(
 	entry = row_build_index_entry(row, NULL, index, heap);
 
 	error = row_ins_clust_index_entry_low(
-		flags, BTR_MODIFY_TREE, index, index->n_uniq, entry, 0, thr);
+		flags, BTR_MODIFY_TREE, index, index->n_uniq, entry, 0, thr,
+		&page_no, &modify_clock);
 
 	switch (error) {
 	case DB_SUCCESS:
@@ -1400,7 +1401,9 @@ row_log_table_apply_insert_low(
 		entry = row_build_index_entry(row, NULL, index, heap);
 		error = row_ins_sec_index_entry_low(
 			flags, BTR_MODIFY_TREE,
-			index, offsets_heap, heap, entry, trx_id, thr);
+			index, offsets_heap, heap, entry, trx_id, thr,
+			&page_no, &modify_clock);
+
 	} while (error == DB_SUCCESS);
 
 	return(error);
@@ -1903,12 +1906,17 @@ delete_insert:
 
 		mtr_commit(&mtr);
 
+		ulint	page_no = ULINT_UNDEFINED;
+		ullint	modify_clock = ULLINT_UNDEFINED;
+
 		entry = row_build_index_entry(row, NULL, index, heap);
 		error = row_ins_sec_index_entry_low(
 			BTR_CREATE_FLAG | BTR_NO_LOCKING_FLAG
 			| BTR_NO_UNDO_LOG_FLAG | BTR_KEEP_SYS_FLAG,
 			BTR_MODIFY_TREE, index, offsets_heap, heap,
-			entry, trx_id, thr);
+			entry, trx_id, thr,
+			&page_no, &modify_clock);
+
 
 		mtr_start(&mtr);
 	}
@@ -2309,7 +2317,10 @@ corruption:
 		if (index->online_log->head.blocks) {
 #ifdef HAVE_FTRUNCATE
 			/* Truncate the file in order to save space. */
-			ftruncate(index->online_log->fd, 0);
+			if (ftruncate(index->online_log->fd, 0))
+			{
+				/* Return value is ignored */
+			}
 #endif /* HAVE_FTRUNCATE */
 			index->online_log->head.blocks
 				= index->online_log->tail.blocks = 0;
@@ -2360,7 +2371,7 @@ all_done:
 		posix_fadvise(index->online_log->fd,
 			      ofs, srv_sort_buf_size, POSIX_FADV_DONTNEED);
 #endif /* POSIX_FADV_DONTNEED */
-#if 0 //def FALLOC_FL_PUNCH_HOLE
+#ifdef FALLOC_FL_PUNCH_HOLE
 		/* Try to deallocate the space for the file on disk.
 		This should work on ext4 on Linux 2.6.39 and later,
 		and be ignored when the operation is unsupported. */
@@ -2623,7 +2634,6 @@ row_log_allocate(
 	byte*		buf;
 	row_log_t*	log;
 	ulint		size;
-	DBUG_ENTER("row_log_allocate");
 
 	ut_ad(!dict_index_is_online_ddl(index));
 	ut_ad(dict_index_is_clust(index) == !!table);
@@ -2637,7 +2647,7 @@ row_log_allocate(
 	size = 2 * srv_sort_buf_size + sizeof *log;
 	buf = (byte*) os_mem_alloc_large(&size);
 	if (!buf) {
-		DBUG_RETURN(false);
+		return(false);
 	}
 
 	log = (row_log_t*) &buf[2 * srv_sort_buf_size];
@@ -2645,7 +2655,7 @@ row_log_allocate(
 	log->fd = row_merge_file_create_low();
 	if (log->fd < 0) {
 		os_mem_free_large(buf, size);
-		DBUG_RETURN(false);
+		return(false);
 	}
 	mutex_create(index_online_log_key, &log->mutex,
 		     SYNC_INDEX_ONLINE_LOG);
@@ -2670,7 +2680,7 @@ row_log_allocate(
 	atomic operations in both cases. */
 	MONITOR_ATOMIC_INC(MONITOR_ONLINE_CREATE_INDEX);
 
-	DBUG_RETURN(true);
+	return(true);
 }
 
 /******************************************************//**
@@ -3102,7 +3112,10 @@ corruption:
 		if (index->online_log->head.blocks) {
 #ifdef HAVE_FTRUNCATE
 			/* Truncate the file in order to save space. */
-			ftruncate(index->online_log->fd, 0);
+			if (ftruncate(index->online_log->fd, 0))
+			{
+				/* Return value is ignored */
+			}
 #endif /* HAVE_FTRUNCATE */
 			index->online_log->head.blocks
 				= index->online_log->tail.blocks = 0;
@@ -3149,7 +3162,7 @@ all_done:
 		posix_fadvise(index->online_log->fd,
 			      ofs, srv_sort_buf_size, POSIX_FADV_DONTNEED);
 #endif /* POSIX_FADV_DONTNEED */
-#if 0 //def FALLOC_FL_PUNCH_HOLE
+#ifdef FALLOC_FL_PUNCH_HOLE
 		/* Try to deallocate the space for the file on disk.
 		This should work on ext4 on Linux 2.6.39 and later,
 		and be ignored when the operation is unsupported. */
@@ -3353,7 +3366,6 @@ row_log_apply(
 	dberr_t		error;
 	row_log_t*	log;
 	row_merge_dup_t	dup = { index, table, NULL, 0 };
-	DBUG_ENTER("row_log_apply");
 
 	ut_ad(dict_index_is_online_ddl(index));
 	ut_ad(!dict_index_is_clust(index));
@@ -3396,5 +3408,5 @@ row_log_apply(
 
 	row_log_free(log);
 
-	DBUG_RETURN(error);
+	return(error);
 }

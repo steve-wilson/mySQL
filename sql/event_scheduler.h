@@ -78,7 +78,7 @@ public:
   /* State changing methods follow */
 
   bool
-  start(int *err_no);
+  start();
 
   bool
   stop();

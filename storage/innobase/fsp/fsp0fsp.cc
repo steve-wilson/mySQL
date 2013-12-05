@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2012, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -50,6 +50,15 @@ Created 11/29/1995 Heikki Tuuri
 #include "dict0mem.h"
 #include "srv0start.h"
 
+double fseg_reserve_factor = 0.01; /* If this value is x, then if
+	        the number of unused but reserved
+	        pages in a segment is less than
+	        reserved pages * x, and there are
+	        at least FSEG_FRAG_LIMIT used pages,
+	        then we allow a new empty extent to
+	        be added to the segment in
+	        fseg_alloc_free_page. Otherwise, we
+	        use unused pages of the segment. */
 
 #ifndef UNIV_HOTBACKUP
 /** Flag to indicate if we have printed the tablespace full error. */
@@ -1035,11 +1044,6 @@ fsp_try_extend_data_file(
 
 	success = fil_extend_space_to_desired_size(&actual_size, space,
 						   size + size_increase);
-	if (!success) {
-
-		return(false);
-	}
-
 	/* We ignore any fragments of a full megabyte when storing the size
 	to the space header */
 
@@ -2422,7 +2426,7 @@ take_hinted_page:
 		goto got_hinted_page;
 		/*-----------------------------------------------------------*/
 	} else if (xdes_get_state(descr, mtr) == XDES_FREE
-		   && reserved - used < reserved / FSEG_FILLFACTOR
+		   && reserved - used < reserved * fseg_reserve_factor
 		   && used >= FSEG_FRAG_LIMIT) {
 
 		/* 2. We allocate the free extent from space and can take
@@ -2444,7 +2448,7 @@ take_hinted_page:
 		goto take_hinted_page;
 		/*-----------------------------------------------------------*/
 	} else if ((direction != FSP_NO_DIR)
-		   && ((reserved - used) < reserved / FSEG_FILLFACTOR)
+		   && ((reserved - used) < reserved * fseg_reserve_factor)
 		   && (used >= FSEG_FRAG_LIMIT)
 		   && (!!(ret_descr
 			  = fseg_alloc_free_extent(seg_inode,

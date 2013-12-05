@@ -1,4 +1,4 @@
-/* Copyright (c) 2007, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2007, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -2359,7 +2359,7 @@ err:
 /**
   Upgrade a shared metadata lock.
 
-  Used in ALTER TABLE and CREATE TABLE.
+  Used in ALTER TABLE.
 
   @param mdl_ticket         Lock to upgrade.
   @param new_type           Lock type to upgrade to.
@@ -2371,11 +2371,7 @@ err:
 
   @note There can be only one upgrader for a lock or we will have deadlock.
         This invariant is ensured by the fact that upgradeable locks SU, SNW
-        and SNRW are not compatible with each other and themselves in case
-        of ALTER TABLE operation. 
-        In case of CREATE TABLE operation there is chance of deadlock as 'S'
-        is compatible with 'S'. But the deadlock is recovered by backoff and
-        retry mechanism.
+        and SNRW are not compatible with each other and themselves.
 
   @retval FALSE  Success
   @retval TRUE   Failure (thread was killed)

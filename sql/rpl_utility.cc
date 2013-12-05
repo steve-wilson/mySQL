@@ -923,25 +923,12 @@ TABLE *table_def::create_conversion_table(THD *thd, Relay_log_info *rli, TABLE *
   DBUG_ENTER("table_def::create_conversion_table");
 
   List<Create_field> field_list;
-  TABLE *conv_table= NULL;
   /*
     At slave, columns may differ. So we should create
     min(columns@master, columns@slave) columns in the
     conversion table.
   */
   uint const cols_to_create= min<ulong>(target_table->s->fields, size());
-
-  // Default value : treat all values signed
-  bool unsigned_flag= FALSE;
-
-  // Check if slave_type_conversions contains ALL_UNSIGNED
-  unsigned_flag= slave_type_conversions_options &
-                  (ULL(1) << SLAVE_TYPE_CONVERSIONS_ALL_UNSIGNED);
-
-  // Check if slave_type_conversions contains ALL_SIGNED
-  unsigned_flag= unsigned_flag && !(slave_type_conversions_options &
-                 (ULL(1) << SLAVE_TYPE_CONVERSIONS_ALL_SIGNED));
-
   for (uint col= 0 ; col < cols_to_create; ++col)
   {
     Create_field *field_def=
@@ -977,15 +964,10 @@ TABLE *table_def::create_conversion_table(THD *thd, Relay_log_info *rli, TABLE *
       break;
 
     case MYSQL_TYPE_DECIMAL:
-      sql_print_error("In RBR mode, Slave received incompatible DECIMAL field "
-                      "(old-style decimal field) from Master while creating "
-                      "conversion table. Please consider changing datatype on "
-                      "Master to new style decimal by executing ALTER command for"
-                      " column Name: %s.%s.%s.",
-                      target_table->s->db.str,
-                      target_table->s->table_name.str,
-                      target_table->field[col]->field_name);
-      goto err;
+      precision= field_metadata(col);
+      decimals= static_cast<Field_num*>(target_table->field[col])->dec;
+      max_length= field_metadata(col);
+      break;
 
     case MYSQL_TYPE_TINY_BLOB:
     case MYSQL_TYPE_MEDIUM_BLOB:
@@ -1002,20 +984,18 @@ TABLE *table_def::create_conversion_table(THD *thd, Relay_log_info *rli, TABLE *
     DBUG_PRINT("debug", ("sql_type: %d, target_field: '%s', max_length: %d, decimals: %d,"
                          " maybe_null: %d, unsigned_flag: %d, pack_length: %u",
                          binlog_type(col), target_table->field[col]->field_name,
-                         max_length, decimals, TRUE, unsigned_flag, pack_length));
+                         max_length, decimals, TRUE, FALSE, pack_length));
     field_def->init_for_tmp_table(type(col),
                                   max_length,
                                   decimals,
-                                  TRUE,          // maybe_null
-                                  unsigned_flag, // unsigned_flag
+                                  TRUE,         // maybe_null
+                                  FALSE,        // unsigned_flag
                                   pack_length);
     field_def->charset= target_table->field[col]->charset();
     field_def->interval= interval;
   }
 
-  conv_table= create_virtual_tmp_table(thd, field_list);
-
-err:
+  TABLE *conv_table= create_virtual_tmp_table(thd, field_list);
   if (conv_table == NULL)
     rli->report(ERROR_LEVEL, ER_SLAVE_CANT_CREATE_CONVERSION,
                 ER(ER_SLAVE_CANT_CREATE_CONVERSION),

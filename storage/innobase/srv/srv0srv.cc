@@ -68,6 +68,8 @@ Created 10/8/1995 Heikki Tuuri
 #include "srv0mon.h"
 #include "ut0crc32.h"
 
+#include "mysqld.h"
+
 #include "mysql/plugin.h"
 #include "mysql/service_thd_wait.h"
 
@@ -134,6 +136,12 @@ UNIV_INTERN ulint	srv_max_file_format_at_startup = UNIV_FORMAT_MAX;
 /** Place locks to records only i.e. do not use next-key locking except
 on duplicate key checking and foreign key checking */
 UNIV_INTERN ibool	srv_locks_unsafe_for_binlog = FALSE;
+
+/** When TRUE then get S locks rather than X locks on rows
+when innodb_fake_changes is set for a transaction. When FALSE
+do not get row locks. */
+UNIV_INTERN my_bool	srv_fake_changes_locks= TRUE;
+
 /** Sort buffer size in index creation */
 UNIV_INTERN ulong	srv_sort_buf_size = 1048576;
 /** Maximum modification log file size for online index creation */
@@ -227,9 +235,17 @@ UNIV_INTERN ulong	srv_flush_neighbors	= 1;
 UNIV_INTERN ulint	srv_buf_pool_old_size;
 /* current size in kilobytes */
 UNIV_INTERN ulint	srv_buf_pool_curr_size	= 0;
+/* requested size (number) */
+UNIV_INTERN ulint	srv_sync_pool_size	= 1024;
 /* size in bytes */
 UNIV_INTERN ulint	srv_mem_pool_size	= ULINT_MAX;
 UNIV_INTERN ulint	srv_lock_table_size	= ULINT_MAX;
+
+UNIV_INTERN uint	srv_defragment_n_pages = 7;
+
+/* page_cleaner_thread should run once per this many milliseconds */
+UNIV_INTERN ulint	srv_page_cleaner_interval_millis = 1000;
+UNIV_INTERN ulint	srv_idle_flush_pct = 100;
 
 /* This parameter is deprecated. Use srv_n_io_[read|write]_threads
 instead. */
@@ -243,6 +259,8 @@ UNIV_INTERN my_bool	srv_random_read_ahead	= FALSE;
 in the buffer cache and accessed sequentially for InnoDB to trigger a
 readahead request. */
 UNIV_INTERN ulong	srv_read_ahead_threshold	= 56;
+
+UNIV_INTERN ulong	srv_trx_log_write_block_size	= 4096;
 
 #ifdef UNIV_LOG_ARCHIVE
 UNIV_INTERN ibool		srv_log_archive_on	= FALSE;
@@ -275,8 +293,8 @@ in the buffer pool to all database pages in the buffer pool smaller than
 the following number. But it is not guaranteed that the value stays below
 that during a time of heavy update/insert activity. */
 
-UNIV_INTERN ulong	srv_max_buf_pool_modified_pct	= 75;
-UNIV_INTERN ulong	srv_max_dirty_pages_pct_lwm	= 50;
+UNIV_INTERN double	srv_max_buf_pool_modified_pct	= 75.0;
+UNIV_INTERN double	srv_max_dirty_pages_pct_lwm	= 50.0;
 
 /* This is the percentage of log capacity at which adaptive flushing,
 if enabled, will kick in. */
@@ -301,6 +319,27 @@ UNIV_INTERN srv_stats_t	srv_stats;
 /* structure to pass status variables to MySQL */
 UNIV_INTERN export_var_t export_vars;
 
+/** Time doing a checkpoint */
+UNIV_INTERN ulonglong   srv_checkpoint_time	= 0;
+
+/** Time in insert buffer */
+UNIV_INTERN ulonglong   srv_ibuf_contract_time	= 0;
+
+/** Time flushing logs */
+UNIV_INTERN ulonglong   srv_log_flush_time	= 0;
+
+/** Time enforcing dict cache limit */
+UNIV_INTERN ulonglong   srv_cache_limit_time	= 0;
+
+/** Time checking log freespace */
+UNIV_INTERN ulonglong   srv_free_log_time	= 0;
+
+/** Time doing background table drop */
+UNIV_INTERN ulonglong   srv_drop_table_time	= 0;
+
+/** Time in trx_purge */
+UNIV_INTERN ulonglong   srv_purge_time		= 0;
+
 /** Normally 0. When nonzero, skip some phases of crash recovery,
 starting from SRV_FORCE_IGNORE_CORRUPT, so that data can be recovered
 by SELECT or mysqldump. When this is nonzero, we do not allow any user
@@ -311,6 +350,36 @@ UNIV_INTERN ulong	srv_force_recovery;
 This is for testing and debugging only. */
 UNIV_INTERN ulong	srv_force_recovery_crash;
 #endif /* !DBUG_OFF */
+
+/** Number of deadlocks */
+UNIV_INTERN ulint	srv_lock_deadlocks	= 0;
+
+/** Number of row lock wait timeouts */
+UNIV_INTERN ulint	srv_lock_wait_timeouts	= 0;
+
+/** Number times purge skipped a row because the table had been dropped */
+UNIV_INTERN ulint srv_drop_purge_skip_row = 0;
+
+/** Number times ibuf merges skipped a row becaue the table had been dropped */
+UNIV_INTERN ulint srv_drop_ibuf_skip_row = 0;
+
+/** Count as "slow" file read, write and fsync requests that take this long */
+UNIV_INTERN ulint	srv_io_slow_usecs	= 0;
+
+/** Count as "old" file read and write requests that wait this long in bg arrays
+before getting scheduled */
+UNIV_INTERN ulint	srv_io_old_usecs	= 0;
+
+#ifdef UNIV_DEBUG
+/** Support diabling insert buffer merges during testing */
+UNIV_INTERN my_bool srv_allow_ibuf_merges = TRUE;
+#endif
+
+/** Number of extra writes done in buf_flush_try_neighbors from LRU list */
+UNIV_INTERN ulint	srv_neighbors_flushed_lru	= 0;
+
+/** Number of extra writes done in buf_flush_try_neighbors from flush list */
+UNIV_INTERN ulint	srv_neighbors_flushed_list	= 0;
 
 /** Print all user-level transactions deadlocks to mysqld stderr */
 
@@ -328,6 +397,10 @@ UNIV_INTERN ulint	srv_fast_shutdown	= 0;
 /* Generate a innodb_status.<pid> file */
 UNIV_INTERN ibool	srv_innodb_status	= FALSE;
 
+/* Optimize prefix index queries to skip cluster index lookup when possible */
+/* Enables or disables this prefix optimization.  Disabled by default. */
+UNIV_INTERN my_bool	srv_prefix_index_cluster_optimization = 0;
+
 /* When estimating number of different key values in an index, sample
 this many index pages, there are 2 ways to calculate statistics:
 * persistent stats that are calculated by ANALYZE TABLE and saved
@@ -339,7 +412,8 @@ UNIV_INTERN my_bool		srv_stats_persistent = TRUE;
 UNIV_INTERN unsigned long long	srv_stats_persistent_sample_pages = 20;
 UNIV_INTERN my_bool		srv_stats_auto_recalc = TRUE;
 
-UNIV_INTERN ibool	srv_use_doublewrite_buf	= TRUE;
+UNIV_INTERN ulong	srv_use_doublewrite_buf	= 1;
+UNIV_INTERN my_bool	srv_doublewrite_reset = FALSE;
 
 /** doublewrite buffer is 1MB is size i.e.: it can hold 128 16K pages.
 The following parameter is the size of the buffer that is used for
@@ -348,6 +422,18 @@ of the pages are used for single page flushing. */
 UNIV_INTERN ulong	srv_doublewrite_batch_size	= 120;
 
 UNIV_INTERN ulong	srv_replication_delay		= 0;
+
+/** Limit the unzip_LRU to this number of pages expressed as
+a percentage of the number of pages on the LRU. */
+UNIV_INTERN ulong srv_unzip_LRU_pct = 10;
+
+/** The factor to multiply the IO rate so that the cost of it is
+ * equivalent to the cost of the rate of page decompression. */
+UNIV_INTERN ulong  srv_lru_io_to_unzip_factor = 50;
+
+#ifdef XTRABACKUP
+UNIV_INTERN ibool	srv_apply_log_only	= FALSE;
+#endif /* XTRABACKUP */
 
 /*-------------------------------------------*/
 UNIV_INTERN ulong	srv_n_spin_wait_rounds	= 30;
@@ -425,8 +511,21 @@ UNIV_INTERN ib_mutex_t	srv_misc_tmpfile_mutex;
 /** Temporary file for miscellanous diagnostic output */
 UNIV_INTERN FILE*	srv_misc_tmpfile;
 
+/* Simulate compression failures. */
+UNIV_INTERN uint srv_simulate_comp_failures = 0;
+
 UNIV_INTERN ulint	srv_main_thread_process_no	= 0;
 UNIV_INTERN ulint	srv_main_thread_id		= 0;
+
+/** See the sync_checkpoint_limit user variable declaration in ha_innodb.cc */
+UNIV_INTERN ulint	srv_sync_checkpoint_limit	= 0;
+
+/** If false, there will be no table stats update from the replication
+slave thread. */
+UNIV_INTERN my_bool	srv_enable_slave_update_table_stats = FALSE;
+
+/** Number of pages processed by trx_purge */
+UNIV_INTERN ulint	srv_purged_pages	= 0;
 
 /* The following counts are used by the srv_master_thread. */
 
@@ -438,6 +537,24 @@ static ulint		srv_main_idle_loops		= 0;
 static ulint		srv_main_shutdown_loops		= 0;
 /** Log writes involving flush. */
 static ulint		srv_log_writes_and_flush	= 0;
+
+ulint	srv_n_commit_all	= 0;
+ulint	srv_n_commit_with_undo	= 0;
+ulint	srv_n_rollback_total	= 0;
+ulint	srv_n_rollback_partial	= 0;
+
+/** Number of times secondary index block visibility check returned TRUE */
+ulint	srv_sec_rec_read_sees	= 0;
+
+/** Number of times secondary index block visibility check was done */
+ulint	srv_sec_rec_read_check	= 0;
+
+/** Number of times secondary index lookup triggered cluster lookup */
+ulint	srv_sec_rec_cluster_reads = 0;
+
+/** Number of times prefix optimization avoided triggering cluster lookup */
+ulint	srv_sec_rec_cluster_reads_avoided = 0;
+
 
 /* This is only ever touched by the master thread. It records the
 time when the last flush of log file has happened. The master
@@ -617,6 +734,19 @@ srv_print_master_thread_info(
 		srv_main_active_loops,
 		srv_main_shutdown_loops,
 		srv_main_idle_loops);
+
+	fprintf(file,
+		"Seconds in background IO: %.2f insert buffer, "
+		"%.2f log flush, %.2f purge, %.2f cache limit, "
+		"%.2f free log, %.2f drop table, %.2f checkpoint\n",
+		my_timer_to_seconds(srv_ibuf_contract_time),
+		my_timer_to_seconds(srv_log_flush_time),
+		my_timer_to_seconds(srv_cache_limit_time),
+		my_timer_to_seconds(srv_free_log_time),
+		my_timer_to_seconds(srv_drop_table_time),
+		my_timer_to_seconds(srv_purge_time),
+		my_timer_to_seconds(srv_checkpoint_time));
+
 	fprintf(file, "srv_master_thread log flush and writes: %lu\n",
 		srv_log_writes_and_flush);
 }
@@ -1100,6 +1230,33 @@ srv_refresh_innodb_monitor_stats(void)
 }
 
 /******************************************************************//**
+Output for SHOW INNODB TRANSACTION STATUS */
+UNIV_INTERN
+void
+srv_printf_innodb_transaction(
+/*======================*/
+	FILE*	file)		/* in: output stream */
+{
+	mutex_enter(&srv_innodb_monitor_mutex);
+
+	fputs("\n=================================================\n", file);
+	ut_print_timestamp(file);
+	fprintf(file,
+		" INNODB TRANSACTION MONITOR OUTPUT\n"
+		"=================================================\n");
+
+	if (lock_print_info_summary(file, TRUE)) {
+		lock_print_info_all_transactions(file);
+	}
+
+	fputs("----------------------------------------\n"
+		"END OF INNODB TRANSACTION MONITOR OUTPUT\n"
+		"========================================\n", file);
+	mutex_exit(&srv_innodb_monitor_mutex);
+	fflush(file);
+}
+
+/******************************************************************//**
 Outputs to a file the output of the InnoDB Monitor.
 @return FALSE if not all information printed
 due to failure to obtain necessary mutex */
@@ -1110,10 +1267,7 @@ srv_printf_innodb_monitor(
 	FILE*	file,		/*!< in: output stream */
 	ibool	nowait,		/*!< in: whether to wait for the
 				lock_sys_t:: mutex */
-	ulint*	trx_start_pos,	/*!< out: file position of the start of
-				the list of active transactions */
-	ulint*	trx_end)	/*!< out: file position of the end of
-				the list of active transactions */
+	ibool   include_trxs)	/*!< in: include per-transaction output */
 {
 	double	time_elapsed;
 	time_t	current_time;
@@ -1174,36 +1328,25 @@ srv_printf_innodb_monitor(
 	function acquires the lock mutex on success. */
 	ret = lock_print_info_summary(file, nowait);
 
-	if (ret) {
-		if (trx_start_pos) {
-			long	t = ftell(file);
-			if (t < 0) {
-				*trx_start_pos = ULINT_UNDEFINED;
-			} else {
-				*trx_start_pos = (ulint) t;
-			}
-		}
-
+	if (include_trxs && ret) {
 		/* NOTE: If we get here then we have the lock mutex. This
 		function will release the lock mutex that we acquired when
 		we called the lock_print_info_summary() function earlier. */
 
 		lock_print_info_all_transactions(file);
-
-		if (trx_end) {
-			long	t = ftell(file);
-			if (t < 0) {
-				*trx_end = ULINT_UNDEFINED;
-			} else {
-				*trx_end = (ulint) t;
-			}
-		}
+	} else if (ret) {
+		lock_mutex_exit();
 	}
 
 	fputs("--------\n"
 	      "FILE I/O\n"
 	      "--------\n", file);
 	os_aio_print(file);
+
+	fputs("--------------\n"
+	      "TABLESPACE I/O\n"
+	      "--------------\n", file);
+	fil_print(file);
 
 	fputs("-------------------------------------\n"
 	      "INSERT BUFFER AND ADAPTIVE HASH INDEX\n"
@@ -1303,6 +1446,55 @@ srv_printf_innodb_monitor(
 }
 
 /******************************************************************//**
+Set compression related counters */
+static void
+export_zip(
+/*=======*/
+	ulint*			compressed,
+	ulint*			compressed_ok,
+	ulonglong*		compressed_time,
+	ulonglong*		compressed_ok_time,
+	ulint*			compressed_primary,
+	ulint*			compressed_primary_ok,
+	ulonglong*		compressed_primary_time,
+	ulonglong*		compressed_primary_ok_time,
+	ulint*			compressed_secondary,
+	ulint*			compressed_secondary_ok,
+	ulonglong*		compressed_secondary_time,
+	ulonglong*		compressed_secondary_ok_time,
+	ulint*			decompressed,
+	ulonglong*		decompressed_time,
+	ulint*			decompressed_primary,
+	ulonglong*		decompressed_primary_time,
+	ulint*			decompressed_secondary,
+	ulonglong*		decompressed_secondary_time,
+	page_zip_stat_t*	zip_stat)
+{
+	*compressed		= zip_stat->compressed;
+	*compressed_ok		= zip_stat->compressed_ok;
+	*compressed_time	= zip_stat->compressed_time;
+	*compressed_ok_time	= zip_stat->compressed_ok_time;
+	*compressed_primary	= zip_stat->compressed_primary;
+	*compressed_primary_ok = zip_stat->compressed_primary_ok;
+	*compressed_primary_time = zip_stat->compressed_primary_time;
+	*compressed_primary_ok_time	= zip_stat->compressed_primary_ok_time;
+	*compressed_secondary	= zip_stat->compressed_secondary;
+	*compressed_secondary_ok = zip_stat->compressed_secondary_ok;
+	*compressed_secondary_time = zip_stat->compressed_secondary_time;
+	*compressed_secondary_ok_time	= zip_stat->compressed_secondary_ok_time;
+	*decompressed		= zip_stat->decompressed;
+	*decompressed_time	= zip_stat->decompressed_time;
+	*decompressed_primary	= zip_stat->decompressed_primary;
+	*decompressed_primary_time = zip_stat->decompressed_primary_time;
+	*decompressed_secondary	= zip_stat->decompressed_secondary;
+	*decompressed_secondary_time = zip_stat->decompressed_secondary_time;
+}
+
+#ifdef UNIV_DEBUG
+extern ullint row_ins_optimistic_insert_calls_in_pessimistic_descent;
+#endif /* UNIV_DEBUG */
+
+/******************************************************************//**
 Function to pass InnoDB status variables to MySQL */
 UNIV_INTERN
 void
@@ -1312,11 +1504,20 @@ srv_export_innodb_status(void)
 	buf_pool_stat_t		stat;
 	buf_pools_list_size_t	buf_pools_list_size;
 	ulint			LRU_len;
+	ulint			old_LRU_len;
 	ulint			free_len;
 	ulint			flush_list_len;
+	ulint			unzip_LRU_len;
+	uint i;
+	ib_uint64_t lsn_oldest = buf_pool_get_oldest_modification();
+	ib_uint64_t lsn_current = log_sys->lsn;
+	ib_uint64_t lsn_gap = lsn_current - lsn_oldest;
+	ib_uint64_t lsn_checkpoint = log_sys->last_checkpoint_lsn;
 
 	buf_get_total_stat(&stat);
-	buf_get_total_list_len(&LRU_len, &free_len, &flush_list_len);
+	buf_get_total_list_len(
+		&LRU_len, &old_LRU_len, &free_len, &flush_list_len,
+		&unzip_LRU_len);
 	buf_get_total_list_size_in_bytes(&buf_pools_list_size);
 
 	mutex_enter(&srv_innodb_monitor_mutex);
@@ -1333,6 +1534,12 @@ srv_export_innodb_status(void)
 
 	export_vars.innodb_data_fsyncs = os_n_fsyncs;
 
+	export_vars.innodb_data_fsync_time = os_file_flush_time;
+
+	export_vars.innodb_data_fsync_slow = os_fsync_too_slow;
+
+	export_vars.innodb_data_fsync_max_time = os_fsync_max_time;
+
 	export_vars.innodb_data_read = srv_stats.data_read;
 
 	export_vars.innodb_data_reads = os_n_file_reads;
@@ -1340,6 +1547,85 @@ srv_export_innodb_status(void)
 	export_vars.innodb_data_writes = os_n_file_writes;
 
 	export_vars.innodb_data_written = srv_stats.data_written;
+
+	export_vars.innodb_data_async_read_bytes = os_async_read_perf.bytes;
+
+	export_vars.innodb_data_async_read_requests =
+		os_async_read_perf.requests;
+
+	export_vars.innodb_data_async_read_svc_time =
+		os_async_read_perf.svc_time ;
+
+	export_vars.innodb_data_async_read_old_ios =
+		os_async_read_old_ios;
+
+	export_vars.innodb_data_async_read_slow_ios =
+		os_async_read_perf.slow_ios;
+
+	export_vars.innodb_data_sync_read_bytes = os_sync_read_perf.bytes;
+
+	export_vars.innodb_data_sync_read_requests =
+		os_sync_read_perf.requests;
+
+	export_vars.innodb_data_sync_read_svc_time =
+		os_sync_read_perf.svc_time;
+
+	export_vars.innodb_data_sync_read_slow_ios =
+		os_sync_read_perf.slow_ios;
+
+	export_vars.innodb_data_async_write_bytes = os_async_write_perf.bytes;
+
+	export_vars.innodb_data_async_write_requests =
+		os_async_write_perf.requests;
+
+	export_vars.innodb_data_async_write_svc_time =
+		os_async_write_perf.svc_time;
+
+	export_vars.innodb_data_async_write_old_ios =
+		os_async_write_old_ios;
+
+	export_vars.innodb_data_async_write_slow_ios =
+		os_async_write_perf.slow_ios;
+
+	export_vars.innodb_data_sync_write_bytes = os_sync_write_perf.bytes;
+
+	export_vars.innodb_data_sync_write_requests =
+		os_sync_write_perf.requests;
+
+	export_vars.innodb_data_sync_write_svc_time =
+		os_sync_write_perf.svc_time;
+
+	export_vars.innodb_data_sync_write_slow_ios =
+		os_sync_write_perf.slow_ios;
+
+	export_vars.innodb_data_log_write_bytes = os_log_write_perf.bytes;
+
+	export_vars.innodb_data_log_write_requests = os_log_write_perf.requests;
+
+	export_vars.innodb_data_log_write_svc_time = os_log_write_perf.svc_time;
+
+	export_vars.innodb_data_log_write_slow_ios = os_log_write_perf.slow_ios;
+
+	export_vars.innodb_data_double_write_bytes = os_double_write_perf.bytes;
+
+	export_vars.innodb_data_double_write_requests =
+		os_double_write_perf.requests;
+
+	export_vars.innodb_data_double_write_svc_time =
+		os_double_write_perf.svc_time;
+
+	export_vars.innodb_data_double_write_slow_ios=
+		os_double_write_perf.slow_ios;
+
+	export_vars.innodb_buffer_pool_flushed_lru = stat.n_flushed_lru;
+
+	export_vars.innodb_buffer_pool_flushed_list = stat.n_flushed_list;
+
+	export_vars.innodb_buffer_pool_flushed_page =
+		stat.n_flushed_single_page;
+
+	export_vars.innodb_buffer_pool_pct_dirty =
+		(((double) flush_list_len) / (LRU_len + 1.0)) * 100.0;
 
 	export_vars.innodb_buffer_pool_read_requests = stat.n_page_gets;
 
@@ -1374,6 +1660,8 @@ srv_export_innodb_status(void)
 	export_vars.innodb_buffer_pool_bytes_dirty =
 		buf_pools_list_size.flush_list_bytes;
 
+	export_vars.innodb_buffer_pool_pages_unzip = unzip_LRU_len;
+
 	export_vars.innodb_buffer_pool_pages_free = free_len;
 
 #ifdef UNIV_DEBUG
@@ -1382,17 +1670,86 @@ srv_export_innodb_status(void)
 #endif /* UNIV_DEBUG */
 	export_vars.innodb_buffer_pool_pages_total = buf_pool_get_n_pages();
 
+	export_vars.innodb_buffer_pool_pages_lru_old = old_LRU_len;
+
 	export_vars.innodb_buffer_pool_pages_misc =
 		buf_pool_get_n_pages() - LRU_len - free_len;
+
+	export_vars.innodb_buffer_pool_neighbors_flushed_list=
+		srv_neighbors_flushed_list;
+	export_vars.innodb_buffer_pool_neighbors_flushed_lru=
+		srv_neighbors_flushed_lru;
+
+	export_vars.innodb_hash_searches = btr_cur_n_sea;
+	export_vars.innodb_hash_nonsearches = btr_cur_n_non_sea;
 
 #ifdef HAVE_ATOMIC_BUILTINS
 	export_vars.innodb_have_atomic_builtins = 1;
 #else
 	export_vars.innodb_have_atomic_builtins = 0;
 #endif
+
+	export_vars.innodb_ibuf_inserts =
+		ibuf->n_merged_ops[IBUF_OP_INSERT];
+	export_vars.innodb_ibuf_delete_marks =
+		ibuf->n_merged_ops[IBUF_OP_DELETE_MARK];
+	export_vars.innodb_ibuf_deletes =
+		ibuf->n_merged_ops[IBUF_OP_DELETE];
+	export_vars.innodb_ibuf_merges = ibuf->n_merges;
+	export_vars.innodb_ibuf_size = ibuf->size;
+
 	export_vars.innodb_page_size = UNIV_PAGE_SIZE;
 
+	export_vars.innodb_lock_deadlocks = srv_lock_deadlocks;
+
+	export_vars.innodb_lock_wait_timeouts = srv_lock_wait_timeouts;
+
 	export_vars.innodb_log_waits = srv_stats.log_waits;
+
+	export_vars.innodb_log_checkpoints= log_sys->n_checkpoints;
+
+	export_vars.innodb_log_syncs= log_sys->n_syncs;
+
+	export_vars.innodb_log_write_archive=
+		log_sys->log_sync_callers[LOG_WRITE_FROM_LOG_ARCHIVE];
+	export_vars.innodb_log_write_background_async=
+		log_sys->log_sync_callers[LOG_WRITE_FROM_BACKGROUND_ASYNC];
+	export_vars.innodb_log_write_background_sync=
+		log_sys->log_sync_callers[LOG_WRITE_FROM_BACKGROUND_SYNC];
+	export_vars.innodb_log_write_checkpoint_async=
+		log_sys->log_sync_callers[LOG_WRITE_FROM_CHECKPOINT_ASYNC];
+	export_vars.innodb_log_write_checkpoint_sync=
+		log_sys->log_sync_callers[LOG_WRITE_FROM_CHECKPOINT_SYNC];
+	export_vars.innodb_log_write_commit_async=
+		log_sys->log_sync_callers[LOG_WRITE_FROM_COMMIT_ASYNC];
+	export_vars.innodb_log_write_commit_sync=
+		log_sys->log_sync_callers[LOG_WRITE_FROM_COMMIT_SYNC];
+	export_vars.innodb_log_write_flush_dirty=
+		log_sys->log_sync_callers[LOG_WRITE_FROM_DIRTY_BUFFER];
+	export_vars.innodb_log_write_other=
+		log_sys->log_sync_callers[LOG_WRITE_FROM_INTERNAL];
+
+	export_vars.innodb_log_sync_archive=
+		log_sys->log_sync_syncers[LOG_WRITE_FROM_LOG_ARCHIVE];
+	export_vars.innodb_log_sync_background_async=
+		log_sys->log_sync_syncers[LOG_WRITE_FROM_BACKGROUND_ASYNC];
+	export_vars.innodb_log_sync_background_sync=
+		log_sys->log_sync_syncers[LOG_WRITE_FROM_BACKGROUND_SYNC];
+	export_vars.innodb_log_sync_checkpoint_async=
+		log_sys->log_sync_syncers[LOG_WRITE_FROM_CHECKPOINT_ASYNC];
+	export_vars.innodb_log_sync_checkpoint_sync=
+		log_sys->log_sync_syncers[LOG_WRITE_FROM_CHECKPOINT_SYNC];
+	export_vars.innodb_log_sync_commit_async=
+		log_sys->log_sync_syncers[LOG_WRITE_FROM_COMMIT_ASYNC];
+	export_vars.innodb_log_sync_commit_sync=
+		log_sys->log_sync_syncers[LOG_WRITE_FROM_COMMIT_SYNC];
+	export_vars.innodb_log_sync_flush_dirty=
+		log_sys->log_sync_syncers[LOG_WRITE_FROM_DIRTY_BUFFER];
+	export_vars.innodb_log_sync_other=
+		log_sys->log_sync_syncers[LOG_WRITE_FROM_INTERNAL];
+#ifdef UNIV_DEBUG
+	export_vars.innodb_log_write_padding = log_sys->log_write_padding;
+#endif /*UNIV_DEBUG*/
 
 	export_vars.innodb_os_log_written = srv_stats.os_log_written;
 
@@ -1415,8 +1772,39 @@ srv_export_innodb_status(void)
 	export_vars.innodb_pages_created = stat.n_pages_created;
 
 	export_vars.innodb_pages_read = stat.n_pages_read;
+	export_vars.innodb_pages_read_index = stat.n_pages_read_index;
+	export_vars.innodb_pages_read_undo_log = stat.n_pages_read_undo_log;
+	export_vars.innodb_pages_read_inode = stat.n_pages_read_inode;
+	export_vars.innodb_pages_read_ibuf_free_list =
+		stat.n_pages_read_ibuf_free_list;
+	export_vars.innodb_pages_read_allocated = stat.n_pages_read_allocated;
+	export_vars.innodb_pages_read_ibuf_bitmap =
+		stat.n_pages_read_ibuf_bitmap;
+	export_vars.innodb_pages_read_sys = stat.n_pages_read_sys;
+	export_vars.innodb_pages_read_trx_sys = stat.n_pages_read_trx_sys;
+	export_vars.innodb_pages_read_fsp_hdr = stat.n_pages_read_fsp_hdr;
+	export_vars.innodb_pages_read_xdes = stat.n_pages_read_xdes;
+	export_vars.innodb_pages_read_blob = stat.n_pages_read_blob;
 
 	export_vars.innodb_pages_written = stat.n_pages_written;
+	export_vars.innodb_pages_written_index = stat.n_pages_written_index;
+	export_vars.innodb_pages_written_undo_log =
+		stat.n_pages_written_undo_log;
+	export_vars.innodb_pages_written_inode = stat.n_pages_written_inode;
+	export_vars.innodb_pages_written_ibuf_free_list =
+		stat.n_pages_written_ibuf_free_list;
+	export_vars.innodb_pages_written_allocated =
+		stat.n_pages_written_allocated;
+	export_vars.innodb_pages_written_ibuf_bitmap =
+		stat.n_pages_written_ibuf_bitmap;
+	export_vars.innodb_pages_written_sys = stat.n_pages_written_sys;
+	export_vars.innodb_pages_written_trx_sys = stat.n_pages_written_trx_sys;
+	export_vars.innodb_pages_written_fsp_hdr = stat.n_pages_written_fsp_hdr;
+	export_vars.innodb_pages_written_xdes = stat.n_pages_written_xdes;
+	export_vars.innodb_pages_written_blob = stat.n_pages_written_blob;
+
+	export_vars.innodb_purge_pending = trx_sys->rseg_history_len;
+	export_vars.innodb_purged_pages= srv_purged_pages;
 
 	export_vars.innodb_row_lock_waits = srv_stats.n_lock_wait_count;
 
@@ -1453,6 +1841,9 @@ srv_export_innodb_status(void)
 
 	export_vars.innodb_available_undo_logs = srv_available_undo_logs;
 
+	export_vars.innodb_buf_dblwr_page_no =
+		buf_dblwr ? buf_dblwr->block1 : 0;
+
 #ifdef UNIV_DEBUG
 	rw_lock_s_lock(&purge_sys->latch);
 	trx_id_t	done_trx_no	= purge_sys->done.trx_no;
@@ -1461,25 +1852,219 @@ srv_export_innodb_status(void)
 		: 0;
 	rw_lock_s_unlock(&purge_sys->latch);
 
-	mutex_enter(&trx_sys->mutex);
-	trx_id_t	max_trx_id	= trx_sys->rw_max_trx_id;
-	mutex_exit(&trx_sys->mutex);
-
-	if (!done_trx_no || max_trx_id < done_trx_no - 1) {
+	if (!done_trx_no || trx_sys->rw_max_trx_id < done_trx_no - 1) {
 		export_vars.innodb_purge_trx_id_age = 0;
 	} else {
 		export_vars.innodb_purge_trx_id_age =
-			(ulint) (max_trx_id - done_trx_no + 1);
+			(ulint) (trx_sys->rw_max_trx_id - done_trx_no + 1);
 	}
 
 	if (!up_limit_id
-	    || max_trx_id < up_limit_id) {
+	    || trx_sys->rw_max_trx_id < up_limit_id) {
 		export_vars.innodb_purge_view_trx_id_age = 0;
 	} else {
 		export_vars.innodb_purge_view_trx_id_age =
-			(ulint) (max_trx_id - up_limit_id);
+			(ulint) (trx_sys->rw_max_trx_id - up_limit_id);
 	}
 #endif /* UNIV_DEBUG */
+
+	export_vars.innodb_mutex_os_waits = mutex_os_wait_count;
+	export_vars.innodb_mutex_spin_rounds = mutex_spin_round_count;
+	export_vars.innodb_mutex_spin_waits = mutex_spin_wait_count;
+
+	export_vars.innodb_rwlock_s_os_waits = rw_lock_stats.rw_s_os_wait_count;
+	export_vars.innodb_rwlock_s_spin_rounds = rw_lock_stats.rw_s_spin_round_count;
+	export_vars.innodb_rwlock_s_spin_waits = rw_lock_stats.rw_s_spin_wait_count;
+
+	export_vars.innodb_rwlock_x_os_waits = rw_lock_stats.rw_x_os_wait_count;
+	export_vars.innodb_rwlock_x_spin_rounds = rw_lock_stats.rw_x_spin_round_count;
+	export_vars.innodb_rwlock_x_spin_waits = rw_lock_stats.rw_x_spin_wait_count;
+
+	export_vars.innodb_srv_checkpoint_time= srv_checkpoint_time;
+	export_vars.innodb_srv_ibuf_contract_time= srv_ibuf_contract_time;
+	export_vars.innodb_srv_log_flush_time= srv_log_flush_time;
+	export_vars.innodb_srv_cache_limit_time= srv_cache_limit_time;
+	export_vars.innodb_srv_free_log_time= srv_free_log_time;
+	export_vars.innodb_srv_drop_table_time= srv_drop_table_time;
+	export_vars.innodb_srv_purge_time= srv_purge_time;
+
+	export_vars.innodb_trx_n_commit_all= srv_n_commit_all;
+	export_vars.innodb_trx_n_commit_with_undo= srv_n_commit_with_undo;
+	export_vars.innodb_trx_n_rollback_partial= srv_n_rollback_partial;
+	export_vars.innodb_trx_n_rollback_total= srv_n_rollback_total;
+
+	export_vars.innodb_sec_rec_read_sees = srv_sec_rec_read_sees;
+	export_vars.innodb_sec_rec_read_check = srv_sec_rec_read_check;
+
+	export_vars.innodb_sec_rec_cluster_reads = srv_sec_rec_cluster_reads;
+	export_vars.innodb_sec_rec_cluster_reads_avoided =
+		srv_sec_rec_cluster_reads_avoided;
+
+	export_vars.innodb_preflush_async_limit = log_sys->max_modified_age_async;
+	export_vars.innodb_preflush_sync_limit = log_sys->max_modified_age_sync;
+	if (!lsn_oldest) {
+		export_vars.innodb_preflush_async_margin =
+			log_sys->max_modified_age_async;
+		export_vars.innodb_preflush_sync_margin =
+			log_sys->max_modified_age_sync;
+	} else {
+		export_vars.innodb_preflush_async_margin =
+			(log_sys->max_modified_age_async >= lsn_gap) ?
+			(log_sys->max_modified_age_async - lsn_gap) : 0;
+		export_vars.innodb_preflush_sync_margin =
+			(log_sys->max_modified_age_sync >= lsn_gap) ?
+			(log_sys->max_modified_age_sync - lsn_gap) : 0;
+	}
+	export_vars.innodb_checkpoint_lsn = lsn_checkpoint;
+	export_vars.innodb_checkpoint_diff = lsn_current - lsn_checkpoint;
+	export_vars.innodb_lsn_current = lsn_current;
+	export_vars.innodb_lsn_oldest = lsn_oldest;
+	export_vars.innodb_lsn_diff = lsn_gap;
+
+	export_vars.innodb_buffered_aio_submitted =
+		srv_stats.n_aio_submitted;
+	export_vars.innodb_logical_read_ahead_misses =
+		srv_stats.n_logical_read_ahead_misses;
+	export_vars.innodb_logical_read_ahead_prefetched =
+		srv_stats.n_logical_read_ahead_prefetched;
+	export_vars.innodb_logical_read_ahead_in_buf_pool =
+		srv_stats.n_logical_read_ahead_in_buf_pool;
+
+	for (i = 0; i < PAGE_ZIP_SSIZE_MAX - 1; i++) {
+		page_zip_stat_t*        zip_stat = &page_zip_stat[i];
+
+		ulint page_size = UNIV_ZIP_SIZE_MIN << i;
+
+		switch (page_size) {
+		case 1024:
+			export_zip(&export_vars.zip1024_compressed,
+				&export_vars.zip1024_compressed_ok,
+				&export_vars.zip1024_compressed_time,
+				&export_vars.zip1024_compressed_ok_time,
+				&export_vars.zip1024_compressed_primary,
+				&export_vars.zip1024_compressed_primary_ok,
+				&export_vars.zip1024_compressed_primary_time,
+				&export_vars.zip1024_compressed_primary_ok_time,
+				&export_vars.zip1024_compressed_secondary,
+				&export_vars.zip1024_compressed_secondary_ok,
+				&export_vars.zip1024_compressed_secondary_time,
+				&export_vars.zip1024_compressed_secondary_ok_time,
+				&export_vars.zip1024_decompressed,
+				&export_vars.zip1024_decompressed_time,
+				&export_vars.zip1024_decompressed_primary,
+				&export_vars.zip1024_decompressed_primary_time,
+				&export_vars.zip1024_decompressed_secondary,
+				&export_vars.zip1024_decompressed_secondary_time,
+				zip_stat);
+			break;
+		case 2048:
+			export_zip(&export_vars.zip2048_compressed,
+				&export_vars.zip2048_compressed_ok,
+				&export_vars.zip2048_compressed_time,
+				&export_vars.zip2048_compressed_ok_time,
+				&export_vars.zip2048_compressed_primary,
+				&export_vars.zip2048_compressed_primary_ok,
+				&export_vars.zip2048_compressed_primary_time,
+				&export_vars.zip2048_compressed_primary_ok_time,
+				&export_vars.zip2048_compressed_secondary,
+				&export_vars.zip2048_compressed_secondary_ok,
+				&export_vars.zip2048_compressed_secondary_time,
+				&export_vars.zip2048_compressed_secondary_ok_time,
+				&export_vars.zip2048_decompressed,
+				&export_vars.zip2048_decompressed_time,
+				&export_vars.zip2048_decompressed_primary,
+				&export_vars.zip2048_decompressed_primary_time,
+				&export_vars.zip2048_decompressed_secondary,
+				&export_vars.zip2048_decompressed_secondary_time,
+				zip_stat);
+			break;
+		case 4096:
+			export_zip(&export_vars.zip4096_compressed,
+				&export_vars.zip4096_compressed_ok,
+				&export_vars.zip4096_compressed_time,
+				&export_vars.zip4096_compressed_ok_time,
+				&export_vars.zip4096_compressed_primary,
+				&export_vars.zip4096_compressed_primary_ok,
+				&export_vars.zip4096_compressed_primary_time,
+				&export_vars.zip4096_compressed_primary_ok_time,
+				&export_vars.zip4096_compressed_secondary,
+				&export_vars.zip4096_compressed_secondary_ok,
+				&export_vars.zip4096_compressed_secondary_time,
+				&export_vars.zip4096_compressed_secondary_ok_time,
+				&export_vars.zip4096_decompressed,
+				&export_vars.zip4096_decompressed_time,
+				&export_vars.zip4096_decompressed_primary,
+				&export_vars.zip4096_decompressed_primary_time,
+				&export_vars.zip4096_decompressed_secondary,
+				&export_vars.zip4096_decompressed_secondary_time,
+				zip_stat);
+			break;
+		case 8192:
+			export_zip(&export_vars.zip8192_compressed,
+				&export_vars.zip8192_compressed_ok,
+				&export_vars.zip8192_compressed_time,
+				&export_vars.zip8192_compressed_ok_time,
+				&export_vars.zip8192_compressed_primary,
+				&export_vars.zip8192_compressed_primary_ok,
+				&export_vars.zip8192_compressed_primary_time,
+				&export_vars.zip8192_compressed_primary_ok_time,
+				&export_vars.zip8192_compressed_secondary,
+				&export_vars.zip8192_compressed_secondary_ok,
+				&export_vars.zip8192_compressed_secondary_time,
+				&export_vars.zip8192_compressed_secondary_ok_time,
+				&export_vars.zip8192_decompressed,
+				&export_vars.zip8192_decompressed_time,
+				&export_vars.zip8192_decompressed_primary,
+				&export_vars.zip8192_decompressed_primary_time,
+				&export_vars.zip8192_decompressed_secondary,
+				&export_vars.zip8192_decompressed_secondary_time,
+				zip_stat);
+			break;
+		case 16384:
+			export_zip(&export_vars.zip16384_compressed,
+				&export_vars.zip16384_compressed_ok,
+				&export_vars.zip16384_compressed_time,
+				&export_vars.zip16384_compressed_ok_time,
+				&export_vars.zip16384_compressed_primary,
+				&export_vars.zip16384_compressed_primary_ok,
+				&export_vars.zip16384_compressed_primary_time,
+				&export_vars.zip16384_compressed_primary_ok_time,
+				&export_vars.zip16384_compressed_secondary,
+				&export_vars.zip16384_compressed_secondary_ok,
+				&export_vars.zip16384_compressed_secondary_time,
+				&export_vars.zip16384_compressed_secondary_ok_time,
+				&export_vars.zip16384_decompressed,
+				&export_vars.zip16384_decompressed_time,
+				&export_vars.zip16384_decompressed_primary,
+				&export_vars.zip16384_decompressed_primary_time,
+				&export_vars.zip16384_decompressed_secondary,
+				&export_vars.zip16384_decompressed_secondary_time,
+				zip_stat);
+			break;
+		default:
+			break;
+		}
+	}
+
+#ifdef UNIV_DEBUG
+	export_vars.num_optimistic_insert_calls_in_pessimistic_descent =
+		row_ins_optimistic_insert_calls_in_pessimistic_descent;
+#endif /* UNIV_DEBUG */
+
+	export_vars.innodb_malloc_cache_hits_compress = malloc_cache_compress->hits;
+	export_vars.innodb_malloc_cache_misses_compress =
+	  malloc_cache_compress->misses;
+	export_vars.innodb_malloc_cache_hits_decompress =
+	  malloc_cache_decompress->hits;
+	export_vars.innodb_malloc_cache_misses_decompress =
+	  malloc_cache_decompress->misses;
+	export_vars.innodb_malloc_cache_block_size_compress =
+	  malloc_cache_compress->block_size;
+	export_vars.innodb_malloc_cache_block_size_decompress =
+	  malloc_cache_decompress->block_size;
+
+	export_vars.innodb_drop_purge_skip_row = srv_drop_purge_skip_row;
+	export_vars.innodb_drop_ibuf_skip_row = srv_drop_ibuf_skip_row;
 
 	mutex_exit(&srv_innodb_monitor_mutex);
 }
@@ -1551,7 +2136,7 @@ loop:
 
 			if (!srv_printf_innodb_monitor(stderr,
 						MUTEX_NOWAIT(mutex_skipped),
-						NULL, NULL)) {
+						TRUE)) {
 				mutex_skipped++;
 			} else {
 				/* Reset the counter */
@@ -1570,7 +2155,7 @@ loop:
 			rewind(srv_monitor_file);
 			if (!srv_printf_innodb_monitor(srv_monitor_file,
 						MUTEX_NOWAIT(mutex_skipped),
-						NULL, NULL)) {
+						TRUE)) {
 				mutex_skipped++;
 			} else {
 				mutex_skipped = 0;
@@ -1818,6 +2403,9 @@ srv_get_active_thread_type(void)
 	if (ret == SRV_NONE
 	    && srv_shutdown_state != SRV_SHUTDOWN_NONE
 	    && trx_purge_state() != PURGE_STATE_DISABLED
+#ifdef XTRABACKUP
+	    && trx_purge_state() != PURGE_STATE_INIT
+#endif /* XTRABACKUP */
 	    && trx_purge_state() != PURGE_STATE_EXIT) {
 
 		ret = SRV_PURGE;
@@ -2066,6 +2654,7 @@ srv_master_do_active_tasks(void)
 {
 	ib_time_t	cur_time = ut_time();
 	ullint		counter_time = ut_time_us(NULL);
+	ulonglong	start_time;
 
 	/* First do the tasks that we are suppose to do at each
 	invocation of this function. */
@@ -2077,10 +2666,12 @@ srv_master_do_active_tasks(void)
 	/* ALTER TABLE in MySQL requires on Unix that the table handler
 	can drop tables lazily after there no longer are SELECT
 	queries to them. */
+	start_time = my_timer_now();
 	srv_main_thread_op_info = "doing background drop tables";
 	row_drop_tables_for_mysql_in_background();
 	MONITOR_INC_TIME_IN_MICRO_SECS(
 		MONITOR_SRV_BACKGROUND_DROP_TABLE_MICROSECOND, counter_time);
+	srv_drop_table_time += my_timer_since(start_time);
 
 	if (srv_shutdown_state > 0) {
 		return;
@@ -2088,21 +2679,27 @@ srv_master_do_active_tasks(void)
 
 	/* make sure that there is enough reusable space in the redo
 	log files */
+	start_time = my_timer_now();
 	srv_main_thread_op_info = "checking free log space";
 	log_free_check();
+	srv_free_log_time += my_timer_since(start_time);
 
 	/* Do an ibuf merge */
+	start_time = my_timer_now();
 	srv_main_thread_op_info = "doing insert buffer merge";
 	counter_time = ut_time_us(NULL);
 	ibuf_contract_in_background(0, FALSE);
 	MONITOR_INC_TIME_IN_MICRO_SECS(
 		MONITOR_SRV_IBUF_MERGE_MICROSECOND, counter_time);
+	srv_ibuf_contract_time += my_timer_since(start_time);
 
 	/* Flush logs if needed */
+	start_time = my_timer_now();
 	srv_main_thread_op_info = "flushing log";
 	srv_sync_log_buffer_in_background();
 	MONITOR_INC_TIME_IN_MICRO_SECS(
 		MONITOR_SRV_LOG_FLUSH_MICROSECOND, counter_time);
+	srv_log_flush_time += my_timer_since(start_time);
 
 	/* Now see if various tasks that are performed at defined
 	intervals need to be performed. */
@@ -2124,24 +2721,28 @@ srv_master_do_active_tasks(void)
 		return;
 	}
 
+	start_time = my_timer_now();
 	if (cur_time % SRV_MASTER_DICT_LRU_INTERVAL == 0) {
 		srv_main_thread_op_info = "enforcing dict cache limit";
 		srv_master_evict_from_table_cache(50);
 		MONITOR_INC_TIME_IN_MICRO_SECS(
 			MONITOR_SRV_DICT_LRU_MICROSECOND, counter_time);
 	}
+	srv_cache_limit_time += my_timer_since(start_time);
 
 	if (srv_shutdown_state > 0) {
 		return;
 	}
 
 	/* Make a new checkpoint */
+	start_time = my_timer_now();
 	if (cur_time % SRV_MASTER_CHECKPOINT_INTERVAL == 0) {
 		srv_main_thread_op_info = "making checkpoint";
 		log_checkpoint(TRUE, FALSE);
 		MONITOR_INC_TIME_IN_MICRO_SECS(
 			MONITOR_SRV_CHECKPOINT_MICROSECOND, counter_time);
 	}
+	srv_checkpoint_time += my_timer_since(start_time);
 }
 
 /*********************************************************************//**
@@ -2578,6 +3179,9 @@ srv_do_purge(
 			break;
 		}
 
+		ulonglong	start_time;
+		start_time = my_timer_now();
+
 		n_pages_purged = trx_purge(
 			n_use_threads, srv_purge_batch_size, false);
 
@@ -2586,6 +3190,8 @@ srv_do_purge(
 			n_pages_purged += trx_purge(
 				1, srv_purge_batch_size, true);
 		}
+
+		srv_purge_time += my_timer_since(start_time);
 
 		*n_total_purged += n_pages_purged;
 

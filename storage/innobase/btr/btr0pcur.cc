@@ -47,6 +47,7 @@ btr_pcur_create_for_mysql(void)
 
 	pcur->btr_cur.index = NULL;
 	btr_pcur_init(pcur);
+	pcur->btr_cur.tree_height = ULINT_UNDEFINED;
 
 	return(pcur);
 }
@@ -224,6 +225,7 @@ btr_pcur_restore_position_func(
 /*===========================*/
 	ulint		latch_mode,	/*!< in: BTR_SEARCH_LEAF, ... */
 	btr_pcur_t*	cursor,		/*!< in: detached persistent cursor */
+	ulint		level,
 	const char*	file,		/*!< in: file name */
 	ulint		line,		/*!< in: line where called */
 	mtr_t*		mtr)		/*!< in: mtr */
@@ -261,7 +263,7 @@ btr_pcur_restore_position_func(
 		btr_cur_open_at_index_side(
 			cursor->rel_pos == BTR_PCUR_BEFORE_FIRST_IN_TREE,
 			index, latch_mode,
-			btr_pcur_get_btr_cur(cursor), 0, mtr);
+			btr_pcur_get_btr_cur(cursor), level, mtr);
 
 		cursor->latch_mode = latch_mode;
 		cursor->pos_state = BTR_PCUR_IS_POSITIONED;
@@ -273,8 +275,12 @@ btr_pcur_restore_position_func(
 	ut_a(cursor->old_rec);
 	ut_a(cursor->old_n_fields);
 
-	if (UNIV_LIKELY(latch_mode == BTR_SEARCH_LEAF)
-	    || UNIV_LIKELY(latch_mode == BTR_MODIFY_LEAF)) {
+	if (true
+#ifdef UNIV_DEBUG
+	    && !level
+#endif
+	    && (UNIV_LIKELY(latch_mode == BTR_SEARCH_LEAF)
+	    || UNIV_LIKELY(latch_mode == BTR_MODIFY_LEAF))) {
 		/* Try optimistic restoration */
 
 		if (UNIV_LIKELY(buf_page_optimistic_get(
@@ -328,24 +334,27 @@ btr_pcur_restore_position_func(
 
 	/* Save the old search mode of the cursor */
 	old_mode = cursor->search_mode;
-
-	switch (cursor->rel_pos) {
-	case BTR_PCUR_ON:
+	if (level > 0) {
 		mode = PAGE_CUR_LE;
-		break;
-	case BTR_PCUR_AFTER:
-		mode = PAGE_CUR_G;
-		break;
-	case BTR_PCUR_BEFORE:
-		mode = PAGE_CUR_L;
-		break;
-	default:
-		ut_error;
-		mode = 0;
+	} else {
+		switch (cursor->rel_pos) {
+		case BTR_PCUR_ON:
+			mode = PAGE_CUR_LE;
+			break;
+		case BTR_PCUR_AFTER:
+			mode = PAGE_CUR_G;
+			break;
+		case BTR_PCUR_BEFORE:
+			mode = PAGE_CUR_L;
+			break;
+		default:
+			ut_error;
+			mode = 0;
+		}
 	}
 
-	btr_pcur_open_with_no_init_func(index, tuple, mode, latch_mode,
-					cursor, 0, file, line, mtr);
+	btr_pcur_open_with_no_init_func_low(index, tuple, mode, latch_mode,
+					    cursor, level, 0, file, line, mtr);
 
 	/* Restore the old search mode */
 	cursor->search_mode = old_mode;
@@ -494,7 +503,7 @@ btr_pcur_move_backward_from_page(
 
 	mtr_commit(mtr);
 
-	mtr_start(mtr);
+	mtr_start_trx(mtr, mtr->trx);
 
 	btr_pcur_restore_position(latch_mode2, cursor, mtr);
 

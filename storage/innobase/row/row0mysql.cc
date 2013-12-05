@@ -587,7 +587,8 @@ row_mysql_handle_errors(
 				function */
 	trx_t*		trx,	/*!< in: transaction */
 	que_thr_t*	thr,	/*!< in: query thread, or NULL */
-	trx_savept_t*	savept)	/*!< in: savepoint, or NULL */
+	trx_savept_t*	savept,	/*!< in: savepoint, or NULL */
+	dict_table_t*	table)	/*!< in: table */
 {
 	dberr_t	err;
 
@@ -600,6 +601,7 @@ handle_new_error:
 
 	switch (err) {
 	case DB_LOCK_WAIT_TIMEOUT:
+		fil_change_lock_wait_timeout_count(table->space, 1);
 		if (row_rollback_on_timeout) {
 			trx_rollback_to_savepoint(trx, NULL);
 			break;
@@ -627,6 +629,7 @@ handle_new_error:
 		/* MySQL will roll back the latest SQL statement */
 		break;
 	case DB_LOCK_WAIT:
+		fil_change_lock_wait_count(table->space, 1);
 		lock_wait_suspend_thread(thr);
 
 		if (trx->error_state != DB_SUCCESS) {
@@ -1023,7 +1026,8 @@ UNIV_INLINE
 void
 row_update_statistics_if_needed(
 /*============================*/
-	dict_table_t*	table)	/*!< in: table */
+	dict_table_t*	table,	/*!< in: table */
+	trx_t*		trx)
 {
 	ib_uint64_t	counter;
 	ib_uint64_t	n_rows;
@@ -1038,6 +1042,11 @@ row_update_statistics_if_needed(
 	}
 
 	counter = table->stat_modified_counter++;
+	if (thd_is_replication_slave_thread(trx->mysql_thd) &&
+	    !srv_enable_slave_update_table_stats) {
+		return;
+	}
+
 	n_rows = dict_table_get_n_rows(table);
 
 	if (dict_stats_is_persistent_enabled(table)) {
@@ -1122,7 +1131,8 @@ run_again:
 	if (err != DB_SUCCESS) {
 		que_thr_stop_for_mysql(thr);
 
-		was_lock_wait = row_mysql_handle_errors(&err, trx, thr, NULL);
+		was_lock_wait = row_mysql_handle_errors(&err, trx, thr, NULL,
+		    prebuilt->table);
 
 		if (was_lock_wait) {
 			goto run_again;
@@ -1203,7 +1213,8 @@ run_again:
 	if (err != DB_SUCCESS) {
 		que_thr_stop_for_mysql(thr);
 
-		was_lock_wait = row_mysql_handle_errors(&err, trx, thr, NULL);
+		was_lock_wait = row_mysql_handle_errors(&err, trx, thr, NULL,
+		    table ? table : prebuilt->table);
 
 		if (was_lock_wait) {
 			goto run_again;
@@ -1321,7 +1332,7 @@ error_exit:
 		thr->lock_state = QUE_THR_LOCK_ROW;
 
 		was_lock_wait = row_mysql_handle_errors(
-			&err, trx, thr, &savept);
+			&err, trx, thr, &savept, prebuilt->table);
 
 		thr->lock_state = QUE_THR_LOCK_NOLOCK;
 
@@ -1357,7 +1368,7 @@ error_exit:
 			if (doc_id < next_doc_id) {
 				fprintf(stderr,
 					"InnoDB: FTS Doc ID must be large than"
-					" "UINT64PF" for table",
+					" " UINT64PF " for table",
 					next_doc_id - 1);
 				ut_print_name(stderr, trx, TRUE, table->name);
 				putc('\n', stderr);
@@ -1372,9 +1383,9 @@ error_exit:
 
 			if (doc_id - next_doc_id >= FTS_DOC_ID_MAX_STEP) {
 				fprintf(stderr,
-					"InnoDB: Doc ID "UINT64PF" is too"
+					"InnoDB: Doc ID " UINT64PF " is too"
 					" big. Its difference with largest"
-					" used Doc ID "UINT64PF" cannot"
+					" used Doc ID " UINT64PF " cannot"
 					" exceed or equal to %d\n",
 					doc_id, next_doc_id - 1,
 					FTS_DOC_ID_MAX_STEP);
@@ -1391,15 +1402,16 @@ error_exit:
 
 	que_thr_stop_for_mysql_no_error(thr, trx);
 
-	srv_stats.n_rows_inserted.add((size_t)trx->id, 1);
-
 	/* Not protected by dict_table_stats_lock() for performance
 	reasons, we would rather get garbage in stat_n_rows (which is
 	just an estimate anyway) than protecting the following code
 	with a latch. */
-	dict_table_n_rows_inc(table);
 
-	row_update_statistics_if_needed(table);
+	if (UNIV_LIKELY(!trx->fake_changes)) {
+		dict_table_n_rows_inc(table);
+		row_update_statistics_if_needed(table, trx);
+		srv_stats.n_rows_inserted.add((size_t)trx->id, 1);
+	}
 	trx->op_info = "";
 
 	return(err);
@@ -1743,7 +1755,7 @@ run_again:
 		DEBUG_SYNC(trx->mysql_thd, "row_update_for_mysql_error");
 
 		was_lock_wait = row_mysql_handle_errors(&err, trx, thr,
-							&savept);
+				&savept, prebuilt->table);
 		thr->lock_state= QUE_THR_LOCK_NOLOCK;
 
 		if (was_lock_wait) {
@@ -1771,18 +1783,23 @@ run_again:
 		reasons, we would rather get garbage in stat_n_rows (which is
 		just an estimate anyway) than protecting the following code
 		with a latch. */
-		dict_table_n_rows_dec(prebuilt->table);
 
-		srv_stats.n_rows_deleted.add((size_t)trx->id, 1);
+		if (UNIV_LIKELY(!trx->fake_changes)) {
+			dict_table_n_rows_dec(prebuilt->table);
+			srv_stats.n_rows_deleted.add((size_t)trx->id, 1);
+		}
 	} else {
-		srv_stats.n_rows_updated.add((size_t)trx->id, 1);
+		if (UNIV_LIKELY(!trx->fake_changes)) {
+			srv_stats.n_rows_updated.add((size_t)trx->id, 1);
+		}
 	}
 
 	/* We update table statistics only if it is a DELETE or UPDATE
 	that changes indexed columns, UPDATEs that change only non-indexed
 	columns would not affect statistics. */
 	if (node->is_delete || !(node->cmpl_info & UPD_NODE_NO_ORD_CHANGE)) {
-		row_update_statistics_if_needed(prebuilt->table);
+		if (UNIV_LIKELY(!trx->fake_changes))
+			row_update_statistics_if_needed(prebuilt->table,trx);
 	}
 
 	trx->op_info = "";
@@ -1839,7 +1856,7 @@ row_unlock_for_mysql(
 		trx_id_t	rec_trx_id;
 		mtr_t		mtr;
 
-		mtr_start(&mtr);
+		mtr_start_trx(&mtr, trx);
 
 		/* Restore the cursor position and find the record */
 
@@ -1987,7 +2004,7 @@ run_again:
 		goto run_again;
 	}
 
-	if (err != DB_SUCCESS) {
+	if (err != DB_SUCCESS || UNIV_UNLIKELY(trx->fake_changes)) {
 
 		return(err);
 	}
@@ -2004,7 +2021,7 @@ run_again:
 		srv_stats.n_rows_updated.add((size_t)trx->id, 1);
 	}
 
-	row_update_statistics_if_needed(table);
+	row_update_statistics_if_needed(table, trx);
 
 	return(err);
 }
@@ -3120,7 +3137,7 @@ run_again:
 			ibool	was_lock_wait;
 
 			was_lock_wait = row_mysql_handle_errors(
-				&err, trx, thr, NULL);
+				&err, trx, thr, NULL, table);
 
 			if (was_lock_wait) {
 				goto run_again;
@@ -3381,7 +3398,7 @@ row_truncate_table_for_mysql(
 				index = dict_table_get_next_index(index);
 			} while (index);
 
-			mtr_start(&mtr);
+			mtr_start_trx(&mtr, trx);
 			fsp_header_init(space,
 					FIL_IBD_FILE_INITIAL_SIZE, &mtr);
 			mtr_commit(&mtr);
@@ -3410,7 +3427,7 @@ row_truncate_table_for_mysql(
 	sys_index = dict_table_get_first_index(dict_sys->sys_indexes);
 	dict_index_copy_types(tuple, sys_index, 1);
 
-	mtr_start(&mtr);
+	mtr_start_trx(&mtr, trx);
 	btr_pcur_open_on_user_rec(sys_index, tuple, PAGE_CUR_GE,
 				  BTR_MODIFY_LEAF, &pcur, &mtr);
 	for (;;) {
@@ -3457,7 +3474,7 @@ row_truncate_table_for_mysql(
 			a page in this mini-transaction, and the rest of
 			this loop could latch another index page. */
 			mtr_commit(&mtr);
-			mtr_start(&mtr);
+			mtr_start_trx(&mtr, trx);
 			btr_pcur_restore_position(BTR_MODIFY_LEAF,
 						  &pcur, &mtr);
 		}
@@ -4250,7 +4267,7 @@ check_next_foreign:
 	case DB_OUT_OF_FILE_SPACE:
 		err = DB_MUST_GET_MORE_FILE_SPACE;
 
-		row_mysql_handle_errors(&err, trx, NULL, NULL);
+		row_mysql_handle_errors(&err, trx, NULL, NULL, table);
 
 		/* raise error */
 		ut_error;
@@ -4514,17 +4531,12 @@ loop:
 			/* There could be orphan temp tables left from
 			interrupted alter table. Leave them, and handle
 			the rest.*/
+			ut_a(!table->ibd_file_missing);
 			if (table->can_be_evicted) {
 				ib_logf(IB_LOG_LEVEL_WARN,
 					"Orphan table encountered during "
 					"DROP DATABASE. This is possible if "
 					"'%s.frm' was lost.", table->name);
-			}
-
-			if (table->ibd_file_missing) {
-				ib_logf(IB_LOG_LEVEL_WARN,
-					"Missing %s.ibd file for table %s.",
-					table->name, table->name);
 			}
 		}
 
@@ -4845,28 +4857,12 @@ row_rename_table_for_mysql(
 	if (!new_is_tmp) {
 		/* Rename all constraints. */
 		char	new_table_name[MAX_TABLE_NAME_LEN] = "";
-		char	old_table_utf8[MAX_TABLE_NAME_LEN] = "";
 		uint	errors = 0;
-
-		strncpy(old_table_utf8, old_name, MAX_TABLE_NAME_LEN);
-		innobase_convert_to_system_charset(
-			strchr(old_table_utf8, '/') + 1,
-			strchr(old_name, '/') +1,
-			MAX_TABLE_NAME_LEN, &errors);
-
-		if (errors) {
-			/* Table name could not be converted from charset
-			my_charset_filename to UTF-8. This means that the
-			table name is already in UTF-8 (#mysql#50). */
-			strncpy(old_table_utf8, old_name, MAX_TABLE_NAME_LEN);
-		}
 
 		info = pars_info_create();
 
 		pars_info_add_str_literal(info, "new_table_name", new_name);
 		pars_info_add_str_literal(info, "old_table_name", old_name);
-		pars_info_add_str_literal(info, "old_table_name_utf8",
-					  old_table_utf8);
 
 		strncpy(new_table_name, new_name, MAX_TABLE_NAME_LEN);
 		innobase_convert_to_system_charset(
@@ -4903,8 +4899,6 @@ row_rename_table_for_mysql(
 			"new_db_name := SUBSTR(:new_table_name, 0,\n"
 			"                      new_db_name_len);\n"
 			"old_t_name_len := LENGTH(:old_table_name);\n"
-			"gen_constr_prefix := CONCAT(:old_table_name_utf8,\n"
-			"			     '_ibfk_');\n"
 			"WHILE found = 1 LOOP\n"
 			"       SELECT ID INTO foreign_id\n"
 			"        FROM SYS_FOREIGN\n"
@@ -4921,7 +4915,7 @@ row_rename_table_for_mysql(
 			"        id_len := LENGTH(foreign_id);\n"
 			"        IF (INSTR(foreign_id, '/') > 0) THEN\n"
 			"               IF (INSTR(foreign_id,\n"
-			"                         gen_constr_prefix) > 0)\n"
+			"                         '_ibfk_') > 0)\n"
 			"               THEN\n"
                         "                offset := INSTR(foreign_id, '_ibfk_') - 1;\n"
 			"                new_foreign_id :=\n"
@@ -4966,24 +4960,6 @@ row_rename_table_for_mysql(
 			if (err != DB_SUCCESS) {
 				break;
 			}
-		}
-	}
-
-	if (dict_table_has_fts_index(table)
-	    && !dict_tables_have_same_db(old_name, new_name)) {
-		err = fts_rename_aux_tables(table, new_name, trx);
-
-		if (err != DB_SUCCESS && (table->space != 0)) {
-			char*	orig_name = table->name;
-
-			/* If rename fails and table has its own tablespace,
-			we need to call fts_rename_aux_tables again to
-			revert the ibd file rename, which is not under the
-			control of trx. Also notice the parent table name
-			in cache is not changed yet. */
-			table->name = const_cast<char*>(new_name);
-			fts_rename_aux_tables(table, old_name, trx);
-			table->name = orig_name;
 		}
 	}
 
@@ -5084,6 +5060,7 @@ end:
 	}
 
 funct_exit:
+
 	if (table != NULL) {
 		dict_table_close(table, dict_locked, FALSE);
 	}
@@ -5213,7 +5190,6 @@ func_exit:
 				    dtuple_get_nth_field(prev_entry, i))) {
 
 				contains_null = TRUE;
-				break;
 			}
 		}
 

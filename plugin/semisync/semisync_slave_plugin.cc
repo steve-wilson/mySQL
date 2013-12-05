@@ -40,48 +40,7 @@ int repl_semi_reset_slave(Binlog_relay_IO_param *param)
 int repl_semi_slave_request_dump(Binlog_relay_IO_param *param,
 				 uint32 flags)
 {
-  MYSQL *mysql= param->mysql;
-  MYSQL_RES *res= 0;
-  MYSQL_ROW row;
-  const char *query;
-
-  if (!repl_semisync.getSlaveEnabled())
-    return 0;
-
-  /* Check if master server has semi-sync plugin installed */
-  query= "SHOW VARIABLES LIKE 'rpl_semi_sync_master_enabled'";
-  if (mysql_real_query(mysql, query, strlen(query)) ||
-      !(res= mysql_store_result(mysql)))
-  {
-    sql_print_error("Execution failed on master: %s", query);
-    return 1;
-  }
-
-  row= mysql_fetch_row(res);
-  if (!row)
-  {
-    /* Master does not support semi-sync */
-    sql_print_warning("Master server does not support semi-sync, "
-                      "fallback to asynchronous replication");
-    rpl_semi_sync_slave_status= 0;
-    mysql_free_result(res);
-    return 0;
-  }
-  mysql_free_result(res);
-
-  /*
-    Tell master dump thread that we want to do semi-sync
-    replication
-  */
-  query= "SET @rpl_semi_sync_slave= 1";
-  if (mysql_real_query(mysql, query, strlen(query)))
-  {
-    sql_print_error("Set 'rpl_semi_sync_slave=1' on master failed");
-    return 1;
-  }
-  mysql_free_result(mysql_store_result(mysql));
-  rpl_semi_sync_slave_status= 1;
-  return 0;
+  return repl_semisync.slaveRequestDump(param->mysql);
 }
 
 int repl_semi_slave_read_event(Binlog_relay_IO_param *param,
@@ -148,6 +107,16 @@ static void fix_rpl_semi_sync_trace_level(MYSQL_THD thd,
   return;
 }
 
+static void fix_rpl_semi_sync_slave_kill_conn_timeout(MYSQL_THD thd,
+                                                      SYS_VAR *var,
+                                                      void *ptr,
+                                                      const void *val)
+{
+  *(unsigned int*)ptr = *(unsigned int *)val;
+  repl_semisync.setKillConnTimeout(rpl_semi_sync_slave_kill_conn_timeout);
+  return;
+}
+
 /* plugin system variables */
 static MYSQL_SYSVAR_BOOL(enabled, rpl_semi_sync_slave_enabled,
   PLUGIN_VAR_OPCMDARG,
@@ -163,9 +132,20 @@ static MYSQL_SYSVAR_ULONG(trace_level, rpl_semi_sync_slave_trace_level,
   &fix_rpl_semi_sync_trace_level, // update
   32, 0, ~0UL, 1);
 
+static MYSQL_SYSVAR_UINT(
+  kill_conn_timeout, rpl_semi_sync_slave_kill_conn_timeout,
+  PLUGIN_VAR_OPCMDARG,
+  "Timeout for the mysql connection used to kill the slave io_thread's "
+  "connection on master. This timeout comes into play when stop slave "
+  "is executed.",
+  NULL,
+  &fix_rpl_semi_sync_slave_kill_conn_timeout,
+  5, 0, UINT_MAX, 1);
+
 static SYS_VAR* semi_sync_slave_system_vars[]= {
   MYSQL_SYSVAR(enabled),
   MYSQL_SYSVAR(trace_level),
+  MYSQL_SYSVAR(kill_conn_timeout),
   NULL,
 };
 

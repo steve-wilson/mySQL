@@ -87,6 +87,8 @@ class ha_innobase: public handler
 					ROW_SEL_EXACT, ROW_SEL_EXACT_PREFIX,
 					or undefined */
 	uint		num_write_row;	/*!< number of write_row() calls */
+	ha_statistics*	ha_partition_stats; /*!< stats of the partition owner
+					handler (if there is one) */
 
 	uint store_key_val_for_row(uint keynr, char* buff, uint buff_len,
                                    const uchar* record);
@@ -101,6 +103,12 @@ class ha_innobase: public handler
 	dberr_t innobase_get_autoinc(ulonglong* value);
 	void innobase_initialize_autoinc();
 	dict_index_t* innobase_get_index(uint keynr);
+
+	inline void init_trx_table_stats(trx_t* trx, bool write);
+	inline void update_stats_from_trx(trx_t* trx, bool write);
+
+	inline void innobase_srv_conc_enter_innodb(trx_t* trx, bool write);
+	inline void innobase_srv_conc_exit_innodb(trx_t* trx, bool write);
 
 	/* Init values for the class: */
  public:
@@ -128,6 +136,7 @@ class ha_innobase: public handler
 	double scan_time();
 	double read_time(uint index, uint ranges, ha_rows rows);
 	longlong get_memory_buffer_size() const;
+	my_bool is_fake_change_enabled(THD *thd);
 
 	int write_row(uchar * buf);
 	int update_row(const uchar * old_data, uchar * new_data);
@@ -187,6 +196,8 @@ class ha_innobase: public handler
 	int truncate();
 	int delete_table(const char *name);
 	int rename_table(const char* from, const char* to);
+	int defragment_table(const char* name, const char* index_name,
+			     bool async);
 	int check(THD* thd, HA_CHECK_OPT* check_opt);
 	char* update_table_comment(const char* comment);
 	char* get_foreign_key_create_info();
@@ -292,6 +303,7 @@ class ha_innobase: public handler
 	/** @} */
 	bool check_if_incompatible_data(HA_CREATE_INFO *info,
 					uint table_changes);
+	void set_partition_owner_stats(ha_statistics *stats);
 private:
 	/** Builds a 'template' to the prebuilt struct.
 
@@ -378,6 +390,20 @@ LEX_STRING* thd_query_string(MYSQL_THD thd);
 extern "C" {
 
 struct charset_info_st *thd_charset(MYSQL_THD thd);
+
+/**
+  Get the users source host
+  @param thd  user thread
+  @return source host
+*/
+const char* thd_user(MYSQL_THD thd);
+
+/**
+  Get the users MySQL username
+  @param thd  user thread
+  @return MySQL username
+*/
+const char* thd_host(MYSQL_THD thd);
 
 /**
   Check if a user thread is a replication slave thread

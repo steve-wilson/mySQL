@@ -216,6 +216,25 @@ void delegates_destroy()
   delete_dynamic(plugins)
 
 
+int Trans_delegate::before_commit(THD *thd, bool all)
+{
+  DBUG_ENTER("Trans_delegate::before_commit");
+  Trans_param param = { 0, 0, 0, 0 };
+  bool is_real_trans= (all || thd->transaction.all.ha_list == 0);
+
+  if (is_real_trans)
+    param.flags = true;
+
+  thd->get_trans_fixed_pos(&param.log_file, &param.log_pos);
+
+  DBUG_PRINT("enter", ("log_file: %s, log_pos: %llu",
+                       param.log_file, param.log_pos));
+
+  int ret= 0;
+  FOREACH_OBSERVER(ret, before_commit, thd, (&param));
+  DBUG_RETURN(ret);
+}
+
 int Trans_delegate::after_commit(THD *thd, bool all)
 {
   DBUG_ENTER("Trans_delegate::after_commit");
@@ -264,13 +283,15 @@ int Binlog_storage_delegate::after_flush(THD *thd,
 #ifdef HAVE_REPLICATION
 int Binlog_transmit_delegate::transmit_start(THD *thd, ushort flags,
                                              const char *log_file,
-                                             my_off_t log_pos)
+                                             my_off_t log_pos,
+                                             MYSQL_BIN_LOG *mysql_bin_log)
 {
   Binlog_transmit_param param;
   param.flags= flags;
 
   int ret= 0;
-  FOREACH_OBSERVER(ret, transmit_start, thd, (&param, log_file, log_pos));
+  FOREACH_OBSERVER(ret, transmit_start, thd,
+                   (&param, log_file, log_pos, mysql_bin_log));
   return ret;
 }
 

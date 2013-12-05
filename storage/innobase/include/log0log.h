@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2013, Oracle and/or its affiliates. All rights reserved.
+Copyright (c) 1995, 2012, Oracle and/or its affiliates. All rights reserved.
 Copyright (c) 2009, Google Inc.
 
 Portions of this file contain modifications contributed and copyrighted by
@@ -192,6 +192,23 @@ void
 log_io_complete(
 /*============*/
 	log_group_t*	group);	/*!< in: log group */
+
+/**********************************************************
+Describes the caller of log_write_up_to. */
+
+typedef enum {
+	LOG_WRITE_FROM_DIRTY_BUFFER,
+	LOG_WRITE_FROM_BACKGROUND_SYNC,
+	LOG_WRITE_FROM_BACKGROUND_ASYNC,
+	LOG_WRITE_FROM_INTERNAL,
+	LOG_WRITE_FROM_CHECKPOINT_SYNC,
+	LOG_WRITE_FROM_CHECKPOINT_ASYNC,
+	LOG_WRITE_FROM_LOG_ARCHIVE,
+	LOG_WRITE_FROM_COMMIT_SYNC,
+	LOG_WRITE_FROM_COMMIT_ASYNC,
+	LOG_WRITE_FROM_NUMBER
+} log_sync_type;
+
 /******************************************************//**
 This function is called, e.g., when a transaction wants to commit. It checks
 that the log has been written to the log file up to the last log entry written
@@ -205,9 +222,10 @@ log_write_up_to(
 			the log should be written, LSN_MAX if not specified */
 	ulint	wait,	/*!< in: LOG_NO_WAIT, LOG_WAIT_ONE_GROUP,
 			or LOG_WAIT_ALL_GROUPS */
-	ibool	flush_to_disk);
+	ibool	flush_to_disk,
 			/*!< in: TRUE if we want the written log
 			also to be flushed to disk */
+	log_sync_type	caller);/* in: identifies the caller */
 /****************************************************************//**
 Does a syncronous flush of the log buffer to disk. */
 UNIV_INTERN
@@ -521,6 +539,17 @@ ulint
 log_block_convert_lsn_to_no(
 /*========================*/
 	lsn_t	lsn);	/*!< in: lsn of a byte within the block */
+
+#ifdef UNIV_DEBUG
+/******************************************************//**
+Update log_write_padding. */
+UNIV_INLINE
+void
+log_update_padding(
+/*========================*/
+	ulint padding);	/*!< in: padding to be added to total. */
+#endif /*UNIV_DEBUG*/
+
 /******************************************************//**
 Prints info of the log. */
 UNIV_INTERN
@@ -787,14 +816,12 @@ struct log_t{
 	ulint		max_buf_free;	/*!< recommended maximum value of
 					buf_free, after which the buffer is
 					flushed */
- #ifdef UNIV_LOG_DEBUG
 	ulint		old_buf_free;	/*!< value of buf free when log was
 					last time opened; only in the debug
 					version */
 	ib_uint64_t	old_lsn;	/*!< value of lsn when log was
 					last time opened; only in the
 					debug version */
-#endif /* UNIV_LOG_DEBUG */
 	ibool		check_flush_or_checkpoint;
 					/*!< this is set to TRUE when there may
 					be need to flush the log buffer, or
@@ -853,6 +880,13 @@ struct log_t{
 					AND flushed to disk */
 	ulint		n_pending_writes;/*!< number of currently
 					pending flushes or writes */
+	ulint		log_sync_callers[LOG_WRITE_FROM_NUMBER];
+					/* counts calls to log_write_up_to */
+	ulint		log_sync_syncers[LOG_WRITE_FROM_NUMBER];
+					/* counts calls to log_write_up_to when
+					log file is sync'd */
+	ulint		n_syncs;	/* number of fsyncs done for log file */
+	ulint		n_checkpoints;	/* number of calls to log_checkpoint */
 	/* NOTE on the 'flush' in names of the fields below: starting from
 	4.0.14, we separate the write of the log file and the actual fsync()
 	or other method to flush it to disk. The names below shhould really
@@ -882,6 +916,9 @@ struct log_t{
 					previous printout */
 	time_t		last_printout_time;/*!< when log_print was last time
 					called */
+#ifdef UNIV_DEBUG
+	ulint		log_write_padding; /*!< Number of padding blocks */
+#endif /*UNIV_DEBUG*/
 	/* @} */
 
 	/** Fields involved in checkpoints @{ */

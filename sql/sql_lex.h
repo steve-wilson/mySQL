@@ -633,7 +633,6 @@ public:
   bool exec();
   bool explain();
   bool cleanup();
-  bool cleanup_level();
   inline void unclean() { cleaned= 0; }
   void reinit_exec_mechanism();
 
@@ -653,8 +652,6 @@ public:
 
   List<Item> *get_unit_column_types();
   List<Item> *get_field_list();
-private:
-  void invalidate();
 };
 
 typedef class st_select_lex_unit SELECT_LEX_UNIT;
@@ -763,12 +760,6 @@ public:
   /// Array of pointers to top elements of all_fields list
   Ref_ptr_array ref_pointer_array;
 
-  /// Number of derived tables and views
-  uint derived_table_count;
-  /// Number of materialized derived tables and views
-  uint materialized_table_count;
-  /// Number of partitioned tables
-  uint partitioned_table_count;
   /*
     number of items in select_list and HAVING clause used to get number
     bigger then can be number of entries that will be added to all item
@@ -789,11 +780,7 @@ public:
   ulong table_join_options;
   uint in_sum_expr;
   uint select_number; /* number of select (used for EXPLAIN) */
-  /**
-    Nesting level of query block, outer-most query block has level 0,
-    its subqueries have level 1, etc. @see also sql/item_sum.h.
-  */
-  int nest_level;
+  int nest_level;     /* nesting level of select */
   /* Circularly linked list of sum func in nested selects */
   Item_sum *inner_sum_func_list;
   uint with_wild; /* item list contain '*' */
@@ -903,7 +890,6 @@ public:
   {
     return &link_next;
   }
-  void invalidate();
   void mark_as_dependent(st_select_lex *last);
 
   bool set_braces(bool value);
@@ -969,7 +955,6 @@ public:
     SELECT_LEX and all nested SELECT_LEXes and SELECT_LEX_UNITs).
   */
   bool cleanup();
-  bool cleanup_level();
   /*
     Recursively cleanup the join of this select lex and of all nested
     select lexes.
@@ -2269,6 +2254,7 @@ struct LEX: public Query_tables_list
   DYNAMIC_ARRAY plugins;
   plugin_ref plugins_static_buffer[INITIAL_LEX_PLUGIN_LIST_SIZE];
 
+  char* gtid_string; /* For find gtid position */
   const CHARSET_INFO *charset;
   bool text_string_is_7bit;
   /* store original leaf_tables for INSERT SELECT and PS/SP */
@@ -2293,13 +2279,6 @@ struct LEX: public Query_tables_list
 
   List<Key_part_spec> col_list;
   List<Key_part_spec> ref_list;
-  /*
-    A list of strings is maintained to store the SET clause command user strings
-    which are specified in load data operation.  This list will be used
-    during the reconstruction of "load data" statement at the time of writing
-    to binary log.
-   */
-  List<String>        load_set_str_list;
   List<String>	      interval_list;
   List<LEX_USER>      users_list;
   List<LEX_COLUMN>    columns;
@@ -2394,6 +2373,14 @@ struct LEX: public Query_tables_list
     Use schema merging when loading data from CSV file
   */
   schema_update_method schema_merge;
+  /*
+    If true, will provide extra padding in data size when inferring data types
+  */
+  bool relaxed_schema_inference;
+  /*
+    Maximum number of lines to read when determining schema
+  */
+  unsigned int inference_sample_size;
 
   bool drop_if_exists, drop_temporary, local_file, one_shot_set;
   bool autocommit;
@@ -2401,6 +2388,8 @@ struct LEX: public Query_tables_list
 
   enum enum_yes_no_unknown tx_chain, tx_release;
   bool safe_to_cache_query;
+  bool disable_flashcache;
+  bool async_commit;
   bool subqueries, ignore;
   st_parsing_options parsing_options;
   Alter_info alter_info;

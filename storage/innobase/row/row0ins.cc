@@ -63,6 +63,12 @@ check.
 If you make a change in this module make sure that no codepath is
 introduced where a call to log_free_check() is bypassed. */
 
+#ifdef UNIV_DEBUG
+/** Number of optimistic and pessimistic inserts performed on the
+b-tree of the indexes */
+ullint	row_ins_optimistic_insert_calls_in_pessimistic_descent = 0;
+#endif /* UNIV_DEBUG */
+
 /*********************************************************************//**
 Creates an insert node struct.
 @return	own: insert node struct */
@@ -271,6 +277,14 @@ row_ins_sec_index_entry_by_modify(
 		returns. After that point, the TEMP_INDEX_PREFIX
 		would be dropped from the index name in
 		commit_inplace_alter_table(). */
+    /* Another exception here is when sql thread updates the delete
+    marked node and unmarks it before the faker thread got here.
+    This can happen with multi threaded slave and when faker thread
+    tries to update the same secondary index node as that of sql slave
+    worker. */
+    trx_t* trx=thr_get_trx(thr);
+    if (UNIV_UNLIKELY(trx->fake_changes))
+      return(DB_SUCCESS);
 		ut_a(update->n_fields == 0);
 		ut_a(*cursor->index->name == TEMP_INDEX_PREFIX);
 		ut_ad(!dict_index_is_online_ddl(cursor->index));
@@ -1292,7 +1306,7 @@ row_ins_foreign_check_on_constraint(
 
 	row_mysql_freeze_data_dictionary(thr_get_trx(thr));
 
-	mtr_start(mtr);
+	mtr_start_trx(mtr, trx);
 
 	/* Restore pcur position */
 
@@ -1320,7 +1334,7 @@ nonstandard_exit_func:
 	btr_pcur_store_position(pcur, mtr);
 
 	mtr_commit(mtr);
-	mtr_start(mtr);
+	mtr_start_trx(mtr, trx);
 
 	btr_pcur_restore_position(BTR_SEARCH_LEAF, pcur, mtr);
 
@@ -1528,7 +1542,7 @@ run_again:
 		}
 	}
 
-	mtr_start(&mtr);
+	mtr_start_trx(&mtr, trx);
 
 	/* Store old value on n_fields_cmp */
 
@@ -1735,6 +1749,9 @@ do_possible_lock_wait:
 exit_func:
 	if (UNIV_LIKELY_NULL(heap)) {
 		mem_heap_free(heap);
+	}
+	if (UNIV_UNLIKELY(trx->fake_changes)) {
+		err = DB_SUCCESS;
 	}
 	return(err);
 }
@@ -2315,7 +2332,23 @@ row_ins_clust_index_entry_low(
 	ulint		n_uniq,	/*!< in: 0 or index->n_uniq */
 	dtuple_t*	entry,	/*!< in/out: index entry to insert */
 	ulint		n_ext,	/*!< in: number of externally stored columns */
-	que_thr_t*	thr)	/*!< in: query thread */
+	que_thr_t*	thr,	/*!< in: query thread */
+	ulint*	page_no,	/*!< *page_no and *modify_clock are used to decide
+	                    whether to call btr_cur_optimistic_insert() during
+	                    pessimistic descent down the index tree.
+	                    in: If this is optimistic descent, then *page_no
+	                    must be ULINT_UNDEFINED. If it is pessimistic
+	                    descent, *page_no must be the page_no to which an
+	                    optimistic insert was attempted last time
+	                    row_ins_index_entry_low() was called.
+	                    out: If this is the optimistic descent, *page_no is set
+	                    to the page_no to which an optimistic insert was
+	                    attempted. If it is pessimistic descent, this value is
+	                    not changed. */
+	ullint*	modify_clock) /*!< in/out: *modify_clock == ULLINT_UNDEFINED
+	                             during optimistic descent, and the modify_clock
+	                             value for the page that was used for optimistic
+	                             insert during pessimistic descent */
 {
 	btr_cur_t	cursor;
 	ulint*		offsets		= NULL;
@@ -2323,17 +2356,25 @@ row_ins_clust_index_entry_low(
 	big_rec_t*	big_rec		= NULL;
 	mtr_t		mtr;
 	mem_heap_t*	offsets_heap	= NULL;
+	ulint		use_mode;
 
 	ut_ad(dict_index_is_clust(index));
 	ut_ad(!dict_index_is_unique(index)
 	      || n_uniq == dict_index_get_n_unique(index));
 	ut_ad(!n_uniq || n_uniq == dict_index_get_n_unique(index));
 
-	mtr_start(&mtr);
+	mtr_start_trx(&mtr, thr_get_trx(thr));
 
-	if (mode == BTR_MODIFY_LEAF && dict_index_is_online_ddl(index)) {
-		mode = BTR_MODIFY_LEAF | BTR_ALREADY_S_LATCHED;
+	/* Note: built-in online schema changes may not work when
+	fake_changes is TRUE. It should be tested what to do
+	(e.g. acquire lock or not) before using them together*/
+	if (UNIV_UNLIKELY(thr_get_trx(thr)->fake_changes)) {
+		use_mode = (mode & BTR_MODIFY_TREE) ? BTR_SEARCH_TREE : BTR_SEARCH_LEAF;
+	} else if (mode == BTR_MODIFY_LEAF && dict_index_is_online_ddl(index)) {
+		use_mode = mode = BTR_MODIFY_LEAF | BTR_ALREADY_S_LATCHED;
 		mtr_s_lock(dict_index_get_lock(index), &mtr);
+	} else {
+		use_mode = mode;
 	}
 
 	cursor.thr = thr;
@@ -2342,7 +2383,7 @@ row_ins_clust_index_entry_low(
 	the function will return in both low_match and up_match of the
 	cursor sensible values */
 
-	btr_cur_search_to_nth_level(index, 0, entry, PAGE_CUR_LE, mode,
+	btr_cur_search_to_nth_level(index, 0, entry, PAGE_CUR_LE, use_mode,
 				    &cursor, 0, __FILE__, __LINE__, &mtr);
 
 #ifdef UNIV_DEBUG
@@ -2406,7 +2447,8 @@ err_exit:
 
 		rec_t*		rec		= btr_cur_get_rec(&cursor);
 
-		if (big_rec) {
+		if (big_rec && UNIV_LIKELY(!thr_get_trx(thr)->fake_changes)) {
+			/* skip store extern */
 			ut_a(err == DB_SUCCESS);
 			/* Write out the externally stored
 			columns while still x-latching
@@ -2460,6 +2502,8 @@ err_exit:
 			the following assertion failure will
 			effectively "roll back" the operation. */
 			ut_a(err == DB_SUCCESS);
+		}
+		if (big_rec) {
 			dtuple_big_rec_free(big_rec);
 		}
 
@@ -2475,10 +2519,17 @@ err_exit:
 		if (mode != BTR_MODIFY_TREE) {
 			ut_ad((mode & ~BTR_ALREADY_S_LATCHED)
 			      == BTR_MODIFY_LEAF);
+			ut_a(*page_no == ULINT_UNDEFINED);
+			ut_a(*modify_clock == ULLINT_UNDEFINED);
 			err = btr_cur_optimistic_insert(
 				flags, &cursor, &offsets, &offsets_heap,
 				entry, &insert_rec, &big_rec,
 				n_ext, thr, &mtr);
+			if (err != DB_SUCCESS) {
+				*page_no = buf_block_get_page_no(btr_cur_get_block(&cursor));
+				*modify_clock = buf_block_get_modify_clock(
+						btr_cur_get_block(&cursor));
+			}
 		} else {
 			if (buf_LRU_buf_pool_running_out()) {
 
@@ -2486,11 +2537,19 @@ err_exit:
 				goto err_exit;
 			}
 
-			err = btr_cur_optimistic_insert(
-				flags, &cursor,
-				&offsets, &offsets_heap,
-				entry, &insert_rec, &big_rec,
-				n_ext, thr, &mtr);
+			if ((*page_no == ULINT_UNDEFINED && *modify_clock == ULLINT_UNDEFINED)
+				|| (*page_no != buf_block_get_page_no(btr_cur_get_block(&cursor)))
+				|| (*modify_clock != buf_block_get_modify_clock(
+						btr_cur_get_block(&cursor)))) {
+				ut_d(++row_ins_optimistic_insert_calls_in_pessimistic_descent);
+				err = btr_cur_optimistic_insert(
+					flags, &cursor,
+					&offsets, &offsets_heap,
+					entry, &insert_rec, &big_rec,
+					n_ext, thr, &mtr);
+			} else {
+				err = DB_FAIL;
+			}
 
 			if (err == DB_FAIL) {
 				err = btr_cur_pessimistic_insert(
@@ -2504,6 +2563,11 @@ err_exit:
 		if (UNIV_LIKELY_NULL(big_rec)) {
 			mtr_commit(&mtr);
 
+		if (UNIV_UNLIKELY(thr_get_trx(thr)->fake_changes)) {
+			/* skip store extern */
+			dtuple_convert_back_big_rec(index, entry, big_rec);
+			goto func_exit;
+		}
 			/* Online table rebuild could read (and
 			ignore) the incomplete record at this point.
 			If online rebuild is in progress, the
@@ -2539,12 +2603,15 @@ func_exit:
 
 /***************************************************************//**
 Starts a mini-transaction and checks if the index will be dropped.
+Transaction handle (trx) must be passed here because btr_cur_latch_leaves()
+has an assertion that involves mtr->trx->fake_changes.
 @return true if the index is to be dropped */
 static __attribute__((nonnull, warn_unused_result))
 bool
-row_ins_sec_mtr_start_and_check_if_aborted(
+row_ins_sec_mtr_start_trx_and_check_if_aborted(
 /*=======================================*/
 	mtr_t*		mtr,	/*!< out: mini-transaction */
+	trx_t*		trx,	/*!< in: transaction handle */
 	dict_index_t*	index,	/*!< in/out: secondary index */
 	bool		check,	/*!< in: whether to check */
 	ulint		search_mode)
@@ -2552,7 +2619,7 @@ row_ins_sec_mtr_start_and_check_if_aborted(
 {
 	ut_ad(!dict_index_is_clust(index));
 
-	mtr_start(mtr);
+	mtr_start_trx(mtr, trx);
 
 	if (!check) {
 		return(false);
@@ -2602,21 +2669,39 @@ row_ins_sec_index_entry_low(
 	dtuple_t*	entry,	/*!< in/out: index entry to insert */
 	trx_id_t	trx_id,	/*!< in: PAGE_MAX_TRX_ID during
 				row_log_table_apply(), or 0 */
-	que_thr_t*	thr)	/*!< in: query thread */
+	que_thr_t*	thr,	/*!< in: query thread */
+	ulint*	page_no,	/*!< *page_no and *modify_clock are used to decide
+	                    whether to call btr_cur_optimistic_insert() during
+	                    pessimistic descent down the index tree.
+	                    in: If this is optimistic descent, then *page_no
+	                    must be ULINT_UNDEFINED. If it is pessimistic
+	                    descent, *page_no must be the page_no to which an
+	                    optimistic insert was attempted last time
+	                    row_ins_index_entry_low() was called.
+	                    out: If this is the optimistic descent, *page_no is set
+	                    to the page_no to which an optimistic insert was
+	                    attempted. If it is pessimistic descent, this value is
+	                    not changed. */
+	ullint*	modify_clock) /*!< in/out: *modify_clock == ULLINT_UNDEFINED
+	                             during optimistic descent, and the modify_clock
+	                             value for the page that was used for optimistic
+	                             insert during pessimistic descent */
 {
 	btr_cur_t	cursor;
-	ulint		search_mode	= mode | BTR_INSERT;
+	ulint		search_mode = 0;
+	ulint		use_mode = 0;
 	dberr_t		err		= DB_SUCCESS;
 	ulint		n_unique;
 	mtr_t		mtr;
 	ulint*		offsets	= NULL;
+	trx_t*		trx=thr_get_trx(thr);
 
 	ut_ad(!dict_index_is_clust(index));
 	ut_ad(mode == BTR_MODIFY_LEAF || mode == BTR_MODIFY_TREE);
 
 	cursor.thr = thr;
 	ut_ad(thr_get_trx(thr)->id);
-	mtr_start(&mtr);
+	mtr_start_trx(&mtr, trx);
 
 	/* Ensure that we acquire index->lock when inserting into an
 	index with index->online_status == ONLINE_INDEX_COMPLETE, but
@@ -2644,10 +2729,19 @@ row_ins_sec_index_entry_low(
 	the function will return in both low_match and up_match of the
 	cursor sensible values */
 
-	if (!thr_get_trx(thr)->check_unique_secondary) {
-		search_mode |= BTR_IGNORE_SEC_UNIQUE;
+	if (UNIV_UNLIKELY(trx->fake_changes)) {
+		search_mode |= (mode & BTR_MODIFY_TREE) ? BTR_SEARCH_TREE : BTR_SEARCH_LEAF;
+	} else if (!(trx->check_unique_secondary)) {
+		search_mode |= mode | BTR_INSERT | BTR_IGNORE_SEC_UNIQUE;
+	} else {
+		search_mode |= mode | BTR_INSERT;
 	}
 
+	if (UNIV_UNLIKELY(trx->fake_changes)) {
+		use_mode = (mode & BTR_MODIFY_TREE) ? BTR_SEARCH_TREE : BTR_SEARCH_LEAF;
+	} else {
+		use_mode = search_mode & ~(BTR_INSERT | BTR_IGNORE_SEC_UNIQUE);
+	}
 	btr_cur_search_to_nth_level(index, 0, entry, PAGE_CUR_LE,
 				    search_mode,
 				    &cursor, 0, __FILE__, __LINE__, &mtr);
@@ -2677,8 +2771,8 @@ row_ins_sec_index_entry_low(
 
 		DEBUG_SYNC_C("row_ins_sec_index_unique");
 
-		if (row_ins_sec_mtr_start_and_check_if_aborted(
-			    &mtr, index, check, search_mode)) {
+		if (row_ins_sec_mtr_start_trx_and_check_if_aborted(
+			    &mtr, trx, index, check, search_mode)) {
 			goto func_exit;
 		}
 
@@ -2712,8 +2806,8 @@ row_ins_sec_index_entry_low(
 			return(err);
 		}
 
-		if (row_ins_sec_mtr_start_and_check_if_aborted(
-			    &mtr, index, check, search_mode)) {
+		if (row_ins_sec_mtr_start_trx_and_check_if_aborted(
+			    &mtr, trx, index, check, search_mode)) {
 			goto func_exit;
 		}
 
@@ -2725,7 +2819,7 @@ row_ins_sec_index_entry_low(
 
 		btr_cur_search_to_nth_level(
 			index, 0, entry, PAGE_CUR_LE,
-			search_mode & ~(BTR_INSERT | BTR_IGNORE_SEC_UNIQUE),
+			use_mode,
 			&cursor, 0, __FILE__, __LINE__, &mtr);
 	}
 
@@ -2745,10 +2839,17 @@ row_ins_sec_index_entry_low(
 		big_rec_t*	big_rec;
 
 		if (mode == BTR_MODIFY_LEAF) {
+			ut_a(*page_no == ULINT_UNDEFINED);
+			ut_a(*modify_clock == ULLINT_UNDEFINED);
 			err = btr_cur_optimistic_insert(
 				flags, &cursor, &offsets, &offsets_heap,
 				entry, &insert_rec,
 				&big_rec, 0, thr, &mtr);
+			if (err != DB_SUCCESS) {
+				*page_no = buf_block_get_page_no(btr_cur_get_block(&cursor));
+				*modify_clock = buf_block_get_modify_clock(
+						btr_cur_get_block(&cursor));
+			}
 		} else {
 			ut_ad(mode == BTR_MODIFY_TREE);
 			if (buf_LRU_buf_pool_running_out()) {
@@ -2757,11 +2858,19 @@ row_ins_sec_index_entry_low(
 				goto func_exit;
 			}
 
-			err = btr_cur_optimistic_insert(
-				flags, &cursor,
-				&offsets, &offsets_heap,
-				entry, &insert_rec,
-				&big_rec, 0, thr, &mtr);
+			if ((*page_no == ULINT_UNDEFINED && *modify_clock == ULLINT_UNDEFINED)
+				|| (*page_no != buf_block_get_page_no(btr_cur_get_block(&cursor)))
+				|| (*modify_clock != buf_block_get_modify_clock(
+						btr_cur_get_block(&cursor)))) {
+				ut_d(++row_ins_optimistic_insert_calls_in_pessimistic_descent);
+				err = btr_cur_optimistic_insert(
+					flags, &cursor,
+					&offsets, &offsets_heap,
+					entry, &insert_rec,
+					&big_rec, 0, thr, &mtr);
+			} else {
+				err = DB_FAIL;
+			}
 			if (err == DB_FAIL) {
 				err = btr_cur_pessimistic_insert(
 					flags, &cursor,
@@ -2782,6 +2891,10 @@ row_ins_sec_index_entry_low(
 	}
 
 func_exit:
+	if (err == DB_SUCCESS && (index->type & DICT_CLUSTERED) == 0) {
+		thr_get_trx(thr)->table_io_perf.index_inserts++;
+	}
+
 	mtr_commit(&mtr);
 	return(err);
 }
@@ -2855,6 +2968,8 @@ row_ins_clust_index_entry(
 {
 	dberr_t	err;
 	ulint	n_uniq;
+	ulint	page_no = ULINT_UNDEFINED;
+	ullint	modify_clock = ULLINT_UNDEFINED;
 
 	if (UT_LIST_GET_FIRST(index->table->foreign_list)) {
 		err = row_ins_check_foreign_constraints(
@@ -2872,7 +2987,8 @@ row_ins_clust_index_entry(
 	log_free_check();
 
 	err = row_ins_clust_index_entry_low(
-		0, BTR_MODIFY_LEAF, index, n_uniq, entry, n_ext, thr);
+		0, BTR_MODIFY_LEAF, index, n_uniq, entry, n_ext, thr,
+		&page_no, &modify_clock);
 
 #ifdef UNIV_DEBUG
 	/* Work around Bug#14626800 ASSERTION FAILURE IN DEBUG_SYNC().
@@ -2893,7 +3009,8 @@ row_ins_clust_index_entry(
 	log_free_check();
 
 	return(row_ins_clust_index_entry_low(
-		       0, BTR_MODIFY_TREE, index, n_uniq, entry, n_ext, thr));
+		0, BTR_MODIFY_TREE, index, n_uniq, entry, n_ext, thr,
+		&page_no, &modify_clock));
 }
 
 /***************************************************************//**
@@ -2913,6 +3030,8 @@ row_ins_sec_index_entry(
 	dberr_t		err;
 	mem_heap_t*	offsets_heap;
 	mem_heap_t*	heap;
+	ulint	page_no = ULINT_UNDEFINED;
+	ullint	modify_clock = ULLINT_UNDEFINED;
 
 	if (UT_LIST_GET_FIRST(index->table->foreign_list)) {
 		err = row_ins_check_foreign_constraints(index->table, index,
@@ -2933,7 +3052,8 @@ row_ins_sec_index_entry(
 	log_free_check();
 
 	err = row_ins_sec_index_entry_low(
-		0, BTR_MODIFY_LEAF, index, offsets_heap, heap, entry, 0, thr);
+		0, BTR_MODIFY_LEAF, index, offsets_heap, heap,
+		entry, 0, thr, &page_no, &modify_clock);
 	if (err == DB_FAIL) {
 		mem_heap_empty(heap);
 
@@ -2943,7 +3063,8 @@ row_ins_sec_index_entry(
 
 		err = row_ins_sec_index_entry_low(
 			0, BTR_MODIFY_TREE, index,
-			offsets_heap, heap, entry, 0, thr);
+			offsets_heap, heap, entry, 0, thr,
+			&page_no, &modify_clock);
 	}
 
 	mem_heap_free(heap);

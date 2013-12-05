@@ -27,19 +27,20 @@ Created Aug 11, 2011 Vasil Dimov
 #include "fil0fil.h" /* FIL_* */
 #include "ut0crc32.h" /* ut_crc32() */
 #include "ut0rnd.h" /* ut_fold_binary() */
+#include "buf0checksum.h"
 
 #ifndef UNIV_INNOCHECKSUM
 
 #include "srv0srv.h" /* SRV_CHECKSUM_* */
 #include "buf0types.h"
 
+#endif /* !UNIV_INNOCHECKSUM */
+
 /** the macro MYSQL_SYSVAR_ENUM() requires "long unsigned int" and if we
 use srv_checksum_algorithm_t here then we get a compiler error:
 ha_innodb.cc:12251: error: cannot convert 'srv_checksum_algorithm_t*' to
   'long unsigned int*' in initialization */
-UNIV_INTERN ulong	srv_checksum_algorithm = SRV_CHECKSUM_ALGORITHM_INNODB;
-
-#endif /* !UNIV_INNOCHECKSUM */
+UNIV_INTERN ulong	srv_checksum_algorithm = SRV_CHECKSUM_ALGORITHM_FACEBOOK;
 
 /********************************************************************//**
 Calculates a page CRC32 which is stored to the page when it is written
@@ -67,6 +68,26 @@ buf_calc_page_crc32(
 		^ ut_crc32(page + FIL_PAGE_DATA,
 			   UNIV_PAGE_SIZE - FIL_PAGE_DATA
 			   - FIL_PAGE_END_LSN_OLD_CHKSUM);
+
+	return(checksum);
+}
+
+UNIV_INTERN
+dual_crc
+buf_calc_page_crc32fb(
+/*================*/
+	const byte*	page)	/*!< in: buffer page */
+{
+	dual_crc	checksum;
+	ib_uint32_t	c1;
+	ib_uint32_t	c2;
+	c1 = ut_crc32(page + FIL_PAGE_OFFSET,
+		FIL_PAGE_FILE_FLUSH_LSN - FIL_PAGE_OFFSET);
+	c2 = ut_crc32(page + FIL_PAGE_DATA,
+		UNIV_PAGE_SIZE - FIL_PAGE_DATA - FIL_PAGE_END_LSN_OLD_CHKSUM);
+
+	checksum.crc32c = c1 ^ c2;
+	checksum.crc32cfb = c1 + c2;
 
 	return(checksum);
 }
@@ -137,6 +158,8 @@ buf_checksum_algorithm_name(
 	srv_checksum_algorithm_t	algo)	/*!< in: algorithm */
 {
 	switch (algo) {
+	case SRV_CHECKSUM_ALGORITHM_FACEBOOK:
+		return("facebook");
 	case SRV_CHECKSUM_ALGORITHM_CRC32:
 	case SRV_CHECKSUM_ALGORITHM_STRICT_CRC32:
 		return("crc32");

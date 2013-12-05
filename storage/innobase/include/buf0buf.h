@@ -96,8 +96,7 @@ extern buf_block_t*	back_block1;	/*!< first block, for --apply-log */
 extern buf_block_t*	back_block2;	/*!< second block, for page reorganize */
 #endif /* !UNIV_HOTBACKUP */
 
-/** Magic value to use instead of checksums when they are disabled */
-#define BUF_NO_CHECKSUM_MAGIC 0xDEADBEEFUL
+extern ulint buf_malloc_cache_len;
 
 /** @brief States of a control block
 @see buf_page_t
@@ -136,6 +135,10 @@ struct buf_pool_info_t{
 	ulint	old_lru_len;		/*!< buf_pool->LRU_old_len */
 	ulint	free_list_len;		/*!< Length of buf_pool->free list */
 	ulint	flush_list_len;		/*!< Length of buf_pool->flush_list */
+	unsigned old_lru_retention;	/*!< Time elapsed from access to page
+					from lru tail */
+	unsigned young_lru_retention;	/*!< Time elapsed from access to last
+					page in young lru */
 	ulint	n_pend_unzip;		/*!< buf_pool->n_pend_unzip, pages
 					pending decompress */
 	ulint	n_pend_reads;		/*!< buf_pool->n_pend_reads, pages
@@ -146,6 +149,13 @@ struct buf_pool_info_t{
 					flushes issued by various user
 					threads */
 	ulint	n_pending_flush_list;	/*!< Pages pending flush in FLUSH
+					LIST */
+	ulint	n_flushed_lru;		/*!< Pages total flushed in LRU */
+	ulint	n_flushed_single_page;	/*!< Total pages
+					flushed as part of single page
+					flushes issued by various user
+					threads */
+	ulint	n_flushed_list;		/*!< Total pages flushed in FLUSH
 					LIST */
 	ulint	n_pages_made_young;	/*!< number of pages made young */
 	ulint	n_pages_not_made_young;	/*!< number of pages not made young */
@@ -287,8 +297,10 @@ Allocates a buf_page_t descriptor. This function must succeed. In case
 of failure we assert in this function. */
 UNIV_INLINE
 buf_page_t*
-buf_page_alloc_descriptor(void)
+buf_page_alloc_descriptor(
 /*===========================*/
+	buf_pool_t*	buf_pool,
+	ibool		buf_pool_mutex_owned)
 	__attribute__((malloc));
 /********************************************************************//**
 Free a buf_page_t descriptor. */
@@ -296,7 +308,9 @@ UNIV_INLINE
 void
 buf_page_free_descriptor(
 /*=====================*/
-	buf_page_t*	bpage)	/*!< in: bpage descriptor to free. */
+	buf_page_t*	bpage,	/*!< in: bpage descriptor to free. */
+	buf_pool_t*	buf_pool,
+	ibool		buf_pool_mutex_owned)
 	__attribute__((nonnull));
 
 /********************************************************************//**
@@ -768,7 +782,7 @@ Returns the ratio in percents of modified pages in the buffer pool /
 database pages in the buffer pool.
 @return	modified page percentage ratio */
 UNIV_INTERN
-ulint
+double
 buf_get_modified_ratio_pct(void);
 /*============================*/
 /**********************************************************************//**
@@ -1130,7 +1144,6 @@ buf_pointer_is_block_field(
 #define buf_pool_is_block_lock(l)			\
 	buf_pointer_is_block_field((const void*)(l))
 
-#if defined UNIV_DEBUG || defined UNIV_ZIP_DEBUG
 /*********************************************************************//**
 Gets the compressed page descriptor corresponding to an uncompressed page
 if applicable.
@@ -1140,7 +1153,7 @@ const page_zip_des_t*
 buf_frame_get_page_zip(
 /*===================*/
 	const byte*	ptr);	/*!< in: pointer to the page */
-#endif /* UNIV_DEBUG || UNIV_ZIP_DEBUG */
+
 /********************************************************************//**
 Function which inits a page for read to the buffer buf_pool. If the page is
 (1) already in buf_pool, or
@@ -1368,8 +1381,11 @@ void
 buf_get_total_list_len(
 /*===================*/
 	ulint*		LRU_len,	/*!< out: length of all LRU lists */
+	ulint*		old_LRU_len,	/*!< out: length of all old LRU lists */
 	ulint*		free_len,	/*!< out: length of all free lists */
-	ulint*		flush_list_len);/*!< out: length of all flush lists */
+	ulint*		flush_list_len,	/*!< out: length of all flush lists */
+	ulint*		unzip_LRU_len);	/*!< out: length of all unzip LRU lists */
+
 /********************************************************************//**
 Get total list size in bytes from all buffer pools. */
 UNIV_INTERN
@@ -1552,6 +1568,9 @@ struct buf_page_t{
 
 	UT_LIST_NODE_T(buf_page_t) LRU;
 					/*!< node of the LRU list */
+	UT_LIST_NODE_T(buf_page_t) malloc_cache;
+					/*!< node of the linked list to cache
+					memory allocations */
 #ifdef UNIV_DEBUG
 	ibool		in_LRU_list;	/*!< TRUE if the page is in
 					the LRU list; used in
@@ -1664,6 +1683,15 @@ struct buf_block_t{
 					indexed in the hash index */
 	/* @} */
 
+	/** @name Working set size fields */
+	/* @{ */
+	unsigned char db_stats_index;
+					/*!< Index of the database to which this block belongs.
+					The index is obtained from the hashtable dbname_hash
+					in the buffer pool, and is used to obtain the relevant
+					hyperloglog structure to update */
+	/* @} */
+
 	/** @name Hash search fields
 	These 5 fields may only be modified when we have
 	an x-latch on btr_search_latch AND
@@ -1755,7 +1783,54 @@ struct buf_pool_stat_t{
 				is NOT protected by the buffer
 				pool mutex */
 	ulint	n_pages_read;	/*!< number read operations */
+	ulint n_pages_read_index;/*!< number read operations
+				      of FIL_PAGE_INDEX pages*/
+	ulint n_pages_read_undo_log;/*!< number read operations
+					 FIL_PAGE_UNDO_LOG pages*/
+	ulint n_pages_read_inode;/*!< number read operations
+				      FIL_PAGE_INODE pages*/
+	ulint n_pages_read_ibuf_free_list;/*!< number read operations
+					       FIL_PAGE_IBUF_FREE_LIST pages*/
+	ulint n_pages_read_allocated;/*!< number read operations
+					  FIL_PAGE_TYPE_ALLOCATED pages*/
+	ulint n_pages_read_ibuf_bitmap;/*!< number read operations
+					    FIL_PAGE_IBUF_BITMAP pages*/
+	ulint n_pages_read_sys;/*!< number read operations
+				    FIL_PAGE_TYPE_SYS pages*/
+	ulint n_pages_read_trx_sys;/*!< number read operations
+					FIL_PAGE_TYPE_TRX_SYS pages*/
+	ulint n_pages_read_fsp_hdr;/*!< number read operations
+					FIL_PAGE_TYPE_FSP_HDR pages*/
+	ulint n_pages_read_xdes;/*!< number read operations
+				     FIL_PAGE_TYPE_XDES pages*/
+	ulint n_pages_read_blob;/*!< number read operations FIL_PAGE_TYPE_BLOB,
+				     FIL_PAGE_TYPE_ZBLOB and
+				     FIL_PAGE_TYPE_ZBLOB2 pages*/
 	ulint	n_pages_written;/*!< number write operations */
+	ulint n_pages_written_index;/*!< number write operations of
+					 FIL_PAGE_INDEX pages*/
+	ulint n_pages_written_undo_log;/*!< number write operations
+					    FIL_PAGE_UNDO_LOG pages*/
+	ulint n_pages_written_inode;/*!< number write operations
+					 FIL_PAGE_INODE pages*/
+	ulint n_pages_written_ibuf_free_list;/*!< number write operations
+						  FIL_PAGE_IBUF_FREE_LIST
+						  pages*/
+	ulint n_pages_written_allocated; /*!< number write operations
+					      FIL_PAGE_TYPE_ALLOCATED pages*/
+	ulint n_pages_written_ibuf_bitmap; /*!< number write operations
+						FIL_PAGE_IBUF_BITMAP pages*/
+	ulint n_pages_written_sys; /*!< number write operations
+					FIL_PAGE_TYPE_SYS pages*/
+	ulint n_pages_written_trx_sys; /*!< number write operations
+					    FIL_PAGE_TYPE_TRX_SYS pages*/
+	ulint n_pages_written_fsp_hdr; /*!< number write operations
+					    FIL_PAGE_TYPE_FSP_HDR pages*/
+	ulint n_pages_written_xdes; /*!< number write operations
+					 FIL_PAGE_TYPE_XDES pages*/
+	ulint n_pages_written_blob;/*!< number write operations
+					FIL_PAGE_TYPE_BLOB, FIL_PAGE_TYPE_ZBLOB
+					and FIL_PAGE_TYPE_ZBLOB2 pages*/
 	ulint	n_pages_created;/*!< number of pages created
 				in the pool with no read */
 	ulint	n_ra_pages_read_rnd;/*!< number of pages read in
@@ -1773,6 +1848,16 @@ struct buf_pool_stat_t{
 				buf_page_peek_if_too_old() */
 	ulint	LRU_bytes;	/*!< LRU size in bytes */
 	ulint	flush_list_bytes;/*!< flush_list size in bytes */
+	/* The following three variables are only used in the
+	total buf pool stats. For stats of individual buf pool, see
+	buf_pool->n_flushed[TYPE] instead. */
+	ulint	n_flushed_lru;		/*!< Pages total flushed in LRU */
+	ulint	n_flushed_single_page;	/*!< Total pages
+					flushed as part of single page
+					flushes issued by various user
+					threads */
+	ulint	n_flushed_list;		/*!< Total pages flushed in FLUSH
+					LIST */
 };
 
 /** Statistics of buddy blocks of a given size. */
@@ -1865,11 +1950,19 @@ struct buf_pool_t{
 	UT_LIST_BASE_NODE_T(buf_page_t) flush_list;
 					/*!< base node of the modified block
 					list */
+	UT_LIST_BASE_NODE_T(buf_page_t) buf_malloc_cache;
+					/*!< base of buf_malloc_cache list */
+	ulint		n_buf_malloc_cache;
+					/*number of entries in
+					buf_malloc_cache allowed.*/
 	ibool		init_flush[BUF_FLUSH_N_TYPES];
 					/*!< this is TRUE when a flush of the
 					given type is being initialized */
 	ulint		n_flush[BUF_FLUSH_N_TYPES];
 					/*!< this is the number of pending
+					writes in the given flush type */
+	ulint		n_flushed[BUF_FLUSH_N_TYPES];
+					/*!< this is the number of total
 					writes in the given flush type */
 	os_event_t	no_flush[BUF_FLUSH_N_TYPES];
 					/*!< this is in the set state

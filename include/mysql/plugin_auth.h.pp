@@ -117,6 +117,7 @@ enum enum_mysql_show_type
   SHOW_LONGLONG,
   SHOW_CHAR, SHOW_CHAR_PTR,
   SHOW_ARRAY, SHOW_FUNC, SHOW_DOUBLE,
+  SHOW_TIMER,
   SHOW_always_last
 };
 struct st_mysql_show_var {
@@ -221,6 +222,7 @@ struct st_mysql_value
   int (*val_int)(struct st_mysql_value *, long long *intbuf);
   int (*is_unsigned)(struct st_mysql_value *);
 };
+void thd_reset_diagnostics(void* thd);
 int thd_in_lock_tables(const void* thd);
 int thd_tablespace_op(const void* thd);
 long long thd_test_options(const void* thd, long long test_options);
@@ -238,7 +240,8 @@ int mysql_tmpfile(const char *prefix);
 int thd_killed(const void* thd);
 void thd_binlog_pos(const void* thd,
                     const char **file_var,
-                    unsigned long long *pos_var);
+                    unsigned long long *pos_var,
+                    const char **gtid_var);
 unsigned long thd_get_thread_id(const void* thd);
 void thd_get_xid(const void* thd, MYSQL_XID *xid);
 void mysql_query_cache_invalidate4(void* thd,
@@ -247,6 +250,12 @@ void mysql_query_cache_invalidate4(void* thd,
 void *thd_get_ha_data(const void* thd, const struct handlerton *hton);
 void thd_set_ha_data(void* thd, const struct handlerton *hton,
                      const void *ha_data);
+char mysql_bin_log_is_open(void);
+void mysql_bin_log_lock_commits(void);
+void mysql_bin_log_unlock_commits(char* binlog_file,
+                                  unsigned long long* binlog_pos,
+                                  char** gtid_executed,
+                                  int* gtid_executed_length);
 #include <mysql/plugin_auth_common.h>
 typedef struct st_plugin_vio_info
 {
@@ -254,6 +263,8 @@ typedef struct st_plugin_vio_info
          MYSQL_VIO_PIPE, MYSQL_VIO_MEMORY } protocol;
   int socket;
 } MYSQL_PLUGIN_VIO_INFO;
+struct st_mysql;
+typedef struct st_mysql MYSQL;
 typedef struct st_plugin_vio
 {
   int (*read_packet)(struct st_plugin_vio *vio,
@@ -262,6 +273,14 @@ typedef struct st_plugin_vio
                       const unsigned char *packet,
                       int packet_len);
   void (*info)(struct st_plugin_vio *vio, struct st_plugin_vio_info *info);
+  MYSQL* mysql;
+  int (*read_packet_nonblocking)(struct st_plugin_vio *vio,
+                                 unsigned char **buf,
+                                 int *result);
+  int (*write_packet_nonblocking)(struct st_plugin_vio *vio,
+                                  const unsigned char *packet,
+                                  int packet_len,
+                                  int *result);
 } MYSQL_PLUGIN_VIO;
 typedef struct st_mysql_server_auth_info
 {
@@ -269,7 +288,7 @@ typedef struct st_mysql_server_auth_info
   unsigned int user_name_length;
   const char *auth_string;
   unsigned long auth_string_length;
-  char authenticated_as[48 +1];
+  char authenticated_as[96 +1];
   char external_user[512];
   int password_used;
   const char *host_or_ip;

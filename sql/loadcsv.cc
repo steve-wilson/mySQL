@@ -76,7 +76,7 @@ vector<column> LoadCSV::match(string schema1, string schema2) {
   return tm.generateNewSchema(s1, s2);
 }
 
-string LoadCSV::calculateSchema() {
+string LoadCSV::calculateSchema(bool relaxed, unsigned int sample_size) {
   vector<string> header = getHeader();
   vector<typeAndMD> data = calculateColumnTypes();
 

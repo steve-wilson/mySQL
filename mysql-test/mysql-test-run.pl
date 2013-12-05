@@ -163,7 +163,7 @@ our $opt_vs_config = $ENV{'MTR_VS_CONFIG'};
 
 # If you add a new suite, please check TEST_DIRS in Makefile.am.
 #
-my $DEFAULT_SUITES= "main,sys_vars,binlog,federated,rpl,innodb,innodb_fts,perfschema,funcs_1,opt_trace,parts,auth_sec";
+my $DEFAULT_SUITES= "main,sys_vars,binlog,federated,rpl,innodb,innodb_fts,perfschema,funcs_1,opt_trace,parts,auth_sec,innodb_stress";
 my $opt_suites;
 
 our $opt_verbose= 0;  # Verbose output, enable with --verbose
@@ -184,6 +184,7 @@ our @opt_mysqld_envs;
 my $opt_stress;
 
 my $opt_compress;
+my $opt_async_client;
 my $opt_ssl;
 my $opt_skip_ssl;
 my @opt_skip_test_list;
@@ -1044,6 +1045,7 @@ sub command_line_setup {
              'skip-ssl'                 => \$opt_skip_ssl,
              'compress'                 => \$opt_compress,
              'vs-config=s'              => \$opt_vs_config,
+             'async-client'             => \$opt_async_client,
 
 	     # Max number of parallel threads to use
 	     'parallel=s'               => \$opt_parallel,
@@ -2059,17 +2061,7 @@ sub executable_setup () {
   }
   else
   {
-    if ( defined $ENV{'MYSQL_TEST'} )
-    {
-      $exe_mysqltest=$ENV{'MYSQL_TEST'};
-      print "===========================================================\n";
-      print "WARNING:The mysqltest binary is fetched from $exe_mysqltest\n";
-      print "===========================================================\n";
-    }
-    else
-    {
-      $exe_mysqltest= mtr_exe_exists("$path_client_bindir/mysqltest");
-    }
+    $exe_mysqltest= mtr_exe_exists("$path_client_bindir/mysqltest");
   }
 
 }
@@ -2225,7 +2217,7 @@ sub read_plugin_defs($)
     mtr_error("Lines in $defs_file must have 3 or 4 items") unless $plug_var;
 
     # If running debug server, plugins will be in 'debug' subdirectory
-    $plug_file= "debug/$plug_file" if $running_debug && !$source_dist;
+    $plug_file= "debug/$plug_file" if $running_debug;
 
     my ($plugin)= find_plugin($plug_file, $plug_loc);
 
@@ -2451,7 +2443,11 @@ sub environment_setup {
   $ENV{'MYSQL'}=                    client_arguments("mysql");
   $ENV{'MYSQL_SLAVE'}=              client_arguments("mysql", ".2");
   $ENV{'MYSQL_UPGRADE'}=            client_arguments("mysql_upgrade");
-  $ENV{'MYSQLADMIN'}=               native_path($exe_mysqladmin);
+  $ENV{'MYSQLADMIN'}=               client_arguments("mysqladmin");
+  # Sometimes we invoke mysqladmin with parameters incompatible with
+  # what client_arguments generates, similar to EXE_MYSQL below.  We
+  # need the raw path to the executable for those tests.
+  $ENV{'MYSQLADMIN_EXEC'}=          native_path($exe_mysqladmin);
   $ENV{'MYSQL_CLIENT_TEST'}=        mysql_client_test_arguments();
   $ENV{'EXE_MYSQL'}=                $exe_mysql;
   $ENV{'MYSQL_PLUGIN'}=             $exe_mysql_plugin;
@@ -2493,6 +2489,42 @@ sub environment_setup {
 		   "$path_client_bindir/my_print_defaults",
 		   "$basedir/extra/my_print_defaults");
   $ENV{'MYSQL_MY_PRINT_DEFAULTS'}= native_path($exe_my_print_defaults);
+
+  # ----------------------------------------------------
+  # innochecksum
+  # ----------------------------------------------------
+  my $exe_innochecksum=
+    mtr_exe_exists(vs_config_dirs('extra', 'innochecksum'),
+		   "$path_client_bindir/innochecksum",
+		   "$basedir/extra/innochecksum");
+  $ENV{'MYSQL_INNOCHECKSUM'}= native_path($exe_innochecksum);
+
+  # ----------------------------------------------------
+  # xtrabackup
+  # ----------------------------------------------------
+  my $exe_xtrabackup=
+    mtr_exe_maybe_exists(vs_config_dirs('xtrabackup/src', 'xtrabackup_innodb56'),
+           "$path_client_bindir/xtrabackup_innodb56",
+           "$basedir/xtrabackup/src/xtrabackup_innodb56");
+  $ENV{'MYSQL_XTRABACKUP'}= native_path($exe_xtrabackup);
+
+  # ----------------------------------------------------
+  # xbstream
+  # ----------------------------------------------------
+  my $exe_xbstream=
+    mtr_exe_maybe_exists(vs_config_dirs('xtrabackup/src', 'xbstream'),
+           "$path_client_bindir/xbstream",
+           "$basedir/xtrabackup/src/xbstream");
+  $ENV{'MYSQL_XBSTREAM'}= native_path($exe_xbstream);
+
+  # ----------------------------------------------------
+  # innobackupex
+  # ----------------------------------------------------
+  my $exe_innobackupex=
+    mtr_exe_maybe_exists(vs_config_dirs('xtrabackup', 'innobackupex'),
+           "$path_client_bindir/innobackupex",
+           "$basedir/xtrabackup/innobackupex");
+  $ENV{'MYSQL_INNOBACKUPEX'}= native_path($exe_innobackupex);
 
   # ----------------------------------------------------
   # Setup env so childs can execute myisampack and myisamchk
@@ -3526,12 +3558,6 @@ sub mysql_install_db {
 
   mtr_add_arg($args, "--lc-messages-dir=%s", $install_lang);
   mtr_add_arg($args, "--character-sets-dir=%s", $install_chsdir);
-
-  # On some old linux kernels, aio on tmpfs is not supported
-  # Remove this if/when Bug #58421 fixes this in the server
-  if ($^O eq "linux" && $opt_mem) {
-    mtr_add_arg($args, "--loose-skip-innodb-use-native-aio");
-  }
 
   # InnoDB arguments that affect file location and sizes may
   # need to be given to the bootstrap process as well as the
@@ -5839,6 +5865,9 @@ sub start_mysqltest ($) {
     $exe=  "strace";
     mtr_add_arg($args, "-o");
     mtr_add_arg($args, "%s/log/mysqltest.strace", $opt_vardir);
+    mtr_add_arg($args, "-s");
+    mtr_add_arg($args, "128");
+    mtr_add_arg($args, "-ttr");
     mtr_add_arg($args, "$exe_mysqltest");
   }
 
@@ -5899,6 +5928,11 @@ sub start_mysqltest ($) {
   if ( $opt_compress )
   {
     mtr_add_arg($args, "--compress");
+  }
+
+  if ( $opt_async_client )
+  {
+    mtr_add_arg($args, "--async-client");
   }
 
   if ( $opt_sleep )
@@ -5972,6 +6006,11 @@ sub start_mysqltest ($) {
     if ( defined $tinfo->{'record_file'} ) {
       mtr_add_arg($args, "--result-file=%s", $tinfo->{record_file});
     }
+  }
+
+  if ($tinfo->{'mysqltest_opt'})
+  {
+    push @$args, @{$tinfo->{'mysqltest_opt'}};
   }
 
   if ( $opt_client_gdb )
@@ -6421,6 +6460,7 @@ Options to control what engine/variation to run
   skip-ssl              Dont start server with support for ssl connections
   vs-config             Visual Studio configuration used to create executables
                         (default: MTR_VS_CONFIG environment variable)
+  async-client          Use async-client with select() to run the test case
 
   defaults-file=<config template> Use fixed config template for all
                         tests

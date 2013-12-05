@@ -1,4 +1,4 @@
-/* Copyright (c) 2006, 2013 Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2011, 2012 Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -52,6 +52,26 @@ const char* info_rli_fields[]=
   "id"
 };
 
+extern "C"
+uchar *get_gtid_info_key(const uchar *record, size_t *length,
+                         my_bool not_used __attribute__((unused)))
+{
+
+  Gtid_info *entry = (Gtid_info *) record;
+  *length = strlen(entry->get_database_name());
+
+  return ((uchar*) entry->get_database_name());
+}
+
+extern "C"
+void free_gtid_info_entry(Gtid_info *entry)
+{
+  if (entry)
+  {
+    delete entry;
+  }
+}
+
 Relay_log_info::Relay_log_info(bool is_slave_recovery
 #ifdef HAVE_PSI_INTERFACE
                                ,PSI_mutex_key *param_key_info_run_lock,
@@ -76,20 +96,27 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery
    replicate_same_server_id(::replicate_same_server_id),
    cur_log_fd(-1), relay_log(&sync_relaylog_period),
    is_relay_log_recovery(is_slave_recovery),
+   part_event(false),
+   ends_group(false),
    save_temporary_tables(0),
    cur_log_old_open_count(0), group_relay_log_pos(0), event_relay_log_pos(0),
    group_master_log_pos(0),
    gtid_set(global_sid_map, global_sid_lock),
    log_space_total(0), ignore_log_space_limit(0),
    sql_force_rotate_relay(false),
-   last_master_timestamp(0), slave_skip_counter(0),
+   last_master_timestamp(0),
+   events_since_last_sample(0),
+   slave_skip_counter(0),
    abort_pos_wait(0), until_condition(UNTIL_NONE),
    until_log_pos(0),
    until_sql_gtids(global_sid_map),
+   until_sql_gtids_seen(global_sid_map),
    until_sql_gtids_first_event(true),
    retried_trans(0),
    tables_to_lock(0), tables_to_lock_count(0),
    rows_query_ev(NULL), last_event_start_time(0), deferred_events(NULL),
+   curr_group_seen_gtid(false),
+   curr_group_seen_begin(false),
    slave_parallel_workers(0),
    recovery_parallel_workers(0), checkpoint_seqno(0),
    checkpoint_group(opt_mts_checkpoint_group), 
@@ -98,7 +125,8 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery
    mts_group_status(MTS_NOT_IN_GROUP), reported_unsafe_warning(false),
    rli_description_event(NULL),
    sql_delay(0), sql_delay_end(0), m_flags(0), row_stmt_start_timestamp(0),
-   long_find_row_note_printed(false), error_on_rli_init_info(false)
+   long_find_row_note_printed(false), error_on_rli_init_info(false),
+   rollback_ev(NULL)
 {
   DBUG_ENTER("Relay_log_info::Relay_log_info");
 
@@ -106,12 +134,15 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery
   relay_log.set_psi_keys(key_RELAYLOG_LOCK_index,
                          key_RELAYLOG_LOCK_commit,
                          key_RELAYLOG_LOCK_commit_queue,
+                         key_RELAYLOG_LOCK_semisync,
+                         key_RELAYLOG_LOCK_semisync_queue,
                          key_RELAYLOG_LOCK_done,
                          key_RELAYLOG_LOCK_flush_queue,
                          key_RELAYLOG_LOCK_log,
                          key_RELAYLOG_LOCK_sync,
                          key_RELAYLOG_LOCK_sync_queue,
                          key_RELAYLOG_LOCK_xids,
+                         key_RELAYLOG_LOCK_binlog_end_pos,
                          key_RELAYLOG_COND_done,
                          key_RELAYLOG_update_cond,
                          key_RELAYLOG_prep_xids_cond,
@@ -120,11 +151,12 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery
 #endif
 
   group_relay_log_name[0]= event_relay_log_name[0]=
-    group_master_log_name[0]= 0;
+    group_master_log_name[0] = last_gtid[0] = 0;
   until_log_name[0]= ign_master_log_name_end[0]= 0;
   set_timespec_nsec(last_clock, 0);
   memset(&cache_buf, 0, sizeof(cache_buf));
   cached_charset_invalidate();
+  memset(peak_lag_last, 0, sizeof(peak_lag_last));
 
   mysql_mutex_init(key_relay_log_info_log_space_lock,
                    &log_space_lock, MY_MUTEX_INIT_FAST);
@@ -136,6 +168,8 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery
 
   relay_log.init_pthread_objects();
   do_server_version_split(::server_version, slave_version_split);
+  last_retrieved_gtid.clear();
+  init_gtid_infos();
 
   DBUG_VOID_RETURN;
 }
@@ -163,6 +197,28 @@ void Relay_log_info::deinit_workers()
   delete_dynamic(&workers);
 }
 
+void Relay_log_info::init_gtid_infos()
+{
+  my_init_dynamic_array(&gtid_infos, sizeof(Gtid_info *), 1, 1);
+  gtid_info_hash_inited =
+    (my_hash_init(&map_db_to_gtid_info, &my_charset_bin,
+                  0, 0, 0, (my_hash_get_key) get_gtid_info_key,
+                  (my_hash_free_key) free_gtid_info_entry, 0) == 0);
+  mysql_rwlock_init(0, &gtid_info_hash_lock);
+  init_alloc_root(&gtid_info_mem_root, NAME_LEN,
+                  (MAX_DBS_IN_EVENT_MTS / 2) * NAME_LEN);
+}
+
+void Relay_log_info::deinit_gtid_infos()
+{
+  delete_dynamic(&gtid_infos);
+  if (gtid_info_hash_inited)
+    my_hash_free(&map_db_to_gtid_info);
+  mysql_rwlock_destroy(&gtid_info_hash_lock);
+  gtid_info_hash_inited = false;
+  free_root(&gtid_info_mem_root, MYF(0));
+}
+
 Relay_log_info::~Relay_log_info()
 {
   DBUG_ENTER("Relay_log_info::~Relay_log_info");
@@ -176,6 +232,7 @@ Relay_log_info::~Relay_log_info()
   my_atomic_rwlock_destroy(&slave_open_temp_tables_lock);
   relay_log.cleanup();
   set_rli_description_event(NULL);
+  deinit_gtid_infos();
 
   DBUG_VOID_RETURN;
 }
@@ -240,13 +297,6 @@ void Relay_log_info::reset_notified_checkpoint(ulong shift, time_t new_ts,
     */
     w->checkpoint_notified= FALSE;
     w->bitmap_shifted= w->bitmap_shifted + shift;
-    /*
-      Zero shift indicates the caller rotates the master binlog.
-      The new name will be passed to W through the group descriptor
-      during the first post-rotation time scheduling.
-    */
-    if (shift == 0)
-      w->master_log_change_notified= false;
 
     DBUG_PRINT("mts", ("reset_notified_checkpoint shift --> %lu, "
                "worker->bitmap_shifted --> %lu, worker --> %u.",
@@ -368,8 +418,74 @@ void Relay_log_info::clear_until_condition()
   until_log_name[0]= 0;
   until_log_pos= 0;
   until_sql_gtids.clear();
+  until_sql_gtids_seen.clear();
   until_sql_gtids_first_event= true;
   DBUG_VOID_RETURN;
+}
+
+/**
+ Update the peak lag with the latest event.
+
+ It accepts one parameter, which is the time this event happened on master.
+ This function will only sample one event every 'peak_lag_sample_rate' events.
+
+ peak_lag_time is not actually used here.  This function always records
+ the most recent event time for each discrete lag value, in seconds.
+ peak_lag_time is only used when calculating the peak, on request.
+
+ This function uses the local timestamp to compute the interval between two
+ local replay events.
+
+ @when_master the time stamp when did this event happen on master
+ */
+void Relay_log_info::update_peak_lag(time_t when_master)
+{
+  DBUG_ENTER("update_peak_lag");
+  if (events_since_last_sample < opt_peak_lag_sample_rate)
+  {
+    ++events_since_last_sample;
+    DBUG_VOID_RETURN;
+  }
+  //sample this event
+  time_t when_slave = time(0);
+  if (((time_t) -1) == when_slave)
+    return; // time() error
+
+  time_t when_base = when_master + mi->clock_diff_with_master;
+  long lag = 0;
+  if (when_slave > when_base)
+  {
+    lag = long(when_slave) - long(when_base);
+    if (lag > PEAK_LAG_MAX_SECS)
+    {
+      lag = PEAK_LAG_MAX_SECS;
+    }
+
+    peak_lag_last[lag - 1] = when_slave;
+  }
+  events_since_last_sample = 0;
+  DBUG_VOID_RETURN;
+}
+
+/**
+ Return the peak lag over the last peak_lag_time seconds.
+
+ peak_lag_last stores the most recent time for each non-zero lag value.
+
+ @param now the current timestamp.
+ */
+time_t Relay_log_info::peak_lag(time_t now)
+{
+  long ret = 0;
+  time_t start = now - opt_peak_lag_time;
+  for (long cur = PEAK_LAG_MAX_SECS - 1; ret == 0 && cur >= 0; --cur)
+  {
+    if(peak_lag_last[cur] >= start)
+    {
+      ret = cur + 1;
+    }
+  }
+  return time_t(ret);
 }
 
 /**
@@ -512,7 +628,8 @@ int Relay_log_info::init_relay_log_pos(const char* log,
       */
       if (!(ev= Log_event::read_log_event(cur_log, 0,
                                           rli_description_event,
-                                          opt_slave_sql_verify_checksum)))
+                                          opt_slave_sql_verify_checksum,
+                                          NULL)))
       {
         DBUG_PRINT("info",("could not read event, cur_log->error=%d",
                            cur_log->error));
@@ -1008,8 +1125,25 @@ int Relay_log_info::inc_group_relay_log_pos(ulonglong log_pos,
 
     See sql/rpl_rli.h for further information on this behavior.
   */
-  error= flush_info(FALSE);
+  if ((error = flush_info(FALSE)))
+    goto err;
 
+  /**
+     Gtid_infos need to be flushed only if
+
+     1) The current transaction is ended because of a COMMIT or ROLLBACK
+        or XID which can be known by the variable ends_group or
+
+     2) If the current event causes an implicit commit which can be
+        determined if the current group didn't see a BEGIN and the current
+        event contains partition info meaning that it is a CREATE DATABASE or
+        DROP DATABASE kind of event.
+  */
+  if ((ends_group || (!curr_group_seen_begin && part_event))
+      && (error = flush_gtid_infos(false)))
+    goto err;
+
+err:
   mysql_cond_broadcast(&data_cond);
   if (need_data_lock)
     mysql_mutex_unlock(&data_lock);
@@ -1030,7 +1164,8 @@ void Relay_log_info::close_temporary_tables()
       slave restarts, but it is a better intention to not delete them.
     */
     DBUG_PRINT("info", ("table: 0x%lx", (long) table));
-    close_temporary(table, 1, 0);
+    // TODO: Check if we need to have a THD here for slow-query-log
+    close_temporary(NULL, table, 1, 0);
   }
   save_temporary_tables= 0;
   slave_open_temp_tables= 0;
@@ -1259,25 +1394,6 @@ bool Relay_log_info::is_until_satisfied(THD *thd, Log_event *ev)
   }
 
   case UNTIL_SQL_BEFORE_GTIDS:
-    // We only need to check once if logged_gtids set contains any of the until_sql_gtids.
-    if (until_sql_gtids_first_event)
-    {
-      until_sql_gtids_first_event= false;
-      global_sid_lock->wrlock();
-      /* Check if until GTIDs were already applied. */
-      const Gtid_set* logged_gtids= gtid_state->get_logged_gtids();
-      if (until_sql_gtids.is_intersection_nonempty(logged_gtids))
-      {
-        char *buffer= until_sql_gtids.to_string();
-        global_sid_lock->unlock();
-        sql_print_information("Slave SQL thread stopped because "
-                              "UNTIL SQL_BEFORE_GTIDS %s is already "
-                              "applied", buffer);
-        my_free(buffer);
-        DBUG_RETURN(true);
-      }
-      global_sid_lock->unlock();
-    }
     if (ev != NULL && ev->get_type_code() == GTID_LOG_EVENT)
     {
       Gtid_log_event *gev= (Gtid_log_event *)ev;
@@ -1292,15 +1408,41 @@ bool Relay_log_info::is_until_satisfied(THD *thd, Log_event *ev)
         DBUG_RETURN(true);
       }
       global_sid_lock->unlock();
+      // We only need to check once if logged_gtids set contains any of the until_sql_gtids.
+      if (until_sql_gtids_first_event)
+      {
+        until_sql_gtids_first_event= false;
+        global_sid_lock->wrlock();
+        /* Check if until GTIDs were already applied. */
+        const Gtid_set* logged_gtids= gtid_state->get_logged_gtids();
+        if (until_sql_gtids.is_intersection_nonempty(logged_gtids))
+        {
+          char *buffer= until_sql_gtids.to_string();
+          global_sid_lock->unlock();
+          sql_print_information("Slave SQL thread stopped because "
+                                "UNTIL SQL_BEFORE_GTIDS %s is already "
+                                "applied", buffer);
+          my_free(buffer);
+          DBUG_RETURN(true);
+        }
+        global_sid_lock->unlock();
+      }
     }
     DBUG_RETURN(false);
     break;
 
   case UNTIL_SQL_AFTER_GTIDS:
+    if (ev != NULL && ev->get_type_code() == GTID_LOG_EVENT)
     {
       global_sid_lock->wrlock();
-      const Gtid_set* logged_gtids= gtid_state->get_logged_gtids();
-      if (until_sql_gtids.is_subset(logged_gtids))
+      // We only need to compute until_sql_gtids_seen once.
+      if (until_sql_gtids_first_event)
+      {
+        until_sql_gtids_first_event= false;
+        const Gtid_set* logged_gtids= gtid_state->get_logged_gtids();
+        until_sql_gtids.intersection(logged_gtids, &until_sql_gtids_seen);
+      }
+      if (until_sql_gtids.is_subset(const_cast<Gtid_set *>(&until_sql_gtids_seen)))
       {
         char *buffer= until_sql_gtids.to_string();
         global_sid_lock->unlock();
@@ -1309,9 +1451,12 @@ bool Relay_log_info::is_until_satisfied(THD *thd, Log_event *ev)
         my_free(buffer);
         DBUG_RETURN(true);
       }
+      Gtid_log_event *gev= (Gtid_log_event *)ev;
+      until_sql_gtids_seen.ensure_sidno(gev->get_sidno(false));
+      until_sql_gtids_seen._add_gtid(gev->get_sidno(false), gev->get_gno());
       global_sid_lock->unlock();
-      DBUG_RETURN(false);
     }
+    DBUG_RETURN(false);
     break;
 
   case UNTIL_SQL_AFTER_MTS_GAPS:
@@ -1550,8 +1695,6 @@ void Relay_log_info::slave_close_thread_tables(THD *thd)
 
   close_thread_tables(thd);
   /*
-    - If transaction rollback was requested due to deadlock
-    perform it and release metadata locks.
     - If inside a multi-statement transaction,
     defer the release of metadata locks until the current
     transaction is either committed or rolled back. This prevents
@@ -1561,12 +1704,7 @@ void Relay_log_info::slave_close_thread_tables(THD *thd)
     - If in autocommit mode, or outside a transactional context,
     automatically release metadata locks of the current statement.
   */
-  if (thd->transaction_rollback_request)
-  {
-    trans_rollback_implicit(thd);
-    thd->mdl_context.release_transactional_locks();
-  }
-  else if (! thd->in_multi_stmt_transaction_mode())
+  if (! thd->in_multi_stmt_transaction_mode())
     thd->mdl_context.release_transactional_locks();
   else
     thd->mdl_context.release_statement_locks();
@@ -1666,7 +1804,8 @@ int Relay_log_info::rli_init_info()
 
     if (hot_log)
       mysql_mutex_unlock(log_lock);
-    DBUG_RETURN(recovery_parallel_workers ? mts_recovery_groups(this) : 0);
+    DBUG_RETURN((gtid_mode == 0 && recovery_parallel_workers) ?
+                mts_recovery_groups(this) : 0);
   }
 
   cur_log_fd = -1;
@@ -1760,8 +1899,17 @@ a file name for --relay-log-index option.", opt_relaylog_index_name);
     gtid_set.dbug_print("set of GTIDs in relay log before initialization");
     global_sid_lock->unlock();
 #endif
+    /*
+      Below init_gtid_sets() function will parse the available relay logs and
+      set I/O retrieved gtid event in gtid_state object. We dont need to find
+      last_retrieved_gtid_event if relay_log_recovery=1 (retrieved set will
+      be cleared off in that case).
+    */
+    Gtid *last_retrieved_gtid = is_relay_log_recovery ?
+                                NULL : get_last_retrieved_gtid();
     if (!current_thd &&
         relay_log.init_gtid_sets(&gtid_set, NULL,
+                                 last_retrieved_gtid,
                                  opt_slave_sql_verify_checksum,
                                  true/*true=need lock*/))
     {
@@ -1924,6 +2072,7 @@ void Relay_log_info::end_info()
   */
   close_temporary_tables();
 
+  my_hash_reset(&map_db_to_gtid_info);
   DBUG_VOID_RETURN;
 }
 
@@ -2013,6 +2162,9 @@ int Relay_log_info::flush_info(const bool force)
     dinamically set.
   */
   handler->set_sync_period(sync_relayloginfo_period);
+
+  if (!handler->need_write(force))
+    DBUG_RETURN(0);
 
   if (write_info(handler))
     goto err;
@@ -2146,16 +2298,32 @@ bool Relay_log_info::write_info(Rpl_info_handler *to)
   */
   //DBUG_ASSERT(!belongs_to_client());
 
-  if (to->prepare_info_for_write() ||
-      to->set_info((int) LINES_IN_RELAY_LOG_INFO_WITH_ID) ||
-      to->set_info(group_relay_log_name) ||
-      to->set_info((ulong) group_relay_log_pos) ||
-      to->set_info(group_master_log_name) ||
-      to->set_info((ulong) group_master_log_pos) ||
-      to->set_info((int) sql_delay) ||
-      to->set_info(recovery_parallel_workers) ||
-      to->set_info((int) internal_id))
+  if (to->prepare_info_for_write())
     DBUG_RETURN(TRUE);
+
+  if (strcmp(to->get_rpl_info_type_str(), "FILE"))
+  {
+    if (to->set_info((int) LINES_IN_RELAY_LOG_INFO_WITH_ID) ||
+        to->set_info(group_relay_log_name) ||
+        to->set_info((ulong) group_relay_log_pos) ||
+        to->set_info(group_master_log_name) ||
+        to->set_info((ulong) group_master_log_pos) ||
+        to->set_info((int) sql_delay) ||
+        to->set_info(recovery_parallel_workers) ||
+        to->set_info((int) internal_id))
+      DBUG_RETURN(TRUE);
+  }
+  else
+  {
+    if (to->set_info(LINES_IN_RELAY_LOG_INFO_WITH_ID,
+                     "%d\n%s\n%lu\n%s\n%lu\n%d\n%lu\n%d\n",
+                     (int) LINES_IN_RELAY_LOG_INFO_WITH_ID,
+                     group_relay_log_name, (ulong) group_relay_log_pos,
+                     group_master_log_name, (ulong) group_master_log_pos,
+                     (int) sql_delay, recovery_parallel_workers,
+                     (int) internal_id))
+      DBUG_RETURN(TRUE);
+  }
 
   DBUG_RETURN(FALSE);
 }
@@ -2343,4 +2511,37 @@ void Relay_log_info::adapt_to_master_version(Format_description_log_event *fdle)
       s_features[i].upgrade(thd);
     }
   }
+}
+
+/**
+   Flushes gtid info state after executing the current event.
+   @param[in] force Forces the synchronization.
+
+   @return false Success
+           true  Failure
+*/
+int Relay_log_info::flush_gtid_infos(bool force)
+{
+  DBUG_ENTER("Relay_log_info::flush_gtid_infos");
+  bool error = false;
+  if (gtid_mode > 0 && last_gtid[0] != 0)
+  {
+    for (uint i = 0; i < gtid_infos.elements; i++)
+    {
+      Gtid_info *gtid_info = *dynamic_element(&gtid_infos, i, Gtid_info**);
+      DBUG_ASSERT(gtid_info);
+#ifndef DBUG_OFF
+      DBUG_ASSERT(!gtid_info->skip_event(last_gtid));
+#endif
+      gtid_info->set_last_gtid(last_gtid);
+      if ((error = gtid_info->flush_info(force)))
+        break;
+    }
+  }
+  /* Reset last_gtid to make sure we don't skip the next transaction
+     which doesn't have GTID.
+  */
+  last_gtid[0] = 0;
+  reset_dynamic(&gtid_infos);
+  DBUG_RETURN(error);
 }

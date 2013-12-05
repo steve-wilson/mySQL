@@ -27,7 +27,7 @@ class LoadCSV {
   }
 
   vector<typeAndMD> calculateColumnTypes();
-  string calculateSchema();
+  string calculateSchema(bool relaxed, unsigned int sample_size);
   vector<column> match(string schema1, string schema2);
 };
 
