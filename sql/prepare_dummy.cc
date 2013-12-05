@@ -9,6 +9,9 @@
 static const string column_delimiter = "___";
 static const string modified_delimiter = "xxx";
 
+static const int MIN_DUMMY_COLS = 6;
+static const float DUMMY_COL_FRACTION = .25;
+
 #define DUMMY_STRING "DUMMY"
 #define MODIFIED_STRING "MODIFY"
 #define INTEGER_STRING "INTEGER"
@@ -30,9 +33,9 @@ struct dummyCol
 };
 
 // Used for initial create of table for adding dummy cols
-string addDummyColsString(string newSchema, int numInts, int numDecimals, int numTexts, float addColFraction, int numDummyColsMin)
+string addDummyColsString(string newSchema, int numInts, int numDecimals, int numVarchars, float addColFraction, int numDummyColsMin)
 {
-	int totalCols = numInts + numDecimals + numTexts;
+	int totalCols = numInts + numDecimals + numVarchars;
 	int addColsUsingFraction = addColFraction * totalCols;		// Rounds off fractional part
 	float intFraction = (float) numInts / totalCols;
 	float decimalFraction = (float) numDecimals / totalCols;
@@ -45,7 +48,7 @@ string addDummyColsString(string newSchema, int numInts, int numDecimals, int nu
 	
 	fractionPerColumn = (float) 1 / numColsToAdd;
 
-	// Find correct number of each column to add. Add remainder of new cols as text.
+	// Find correct number of each column to add. Add remainder of new cols as varchars.
 	int intColsToAdd = (int)(intFraction / fractionPerColumn);
 	int decimalColsToAdd = (int)(decimalFraction / fractionPerColumn);
 
@@ -83,19 +86,48 @@ string addDummyColsString(string newSchema, int numInts, int numDecimals, int nu
 	return newSchema;
 }
 
-// Alter statement for adding dummy cols to exisiting table
-string alterDummyColsStatement(map<string, vector<dummyCol> > &typeToDummyCol, set<int> &alreadyUsed, int numInts, int numDecimals, int numTexts, float addColFraction, int numDummyColsMin)
+void correctlyProportionDummyCols(string &alterDummyString, map<string, vector<dummyCol> > &typeToDummyCol, int &numColsToAdd, string colToAdd, 
+								  int &numColsToModify1, string colToModify1, int &numColsToModify2, string colToModify2)
 {
-	int totalCols = numInts + numDecimals + numTexts;
+	while(numColsToAdd > 0 && (numColsToModify1 < 0 || numColsToModify2 < 0))
+	{
+		alterDummyString += ", MODIFY ";
+		
+		if(numColsToModify1 < 0)
+		{
+			dummyCol dc = typeToDummyCol[colToModify1].back();
+			typeToDummyCol[colToModify1].pop_back();
+			++numColsToModify1;
+
+			alterDummyString += dc.colName; 	
+		}
+		else 
+		{
+			dummyCol dc = typeToDummyCol[colToModify2].back();
+            typeToDummyCol[colToModify2].pop_back();
+			++numColsToModify2;			
+
+			alterDummyString += dc.colName;
+		}
+		
+		alterDummyString += " " + colToAdd;
+		--numColsToAdd;	
+	}
+}
+
+// Alter statement for adding dummy cols to exisiting table
+string alterDummyColsStatement(map<string, vector<dummyCol> > &typeToDummyCol, set<int> &alreadyUsed, int numInts, int numDecimals, int numVarchars, float addColFraction, int numDummyColsMin)
+{
+	int totalCols = numInts + numDecimals + numVarchars;
 	int addColsUsingFraction = addColFraction * totalCols;		// Rounds off fractional part
 	float intFraction = (float) numInts / totalCols;
 	float decimalFraction = (float) numDecimals / totalCols;
 	float fractionPerColumn;
 	int intDummyColsExisting = (int)typeToDummyCol[INTEGER_STRING].size();
 	int decimalDummyColsExisting = (int)typeToDummyCol[DECIMAL_STRING].size();
-	int textDummyColsExisting = (int)typeToDummyCol[VARCHAR_STRING].size();
+	int varcharDummyColsExisting = (int)typeToDummyCol[VARCHAR_STRING].size();
 	int numColsToAdd = addColsUsingFraction;
-	int totalDummyColsExisting = intDummyColsExisting + decimalDummyColsExisting + textDummyColsExisting;
+	int totalDummyColsExisting = intDummyColsExisting + decimalDummyColsExisting + varcharDummyColsExisting;
 	string alterDummyString = "";
 	
 	// Set numColsToAdd to max of numDummyColsMin and addColsUsingFraction
@@ -104,12 +136,15 @@ string alterDummyColsStatement(map<string, vector<dummyCol> > &typeToDummyCol, s
 	
 	fractionPerColumn = (float) 1 / numColsToAdd;
 
-	// Find correct number of each column to add. Add remainder of new cols as text.
+	// Find correct number of each column to add. Add remainder of new cols as varchars.
 	int intColsToAdd = (int)(intFraction / fractionPerColumn);
 	int decimalColsToAdd = (int)(decimalFraction / fractionPerColumn);
+	int varcharColsToAdd = numColsToAdd - intColsToAdd - decimalColsToAdd;
 
 	intColsToAdd -= intDummyColsExisting;
 	decimalColsToAdd -= decimalDummyColsExisting;
+	varcharColsToAdd -= varcharDummyColsExisting;
+
 	numColsToAdd -= totalDummyColsExisting;
 
 	int dummyIndex = 0;
@@ -137,11 +172,25 @@ string alterDummyColsStatement(map<string, vector<dummyCol> > &typeToDummyCol, s
 		}
 		else
 		{
+			--varcharColsToAdd;
 			alterDummyString += VARCHAR_STRING;			
 		}
 
 		os.str("");	
 	}
+	
+	// Need to make dummy col proportions correct that takes into account newly added cols
+	// Adds more int cols from a type that has too many if necessary
+	correctlyProportionDummyCols(alterDummyString, typeToDummyCol, intColsToAdd, INTEGER_STRING, 
+								 decimalColsToAdd, DECIMAL_STRING, varcharColsToAdd, VARCHAR_STRING);	
+
+	// Adds more decimal cols from a type that has too many if necessary	
+	correctlyProportionDummyCols(alterDummyString, typeToDummyCol, varcharColsToAdd, VARCHAR_STRING, 
+                                 decimalColsToAdd, DECIMAL_STRING, intColsToAdd, INTEGER_STRING);
+
+	// Adds more varchar cols from a type that has too many if necessary
+	correctlyProportionDummyCols(alterDummyString, typeToDummyCol, decimalColsToAdd, DECIMAL_STRING, 
+                                 intColsToAdd, INTEGER_STRING, varcharColsToAdd, VARCHAR_STRING);
 
 	return alterDummyString;
 }
@@ -153,7 +202,7 @@ void createTableAndView(string db, string dummy_table_name, string table_name, s
 	string viewCols = "";
 	int numInts = 0;
 	int numDecimals = 0;
-	int numTexts = 0;
+	int numVarchars = 0;
 
 	// Create view with actual cols
 	vector<column>::iterator it;
@@ -167,13 +216,13 @@ void createTableAndView(string db, string dummy_table_name, string table_name, s
 		else if(decimalTypes.find(it->typeMD.type) != decimalTypes.end())
 			++numDecimals;
 		else
-			++numTexts; 
+			++numVarchars; 
 		
 		viewCols += it->newName;			
 	}		
 
 	// Create table with dummy cols
-	createStatement += addDummyColsString(newSchema, numInts, numDecimals, numTexts, .25, 10);
+	createStatement += addDummyColsString(newSchema, numInts, numDecimals, numVarchars, DUMMY_COL_FRACTION, MIN_DUMMY_COLS);
 	executeQuery(c, createStatement);
 
 	viewStatement += viewCols + " FROM " + db + "." + dummy_table_name;
@@ -210,8 +259,8 @@ string getCastString(typeAndMD type)
        
 static void stringToUpper(string &s)
 {
-        for(unsigned int i = 0; i < s.length(); ++i)
-                s[i] = toupper(s[i]);
+ 	for(unsigned int i = 0; i < s.length(); ++i)
+     	s[i] = toupper(s[i]);
 }
 
 string findDummyColType(string type)
@@ -289,7 +338,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 				if(typeToUnusedDummyCols.find(typeToAdd) == typeToUnusedDummyCols.end())
 				{
 					vector<dummyCol> dcv;
-					typeToUnusedDummyCols.insert(make_pair<string, vector<dummyCol> >(typeToAdd, dcv));
+					typeToUnusedDummyCols.insert(make_pair(typeToAdd, dcv));
 				}
 
 				typeToUnusedDummyCols[typeToAdd].push_back(dc);
@@ -307,7 +356,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 				if(colNameToModifiedIndexes.find(colName) == colNameToModifiedIndexes.end())
 				{
 					set<int> modifiedIndexes;
-					colNameToModifiedIndexes.insert(make_pair<string, set<int> >(colName, modifiedIndexes));
+					colNameToModifiedIndexes.insert(make_pair(colName, modifiedIndexes));
 				}
 
 				colNameToModifiedIndexes[colName].insert(modifiedIndex);
@@ -325,10 +374,10 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 		vector<column>::iterator it;
 		int numInts = 0;
 		int numDecimals = 0;
-		int numTexts = 0;
-		unsigned int numNewInts = 0;
-		unsigned int numNewDecimals = 0;
-		unsigned int numNewTexts = 0;
+		int numVarchars = 0;
+		int numNewInts = 0;
+		int numNewDecimals = 0;
+		int numNewVarchars = 0;
 		string finalViewCols = "";
 	
 		// Find added and modifed cols and store in vectors. Also compute counts of existing cols for computing dummyCols to add next
@@ -358,10 +407,10 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 			}
 			else
 			{
-             	++numTexts;
+             	++numVarchars;
 				
 				if(it->addedFromExisting || it->changedFromExisting)
-					++numNewTexts;
+					++numNewVarchars;
 			}
 
 			if(it->addedFromExisting)
@@ -385,7 +434,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 		// Need to add columns so add the exact type instead of storing in dummy cols
 		if(numNewInts > typeToUnusedDummyCols[INTEGER_STRING].size() ||
 		   numNewDecimals > typeToUnusedDummyCols[DECIMAL_STRING].size() ||
-		   numNewTexts > typeToUnusedDummyCols[VARCHAR_STRING].size())
+		   numNewVarchars > typeToUnusedDummyCols[VARCHAR_STRING].size())
 		{
 			// Handle added columns
 			if(fieldsAdded.size() > 0 || fieldsModified.size() > 0)
@@ -420,6 +469,8 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 					viewCols += (string)row->get_column(0)->str;
 				}
 
+				alterDummyColString = alterDummyColsStatement(typeToUnusedDummyCols, alreadyUsedDummyIndexes, numInts, numDecimals, numVarchars, DUMMY_COL_FRACTION, MIN_DUMMY_COLS); 
+					
 				// Create table like old underyling table
 				string dummy_table_copy_name = dummy_table_name + "copy";
 				string createTableString = "CREATE TABLE " + db + "." + dummy_table_copy_name + " LIKE " + db + "." + dummy_table_name;
@@ -469,13 +520,13 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 						
 						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + type;
 						
-						// Need to cast if type is text and type of what we are storing is not text				
+						// Need to cast if type is varchar and type of what we are storing is not varchar				
 						if(type == VARCHAR_STRING && it->typeMD.type != VARCHAR_STRING)
 						{
 							string castString = getCastString(it->typeMD);
 							
 							string viewCol = "CAST(" + it->newName + " AS " + castString + ") AS " + it->newName;
-							colNameToViewColString.insert(make_pair<string, string>(it->newName, viewCol));	
+							colNameToViewColString.insert(make_pair(it->newName, viewCol));	
 						}
 					}
 				}
@@ -508,15 +559,18 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + type;
 						
 						os.str("");
-
-						// Need to cast if type is text and type of what we are storing is not text				
+					
+						// Need this if we want to cast the coalesced column	
+						/*
+						// Need to cast if type is varchar and type of what we are storing is not varchar				
 						if(type == VARCHAR_STRING && it->typeMD.type != VARCHAR_STRING)
 						{
 							string castString = getCastString(it->typeMD);
 							
 							string viewCol = "CAST(" + it->newName + " AS " + castString + ") AS " + it->newName;
-							colNameToViewColString.insert(make_pair<string, string>(it->newName, viewCol));	
+							colNameToViewColString.insert(make_pair(it->newName, viewCol));	
 						}
+						*/
 					}
 				}
 
@@ -534,10 +588,10 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 						os.str("");
 					}
 
-					viewCol += ")";
+					viewCol += ") AS " + cit->first;
 					colNameToViewColString.insert(make_pair<string, string>(cit->first, viewCol)); 
 				}
-
+		
 				for(it = matches.begin(); it != matches.end(); ++it)
 				{
 					string colName = it->existingName;
@@ -565,6 +619,37 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 					executeQuery(c, "CREATE VIEW " + db + "." + table_name + " AS SELECT " + viewCols + " FROM " + db + "." + dummy_table_name);
 				}
 			}
-		}
+		}	
 	}
+
+	// save the original table in aux list, just in case it is needed later
+    // then clear the table list
+    thd->lex->select_lex.table_list.save_and_clear(&thd->lex->auxiliary_table_list);
+
+	// important: create dynamic string or it will get truncated later and cause errors
+	//TODO: make sure this is deleted later
+	char *dummy_table_name_cstr = new char[dummy_table_name.length()];
+	strcpy(dummy_table_name_cstr, dummy_table_name.c_str());
+
+	char * db_cstr = new char[db.length()];
+	strcpy(db_cstr, db.c_str());
+
+	// create lex string in order to create a new table identifier
+	LEX_STRING table_ls = { C_STRING_WITH_LEN(dummy_table_name_cstr) };
+	table_ls.length = dummy_table_name.length();
+
+	LEX_STRING db_ls = { C_STRING_WITH_LEN(db_cstr) };
+	db_ls.length = db.length();
+
+	Table_ident* tid = new Table_ident(thd, db_ls, table_ls, true);
+
+	// add the new table (the one data should be loaded into) to the table list
+	thd->lex->select_lex.add_table_to_list(thd, tid, NULL, TL_OPTION_UPDATING,
+											TL_WRITE_DEFAULT, MDL_SHARED_WRITE, NULL, 0);
+
+	// changing table_list itself to point to the new table
+	// load data can now proceed
+	*table_list_ptr = thd->lex->select_lex.table_list.first;
+	// BL:  I had to add this line to get autocalculating the field list to work	
+	thd->lex->select_lex.context.first_name_resolution_table = thd->lex->select_lex.table_list.first;	
 }
