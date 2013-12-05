@@ -22,6 +22,11 @@ using std::cout;
 using std::vector;
 using std::map;
 
+struct BufStruct {
+  uchar* request_pos;
+  uint length;
+};
+
 class XMLTAG {
 public:
   int level;
@@ -58,15 +63,17 @@ public:
   uchar        *row_start,                        /* Found row starts here */
         *row_end;                        /* Found row ends here */
   const CHARSET_INFO *read_charset;
-  map<int,uchar*>* buffers;
-  int read_pos;
+  map<int,BufStruct> buffers;
+  uint read_pos;
+  uint last_start_pos, line_start, line_end;
+  vector<uchar*> freeBuffers;
 
   READER(File file,uint tot_length,const CHARSET_INFO *cs,
             const String &field_term,
             const String &line_start,
             const String &line_term,
             const String &enclosed,
-            int escape,bool get_it_from_net, bool is_fifo, map<int,uchar*>* buffers, bool init_io_cache);
+            int escape,bool get_it_from_net, bool is_fifo);
   ~READER();
   int read_field();
   int read_fixed_length(void);
@@ -79,7 +86,9 @@ public:
   int read_value(int delim, String *val);
   int read_xml();
   int clear_level(int level);
-
+  int reset_line();
+  int set_checkpoint();
+  int next_line_set(void);
   /*
     We need to force cache close before destructor is invoked to log
     the last read block

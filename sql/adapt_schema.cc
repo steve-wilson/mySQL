@@ -70,7 +70,7 @@ string schema_from_row(string& db, string& table, vector<string>& header, vector
   return ss.str();
 }
 
-bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_INFO *cs, const String &field_term, const String &line_start, const String &line_term, const String &enclosed, int escape, bool get_it_from_net, bool is_fifo, THD* thd, sql_exchange *ex, TABLE_LIST **table_list_ptr, List<Item>& fields_vars, vector<string>& header, map<int,uchar*>* buffers, schema_update_method method, string& newSchema, bool init_io_cache){
+bool update_schema_to_accomodate_data(READER& reader, THD* thd, sql_exchange *ex, TABLE_LIST **table_list_ptr, List<Item>& fields_vars, vector<string>& header, schema_update_method method, string& newSchema){
     /*
         In this function we can make whatever calls are necessary
         in order to update the schema to accomodate the incoming data
@@ -90,10 +90,7 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
     List<Ed_row> it = executeQuery(c, "describe " + db  + "." + table_name); 
     string oldSchema = resultToSchema(table_list->db, table_list->table_name, it);
 
-    // Get new schema
-    READER reader(file, tot_length,
-                        cs, field_term, line_start, line_term, enclosed,
-                        escape, get_it_from_net, is_fifo, buffers, init_io_cache);
+
 
     // If we cannot read the file, return an error
     if(reader.error)
@@ -101,10 +98,12 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
 
     LoadCSV csv(table_list->db, table_list->table_name, &reader);
 
-    if(newSchema.length()==0) {
+    if(header.empty())
       header = csv.getHeader();
 
-      string newSchema = csv.calculateSchema(relaxed_schema_inference, infer_sample_size);
+    reader.set_checkpoint();
+    if(newSchema.length()==0) {
+      newSchema = csv.calculateSchema(relaxed_schema_inference, infer_sample_size);
 
       // Printf generated schema to outfile
       std::ofstream outfile;
@@ -113,7 +112,10 @@ bool update_schema_to_accomodate_data(File file, uint tot_length, const CHARSET_
       outfile << newSchema << std::endl;
       outfile.close();
     }
+    reader.reset_line();
 
+    cout << "existing schema: " << oldSchema << "\n";
+    cout << "schema derived from file: " << newSchema << "\n";
     vector<column> matches = csv.match(oldSchema, newSchema);
 
     // If there were no changes, nothing should be done
