@@ -111,8 +111,13 @@ class typeManager
     regex_t DECIMAL_REGEX;
 
     inline ParsedType match(const char* d, unsigned int length, int & dotPosition);
+    typeAndMD inferType_int(char* value, unsigned int length);
 public:
-    typeManager();
+    enum FitPolicy {STRICT=0, RELAXED_POW2};
+
+    typeManager(FitPolicy policy_in);
+
+    FitPolicy policy;
 
     typeAndMD inferType(char* value, unsigned int length);
     vector<column> generateNewSchema(string existingSchema, string insertSchema);

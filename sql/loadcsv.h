@@ -20,14 +20,12 @@ class LoadCSV {
 
   public:
 
-  LoadCSV(string db, string table, READER * reader);
+  LoadCSV(string db, string table, READER * reader, typeManager& type_manager);
 
-  vector<string> getHeader() {
-    return header;
-  }
+  vector<string> getHeader();
 
-  vector<typeAndMD> calculateColumnTypes();
   string calculateSchema(bool relaxed, unsigned int sample_size);
+  vector<typeAndMD> calculateColumnTypes(int rows);
   vector<column> match(string schema1, string schema2);
 };
 

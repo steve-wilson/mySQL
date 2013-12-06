@@ -1,6 +1,7 @@
 #ifndef READER_H
 #define READER_H
 
+#include <vector>
 #include "sql_class.h"
 #include <my_dir.h>
 #include "my_sys.h"
@@ -11,13 +12,22 @@
 #include <algorithm>
 #include <iostream>
 #include "log_event.h"
-
+#include <map>
 #include <mysql.h>
 #include <hash.h>
+#include "rpl_slave.h"
+#include "rpl_mi.h"
 
 using std::min;
 using std::max;
 using std::cout;
+using std::vector;
+using std::map;
+
+struct BufStruct {
+  uchar* request_pos;
+  uint length;
+};
 
 class XMLTAG {
 public:
@@ -30,7 +40,7 @@ public:
     value.append(v);
   }
 };
- 
+
 class READER {
   File        file;
   uchar        *buffer,                        /* Buffer for read text */
@@ -43,15 +53,23 @@ class READER {
   int        *stack,*stack_pos;
   bool        found_end_of_line,start_of_line,eof;
   bool  need_end_io_cache;
+  uchar *first_request_pos;
+
+
   IO_CACHE cache;
   NET *io_net;
   int level; /* for load xml */
+  int last_read;
 
 public:
   bool error,line_cuted,found_null,enclosed;
   uchar        *row_start,                        /* Found row starts here */
         *row_end;                        /* Found row ends here */
   const CHARSET_INFO *read_charset;
+  map<int,BufStruct> buffers;
+  uint read_pos;
+  uint last_start_pos, line_start, line_end;
+  vector<uchar*> freeBuffers;
 
   READER(File file,uint tot_length,const CHARSET_INFO *cs,
             const String &field_term,
@@ -71,7 +89,9 @@ public:
   int read_value(int delim, String *val);
   int read_xml();
   int clear_level(int level);
-
+  int reset_line();
+  int set_checkpoint();
+  int next_line_set(void);
   /*
     We need to force cache close before destructor is invoked to log
     the last read block
@@ -82,6 +102,7 @@ public:
     need_end_io_cache = 0;
   }
 
+  void init_io(bool read_from_client, bool is_fifo);
   /*
     Either this method, or we need to make cache public
     Arg must be set from mysql_load() since constructor does not see

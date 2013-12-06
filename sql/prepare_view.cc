@@ -8,7 +8,7 @@
 using namespace std;
 
 // TODO: add commands/pseudo-triggers to clean up all of the sub tables used to make views work
-void prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr) {
+void AdaptSchema::prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr) {
     TABLE_LIST* table_list = *table_list_ptr;
 
     string table_name = table_list->table_name;

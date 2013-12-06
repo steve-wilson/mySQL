@@ -1,9 +1,94 @@
 #include "reader.h"
 
+#include <vector>
 #include <iostream>
 
 using std::min;
 using std::max;
+using std::vector;
+
+#define my_b_get2(info, cache, read_pos) \
+       ((info)->read_pos != (info)->read_end ?\
+       ((info)->read_pos++, (int) (uchar) (info)->read_pos[-1]) :\
+       do_read(info, cache, read_pos, freeBuffers, last_read))
+
+/*
+#define my_b_get2(info, cache) \
+      ((info)->read_pos != (info)->read_end ?\
+          ((info)->read_pos++, (int) (uchar) (info)->read_pos[-1]) :\
+          do_read(info, cache, read_pos))
+
+
+inline int do_read(IO_CACHE* cache, map<int,BufStruct>* buffers, int& read_pos) {
+  read_pos++;
+  int r = _my_b_get(cache);
+
+  uchar* b = new uchar[cache->buffer_length+sizeof(int)];
+  if(cache->request_pos==NULL)
+      return my_b_EOF;
+
+  strncpy((char*)b, (char*)cache->request_pos, cache->buffer_length);
+  *((int*)(b+cache->buffer_length)) = (int)(cache->read_end-cache->request_pos);
+  (*buffers)[read_pos] = b;
+
+  return r;
+}
+*/
+
+inline int do_read(IO_CACHE* cache, map<int,BufStruct>& buffers, uint& read_pos, vector<uchar*>& freeBuffers, int& last_read) {
+  read_pos++;
+
+  if(buffers.find(read_pos)!=buffers.end()) {
+    BufStruct s = buffers[read_pos];
+    cache->request_pos = s.request_pos;
+    cache->read_pos = cache->request_pos+1;
+    // We need these two pieces of info so we just tag them to the end of the buffer
+    int length = s.length;  
+        
+    // cache->pos_in_file = pos_in_file;
+    cache->read_end = s.request_pos + length;
+    cache->buffer = s.request_pos;
+ 
+    return (int)*cache->request_pos;
+  }
+  /*
+  else if(cache->request_pos==NULL) {
+    // If the request_pos is null then there is not data, so we return eof
+    // This ensures we terminate and the client returns correct error
+    return my_b_EOF;
+  }
+   */
+  // If the free buffer last has a free buffer, use it, otherwise allocate a new one
+
+  uchar* buf;
+  if(freeBuffers.empty()) {
+    buf = new uchar[cache->buffer_length+sizeof(int)];
+  } else {
+    buf = freeBuffers.back();
+    freeBuffers.pop_back();
+  }
+/*
+    int readend = cache->read_end-cache->request_pos;
+    cache->request_pos = buf;
+    cache->buffer = buf;
+    cache->read_end = buf + readend;
+    cache->read_pos = cache->read_end;
+*/
+  int r = _my_b_get(cache);
+
+  if(cache->request_pos==NULL)
+    return my_b_EOF;
+
+  strncpy((char*)buf, (char*)cache->request_pos, cache->buffer_length);
+  int length  = cache->read_end-cache->request_pos;
+
+  buffers[read_pos] = (BufStruct){buf, length};
+
+  return r;
+}
+ 
+#define GET (stack_pos != stack ? *--stack_pos : my_b_get2(&cache, buffers, read_pos))
+#define PUSH(A) *(stack_pos++)=(A)
 
 /* Unescape all escape characters, mark \N as null */
 
@@ -40,7 +125,8 @@ READER::READER(File file_par, uint tot_length, const CHARSET_INFO *cs,
                      int escape, bool get_it_from_net, bool is_fifo)
   :file(file_par), buff_length(tot_length), escape_char(escape),
    found_end_of_line(false), eof(false), need_end_io_cache(false),
-   error(false), line_cuted(false), found_null(false), read_charset(cs)
+   error(false), line_cuted(false), found_null(false), read_charset(cs),
+   read_pos(0), last_start_pos(0), last_read(-1)
 {
   field_term_ptr= field_term.ptr();
   field_term_length= field_term.length();
@@ -111,9 +197,31 @@ READER::READER(File file_par, uint tot_length, const CHARSET_INFO *cs,
   }
 }
 
+void READER::init_io(bool get_it_from_net, bool is_fifo){
+  init_io_cache(&cache,(get_it_from_net) ? -1 : file, 0,
+		      (get_it_from_net) ? READ_NET :
+		      (is_fifo ? READ_FIFO : READ_CACHE),0L,1,
+		      MYF(MY_WME));
+  need_end_io_cache = 1;
+  eof = false;
+}
 
 READER::~READER()
 {
+  map<int,BufStruct>::iterator it;
+  for(it=buffers.begin(); it!=buffers.end(); it++) {
+    uchar* add = it->second.request_pos;
+    // Don't want to free this buffer twice!!
+    if(add!=cache.buffer)
+      delete[] add;
+  }
+
+  while(!freeBuffers.empty()) {
+    uchar* add = freeBuffers.back();
+    delete[] add;
+    freeBuffers.pop_back();
+  }
+  
   if (need_end_io_cache)
     ::end_io_cache(&cache);
 
@@ -124,11 +232,6 @@ READER::~READER()
   while ((t= xmlit++))
     delete(t);
 }
-
-
-#define GET (stack_pos != stack ? *--stack_pos : my_b_get(&cache))
-#define PUSH(A) *(stack_pos++)=(A)
-
 
 inline int READER::terminator(const char *ptr,uint length)
 {
@@ -170,6 +273,7 @@ int READER::read_field()
   if ((chr=GET) == my_b_EOF)
   {
     found_end_of_line=eof=1;
+    last_read = read_pos;
     return 1;
   }
   to=buffer;
@@ -320,6 +424,7 @@ int READER::read_field()
   }
 
 found_eof:
+  last_read = read_pos;
   enclosed=0;
   found_end_of_line=eof=1;
   row_start=buffer;
@@ -386,12 +491,55 @@ int READER::read_fixed_length()
   return 0;
 
 found_eof:
+  last_read = read_pos;
   found_end_of_line=eof=1;
   row_start=buffer;
   row_end=to;
   return to == buffer ? 1 : 0;
 }
 
+int READER::set_checkpoint() {
+  // We can delete all the unused buffers when next_line is called
+
+  line_start = cache.read_pos-cache.request_pos;
+  line_end = cache.read_end-cache.request_pos;
+
+  if(last_start_pos<read_pos) {
+    last_start_pos = read_pos;
+ 
+    int d = read_pos - 1;
+    while(true) {
+      if(buffers.find(d)==buffers.end())
+        break;
+      uchar* dbuff = buffers[d].request_pos;
+      freeBuffers.push_back(dbuff);
+      buffers.erase(d);
+      d--;
+    }
+  }
+
+  return 0;
+}
+
+int READER::reset_line() {
+  cache.request_pos = buffers[last_start_pos].request_pos;
+  cache.buffer = buffers[last_start_pos].request_pos;
+  cache.read_pos = cache.request_pos+line_start;
+  cache.read_end = cache.request_pos+line_end;
+  read_pos = last_start_pos;
+
+  found_end_of_line = false;
+  eof = false;
+
+  return 0;
+}
+
+int READER::next_line_set() {
+  int l = next_line();
+  set_checkpoint();
+
+  return l;
+}
 
 int READER::next_line()
 {
