@@ -9,7 +9,7 @@
 static const string column_delimiter = "___";
 static const string modified_delimiter = "xxx";
 
-static const int MIN_DUMMY_COLS = 6;
+static const int MIN_DUMMY_COLS = 7;
 static const float DUMMY_COL_FRACTION = .25;
 
 #define DUMMY_STRING "DUMMY"
@@ -467,7 +467,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 		if(removeRequiredDecimalCols < numNewDecimals)
 			removeRequiredDecimalCols = numNewDecimals;
 
-		int dummyColsThatFitVarchars = dummyColsThatFitDecimals - removeRequiredIntCols;
+		int dummyColsThatFitVarchars = dummyColsThatFitDecimals - removeRequiredDecimalCols;
 
 		bool cantFitInDummyCols = numNewVarchars > dummyColsThatFitVarchars;
 		
@@ -511,14 +511,12 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 						alterAddColString += "DROP " + modified_delimiter + MODIFIED_STRING + cit->first + modified_delimiter + os.str();
 						os.str("");
 					}
-
-					alterAddColString += ", MODIFY " + cit->first + " " + toString(colNameToTypeMD[cit->first]);
 				}
 
 				// Change prior renamed dummy types to actual types
 				for(it = matches.begin(); it != matches.end(); ++it)
 				{
-					if(!it->addedFromExisting && !it->changedFromExisting && colNameToModifiedIndexes.find(it->existingName) == colNameToModifiedIndexes.end())
+					if(!it->addedFromExisting && !it->changedFromExisting)
 					{	
 						string typeExistingInDummyTable = currentType[it->existingName];
 						stringToUpper(typeExistingInDummyTable);
