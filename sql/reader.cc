@@ -10,7 +10,7 @@ using std::vector;
 #define my_b_get2(info, cache, read_pos) \
        ((info)->read_pos != (info)->read_end ?\
        ((info)->read_pos++, (int) (uchar) (info)->read_pos[-1]) :\
-       do_read(info, cache, read_pos, freeBuffers))
+       do_read(info, cache, read_pos, freeBuffers, last_read))
 
 /*
 #define my_b_get2(info, cache) \
@@ -35,8 +35,9 @@ inline int do_read(IO_CACHE* cache, map<int,BufStruct>* buffers, int& read_pos) 
 }
 */
 
-inline int do_read(IO_CACHE* cache, map<int,BufStruct>& buffers, uint& read_pos, vector<uchar*>& freeBuffers) {
+inline int do_read(IO_CACHE* cache, map<int,BufStruct>& buffers, uint& read_pos, vector<uchar*>& freeBuffers, int& last_read) {
   read_pos++;
+
   if(buffers.find(read_pos)!=buffers.end()) {
     BufStruct s = buffers[read_pos];
     cache->request_pos = s.request_pos;
@@ -74,6 +75,9 @@ inline int do_read(IO_CACHE* cache, map<int,BufStruct>& buffers, uint& read_pos,
     cache->read_pos = cache->read_end;
 */
   int r = _my_b_get(cache);
+
+  if(cache->request_pos==NULL)
+    return my_b_EOF;
 
   strncpy((char*)buf, (char*)cache->request_pos, cache->buffer_length);
   int length  = cache->read_end-cache->request_pos;
@@ -121,7 +125,8 @@ READER::READER(File file_par, uint tot_length, const CHARSET_INFO *cs,
                      int escape, bool get_it_from_net, bool is_fifo)
   :file(file_par), buff_length(tot_length), escape_char(escape),
    found_end_of_line(false), eof(false), need_end_io_cache(false),
-   error(false), line_cuted(false), found_null(false), read_charset(cs), read_pos(0)
+   error(false), line_cuted(false), found_null(false), read_charset(cs),
+   read_pos(0), last_start_pos(0), last_read(-1)
 {
   field_term_ptr= field_term.ptr();
   field_term_length= field_term.length();
@@ -268,6 +273,7 @@ int READER::read_field()
   if ((chr=GET) == my_b_EOF)
   {
     found_end_of_line=eof=1;
+    last_read = read_pos;
     return 1;
   }
   to=buffer;
@@ -418,6 +424,7 @@ int READER::read_field()
   }
 
 found_eof:
+  last_read = read_pos;
   enclosed=0;
   found_end_of_line=eof=1;
   row_start=buffer;
@@ -484,6 +491,7 @@ int READER::read_fixed_length()
   return 0;
 
 found_eof:
+  last_read = read_pos;
   found_end_of_line=eof=1;
   row_start=buffer;
   row_end=to;
@@ -521,7 +529,8 @@ int READER::reset_line() {
   read_pos = last_start_pos;
 
   found_end_of_line = false;
-  
+  eof = false;
+
   return 0;
 }
 

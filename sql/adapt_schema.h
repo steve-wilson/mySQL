@@ -22,17 +22,19 @@ class AdaptSchema {
   THD* thd;
   sql_exchange *ex;
   List<Item>* field_list;
-  vector<string>* header;
+  vector<string> header;
   schema_update_method method;
   bool relaxed_schema_inference;
   unsigned int sample_size;
 
   public:
-  AdaptSchema(READER* reader, THD* thd, sql_exchange* ex, List<Item>* field_list, vector<string>* header, schema_update_method method, bool relaxed_schema_inference, unsigned int infer_sample_size);
+  AdaptSchema(READER* reader, THD* thd, sql_exchange* ex, List<Item>* field_list, schema_update_method method, bool relaxed_schema_inference, unsigned int infer_sample_size);
+
+  vector<string> getHeader() { return header; }
 
   bool update_schema_to_accomodate_data(TABLE_LIST **table_list_ptr, string& newSchema);
 
-  string schema_from_row(string& db, string& table_name, vector<string>& header, vector<string>& row);
+  string schema_from_row(string& db, string& table_name, vector<string>& row);
 
   bool finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_method method);
 

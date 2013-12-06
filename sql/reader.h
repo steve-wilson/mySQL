@@ -59,6 +59,7 @@ class READER {
   IO_CACHE cache;
   NET *io_net;
   int level; /* for load xml */
+  int last_read;
 
 public:
   bool error,line_cuted,found_null,enclosed;

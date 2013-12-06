@@ -192,7 +192,6 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
                 bool read_file_from_client, schema_update_method  merge_method,
                 bool relaxed_schema_inference, unsigned int infer_sample_size)
 {
-  vector<string> header;
   // reaches this line, (verified via gdb) but cerr doesn't go to terminal
   //std::cerr << "in mysql_load() from sql/sql_load.cc" << std::endl;
   char name[FN_REFLEN];
@@ -278,19 +277,9 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
     DBUG_RETURN(TRUE);				// Can't allocate buffers
   }
 
-#ifndef EMBEDDED_LIBRARY
-  if (mysql_bin_log.is_open())
-  {
-    lf_info.thd = thd;
-    lf_info.wrote_create_file = 0;
-    lf_info.last_pos_in_file = HA_POS_ERROR;
-    lf_info.log_delayed= transactional_table;
-    read_info.set_io_cache_arg((void*) &lf_info);
-  }
-#endif 
   /*!EMBEDDED_LIBRARY*/
 
-  AdaptSchema as(&read_info, thd, ex, &fields_vars, &header, merge_method, 
+  AdaptSchema as(&read_info, thd, ex, &fields_vars, merge_method, 
               relaxed_schema_inference, infer_sample_size);
   // make changes to schema if desired and required
   if (merge_method !=  SCHEMA_UPDATE_NONE) {
@@ -298,7 +287,11 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
           DBUG_RETURN(TRUE);
 
     if(!is_partial_read) {
+      if (file >= 0)
+        mysql_file_close(file, MYF(0));           // no files in net reading
+
       read_info.end_io_cache();
+
       open_file(thd, name, tdb, ex, read_file_from_client, file, is_fifo);
       read_info.init_io(read_file_from_client, is_fifo);
       skip_lines++;
@@ -360,7 +353,16 @@ continue_inserting:
   transactional_table= table->file->has_transactions();
 #ifndef EMBEDDED_LIBRARY
   is_concurrent= (table_list->lock_type == TL_WRITE_CONCURRENT_INSERT);
-#endif
+
+  if (mysql_bin_log.is_open())
+  {
+    lf_info.thd = thd;
+    lf_info.wrote_create_file = 0;
+    lf_info.last_pos_in_file = HA_POS_ERROR;
+    lf_info.log_delayed= transactional_table;
+    read_info.set_io_cache_arg((void*) &lf_info);
+  }
+#endif 
 
   if (!fields_vars.elements)
   {
@@ -516,7 +518,7 @@ continue_inserting:
           lastRow.push_back((const char*)read_info.row_start);
         }
         read_info.reset_line();
-        newSchema = as.schema_from_row(db_s, table_name_s, header, lastRow);  
+        newSchema = as.schema_from_row(db_s, table_name_s, lastRow);  
 
         fields_vars.delete_elements();
         if (as.update_schema_to_accomodate_data(&table_list, newSchema))
