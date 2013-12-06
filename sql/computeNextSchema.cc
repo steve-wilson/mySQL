@@ -419,13 +419,14 @@ void addToOutputSchema(vector<column> &outputSchema, string existingColName, str
 	typeMD.m = m;
 	typeMD.d = d;
 	typeMD.unsignedVal = typeUnsigned;
-	
+	typeMD.typeEnum = stringToEnum[type];
+
 	outputCol.existingName = existingColName;
 	outputCol.newName = insertColName;
 	outputCol.typeMD = typeMD;
 	outputCol.changedFromExisting = changedFromExisting;
 	outputCol.addedFromExisting = addedFromExisting;
-
+	
 
 	outputSchema.push_back(outputCol);
 }
