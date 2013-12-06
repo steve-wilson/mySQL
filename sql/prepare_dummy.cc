@@ -15,7 +15,7 @@ static const float DUMMY_COL_FRACTION = .25;
 #define DUMMY_STRING "DUMMY"
 #define MODIFIED_STRING "MODIFY"
 #define INTEGER_STRING "INTEGER"
-#define DECIMAL_STRING "DECIMAL"
+#define DECIMAL_STRING "DECIMAL(65,30)"
 #define VARCHAR_STRING "VARCHAR(255)"
 
 static string intTypesArray[] = { "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER"};
@@ -231,6 +231,15 @@ void createTableAndView(string db, string dummy_table_name, string table_name, s
 
 string getCastString(typeAndMD type)
 {
+	// Get m and d strings
+	string d, m;
+	ostringstream os;
+	os << type.m;
+	m = os.str();
+	os.str("");
+	os << type.d;
+	d = os.str();
+
 	if(type.type == "BIT" || type.type == "BINARY" || type.type == "VARBINARY")
 		return "BINARY";
 	else if(type.type == "TINYINT" || type.type == "SMALLINT" || type.type == "MEDIUMINT"
@@ -244,7 +253,13 @@ string getCastString(typeAndMD type)
 	else if(type.type == "REAL" || type.type == "DOUBLE" || type.type == "DOUBLE_PRECISION"
 			|| type.type == "FLOAT" || type.type == "DECIMAL" || type.type == "DEC" 
 			|| type.type == "NUMERIC")
+	{	
+		if(type.m >= 0 && type.d >= 0)
+			return "DECIMAL(" + m + "," + d + ")";
+		else if(type.m >=0)
+			return "DECIMAL(" + m + ")";
 		return "DECIMAL";
+	}
 	else if(type.type == "DATE")
 		return "DATE";
 	else if(type.type == "TIME" || type.type == "TIMESTAMP")
@@ -252,8 +267,12 @@ string getCastString(typeAndMD type)
 	else if(type.type == "DATETIME" || type.type == "YEAR")
 		return "DATETIME";
 	else if(type.type == "CHAR" || type.type == "VARCHAR")
-		return "CHAR(255)";
-
+	{	
+		if(type.m >= 0)
+			return "CHAR(" + m + ")";
+		else
+			return "CHAR(255)";
+	}
 	return "";
 }
        
@@ -379,18 +398,24 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 		int numNewDecimals = 0;
 		int numNewVarchars = 0;
 		string finalViewCols = "";
-	
+		map<string, typeAndMD> colNameToTypeMD;
+
 		// Find added and modifed cols and store in vectors. Also compute counts of existing cols for computing dummyCols to add next
+		// Also maps column name to its type string
 		for(it = matches.begin(); it != matches.end(); ++it)
 		{
 			if(finalViewCols.length() > 0)
 				finalViewCols += ",";
+			
+			string colName = it->existingName;
 
 			if(it->addedFromExisting)
-				finalViewCols += it->newName;
-			else 
-				finalViewCols += it->existingName;
-			
+				colName = it->newName;
+
+			finalViewCols += colName;
+
+			colNameToTypeMD[colName] = it->typeMD;
+
 			if(intTypes.find(it->typeMD.type) != intTypes.end())
 			{
 				++numInts;
@@ -430,11 +455,24 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 
 		string alterAddColString = "";
 		string alterDummyColString = "";
+
+		// See if we can fit all the types of data into the existing dummy cols available
+		int dummyColsThatFitInts = typeToUnusedDummyCols[INTEGER_STRING].size() + typeToUnusedDummyCols[DECIMAL_STRING].size() + typeToUnusedDummyCols[VARCHAR_STRING].size();
+		int removeRequiredIntCols = typeToUnusedDummyCols[INTEGER_STRING].size();
+		if(removeRequiredIntCols < numNewInts)
+			removeRequiredIntCols = numNewInts;
+
+		int dummyColsThatFitDecimals = dummyColsThatFitInts - removeRequiredIntCols;
+		int removeRequiredDecimalCols = typeToUnusedDummyCols[DECIMAL_STRING].size();
+		if(removeRequiredDecimalCols < numNewDecimals)
+			removeRequiredDecimalCols = numNewDecimals;
+
+		int dummyColsThatFitVarchars = dummyColsThatFitDecimals - removeRequiredIntCols;
+
+		bool cantFitInDummyCols = numNewVarchars > dummyColsThatFitVarchars;
 		
 		// Need to add columns so add the exact type instead of storing in dummy cols
-		if(numNewInts > typeToUnusedDummyCols[INTEGER_STRING].size() ||
-		   numNewDecimals > typeToUnusedDummyCols[DECIMAL_STRING].size() ||
-		   numNewVarchars > typeToUnusedDummyCols[VARCHAR_STRING].size())
+		if(cantFitInDummyCols)
 		{
 			// Handle added columns
 			if(fieldsAdded.size() > 0 || fieldsModified.size() > 0)
@@ -444,7 +482,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 				{
 					if(alterAddColString.length() > 0)
 						alterAddColString += ", ";
-
+	
 					alterAddColString += "ADD " + it->newName + " " + toString(it->typeMD);
 				}
 
@@ -457,6 +495,39 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 					alterAddColString += "MODIFY " + it->newName + " " + toString(it->typeMD);
 				}
 				
+				// We are creating a new table so remove modified dummy cols
+				set<int>::iterator sit;
+				map<string, set<int> >::iterator cit;
+				for(cit = colNameToModifiedIndexes.begin(); cit != colNameToModifiedIndexes.end(); ++cit)
+				{
+					for(sit = cit->second.begin(); sit != cit->second.end(); ++sit)
+					{
+						if(alterAddColString.length() > 0)
+							alterAddColString += ", ";
+	
+						ostringstream os; 
+						os << *sit;
+
+						alterAddColString += "DROP " + modified_delimiter + MODIFIED_STRING + cit->first + modified_delimiter + os.str();
+						os.str("");
+					}
+
+					alterAddColString += ", MODIFY " + cit->first + " " + toString(colNameToTypeMD[cit->first]);
+				}
+
+				// Change prior renamed dummy types to actual types
+				for(it = matches.begin(); it != matches.end(); ++it)
+				{
+					if(!it->addedFromExisting && !it->changedFromExisting && colNameToModifiedIndexes.find(it->existingName) == colNameToModifiedIndexes.end())
+					{	
+						string typeExistingInDummyTable = currentType[it->existingName];
+						stringToUpper(typeExistingInDummyTable);
+
+						if(typeExistingInDummyTable != toString(it->typeMD))
+							alterAddColString += ", MODIFY " + it->existingName + " " + toString(it->typeMD);
+					}
+				}
+
 				List<Ed_row> viewFields = executeQuery(c, "describe " + db  +	"." + table_name);
 		        List_iterator<Ed_row> viewFieldsIT(viewFields);
 
@@ -470,7 +541,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 				}
 
 				alterDummyColString = alterDummyColsStatement(typeToUnusedDummyCols, alreadyUsedDummyIndexes, numInts, numDecimals, numVarchars, DUMMY_COL_FRACTION, MIN_DUMMY_COLS); 
-					
+
 				// Create table like old underyling table
 				string dummy_table_copy_name = dummy_table_name + "copy";
 				string createTableString = "CREATE TABLE " + db + "." + dummy_table_copy_name + " LIKE " + db + "." + dummy_table_name;
@@ -479,7 +550,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 				// Alter the new table adding columns and renaming old columns
 				string alterTableString = "ALTER TABLE " + db + "." + dummy_table_copy_name + " " + alterAddColString + alterDummyColString;
 				executeQuery(c, alterTableString);
- 							
+						
 				// Insert into new table from what is in the view
 				string insertString = "INSERT INTO " + db + "." + dummy_table_copy_name + " (" +  viewCols + ") SELECT * FROM " + db + "." + table_name;
 				executeQuery(c, insertString);
@@ -491,7 +562,7 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 				// Rename new table to old table name
 				string renameTableString = "RENAME TABLE " + db + "." + dummy_table_copy_name + " TO " + db + "." + dummy_table_name;
 				executeQuery(c, renameTableString);
-
+				
 				// Now drop old view and make a new view that casts the datatypes when appropriate  
 				executeQuery(c, "DROP VIEW " + db + "." + table_name);
 				executeQuery(c, "CREATE VIEW " + db + "." + table_name + " AS SELECT " + finalViewCols + " FROM " + db + "." + dummy_table_name);
@@ -505,30 +576,56 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 				map<string, string> colNameToViewColString;
 
 				// For each added column add it using existing dummy cols 
-				for(it = fieldsAdded.begin(); it != fieldsAdded.end(); ++it)
+				for(it = fieldsAdded.begin(); it != fieldsAdded.end(); ++it) 
 				{
 					string type = findDummyColType(it->typeMD.type);
 				
+					// Update number of new types we still need
+					if(type == INTEGER_STRING)
+						--numNewInts;
+					else if(type == DECIMAL_STRING)
+						--numNewDecimals;
+					else
+						--numNewVarchars;
+
 					if(alterAddColString.length() > 0)
 						alterAddColString += ", ";
 
-					// Have an available matching type dummy col
+					// Have an available matching type dummy col 
 					if(typeToUnusedDummyCols.find(type) != typeToUnusedDummyCols.end() && typeToUnusedDummyCols[type].size() > 0)
 					{
 						dummyCol dc = typeToUnusedDummyCols[type].back();
 						typeToUnusedDummyCols[type].pop_back();
 						
 						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + type;
-						
-						// Need to cast if type is varchar and type of what we are storing is not varchar				
-						if(type == VARCHAR_STRING && it->typeMD.type != VARCHAR_STRING)
-						{
-							string castString = getCastString(it->typeMD);
-							
-							string viewCol = "CAST(" + it->newName + " AS " + castString + ") AS " + it->newName;
-							colNameToViewColString.insert(make_pair(it->newName, viewCol));	
-						}
 					}
+					// Can store int in decimal or varchar
+					else if(type == INTEGER_STRING)
+					{
+						string dummyColToStoreIn = VARCHAR_STRING;
+	
+						if(typeToUnusedDummyCols[DECIMAL_STRING].size() > numNewDecimals)
+							dummyColToStoreIn = DECIMAL_STRING;
+						
+						dummyCol dc = typeToUnusedDummyCols[dummyColToStoreIn].back();
+						typeToUnusedDummyCols[dummyColToStoreIn].pop_back();
+						
+						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + dummyColToStoreIn;
+					}
+					// Can store decimal in varchar
+					else if(type == DECIMAL_STRING)
+					{
+						dummyCol dc = typeToUnusedDummyCols[VARCHAR_STRING].back();
+						typeToUnusedDummyCols[VARCHAR_STRING].pop_back();
+						
+						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + VARCHAR_STRING;
+					}
+					
+					// Need to cast to correct type in view				
+					string castString = getCastString(it->typeMD);
+							
+					string viewCol = "CAST(" + it->newName + " AS " + castString + ") AS " + it->newName;
+					colNameToViewColString.insert(make_pair(it->newName, viewCol));	
 				}
 
 				// For each modfied column add a modified type to a dummy col
@@ -539,46 +636,54 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 					if(alterAddColString.length() > 0)
 						alterAddColString += ", ";
 
+					int currentMaxIndex = 0;
+
+					if(colNameToModifiedIndexes.find(it->newName) != colNameToModifiedIndexes.end())
+							currentMaxIndex = *colNameToModifiedIndexes[it->newName].rbegin();
+
+					ostringstream os;
+					os << currentMaxIndex + 1;
+					colNameToModifiedIndexes[it->newName].insert(currentMaxIndex + 1);
+					alterAddColString += "CHANGE " + it->newName + " " + modified_delimiter + MODIFIED_STRING + it->newName + modified_delimiter + os.str() + " " + currentType[it->newName] + ", ";
+					os.str("");
+
 					// Have an available matching type dummy col
 					if(typeToUnusedDummyCols.find(type) != typeToUnusedDummyCols.end() && typeToUnusedDummyCols[type].size() > 0)
 					{
 						dummyCol dc = typeToUnusedDummyCols[type].back();
 						typeToUnusedDummyCols[type].pop_back();
 							
-						int currentMaxIndex = 0;
-
-						if(colNameToModifiedIndexes.find(it->newName) != colNameToModifiedIndexes.end())
-							currentMaxIndex = *colNameToModifiedIndexes[it->newName].rbegin();
-
-						ostringstream os;
-						os << currentMaxIndex + 1;
-						
-						colNameToModifiedIndexes[it->newName].insert(currentMaxIndex + 1);
-
-						alterAddColString += "CHANGE " + it->newName + " " + modified_delimiter + MODIFIED_STRING + it->newName + modified_delimiter + os.str() + " " + currentType[it->newName] + ", ";
 						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + type;
+					}
+					// Can store int in decimal or varchar
+					else if(type == INTEGER_STRING)
+					{
+						string dummyColToStoreIn = VARCHAR_STRING;
+	
+						if(typeToUnusedDummyCols[DECIMAL_STRING].size() > numNewDecimals)
+							dummyColToStoreIn = DECIMAL_STRING;
 						
-						os.str("");
-					
-						// Need this if we want to cast the coalesced column	
-						/*
-						// Need to cast if type is varchar and type of what we are storing is not varchar				
-						if(type == VARCHAR_STRING && it->typeMD.type != VARCHAR_STRING)
-						{
-							string castString = getCastString(it->typeMD);
-							
-							string viewCol = "CAST(" + it->newName + " AS " + castString + ") AS " + it->newName;
-							colNameToViewColString.insert(make_pair(it->newName, viewCol));	
-						}
-						*/
+						dummyCol dc = typeToUnusedDummyCols[dummyColToStoreIn].back();
+						typeToUnusedDummyCols[dummyColToStoreIn].pop_back();
+						
+						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + dummyColToStoreIn;
+					}
+					// Can store decimal in varchar
+					else if(type == DECIMAL_STRING)
+					{
+						dummyCol dc = typeToUnusedDummyCols[VARCHAR_STRING].back();
+						typeToUnusedDummyCols[VARCHAR_STRING].pop_back();
+						
+						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + VARCHAR_STRING;
 					}
 				}
 
+				// Coalesce columns that have modified columns
 				set<int>::reverse_iterator sit;
 				map<string, set<int> >::iterator cit;
 				for(cit = colNameToModifiedIndexes.begin(); cit != colNameToModifiedIndexes.end(); ++cit)
 				{
-					string viewCol = "COALESCE(" + cit->first;
+					string viewCol = "CAST(COALESCE(" + cit->first;
 					for(sit = cit->second.rbegin(); sit != cit->second.rend(); ++sit)
 					{
 						ostringstream os; 
@@ -587,11 +692,11 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 						viewCol += "," + modified_delimiter + MODIFIED_STRING + cit->first + modified_delimiter + os.str();
 						os.str("");
 					}
-
-					viewCol += ") AS " + cit->first;
+						
+					viewCol += ") AS " + getCastString(colNameToTypeMD[cit->first]) + ") AS " + cit->first;
 					colNameToViewColString.insert(make_pair<string, string>(cit->first, viewCol)); 
 				}
-		
+
 				for(it = matches.begin(); it != matches.end(); ++it)
 				{
 					string colName = it->existingName;
@@ -599,8 +704,19 @@ void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> m
 					if(it->addedFromExisting)
 						colName = it->newName;
 
+					string typeExistingInDummyTable = currentType[it->newName];
+					stringToUpper(typeExistingInDummyTable);
+
 					if(colNameToViewColString.find(colName) != colNameToViewColString.end())
 						viewCols += colNameToViewColString[colName];
+					// Cast columns stored in dummy cols in prior iterations to their respective values
+					else if(typeExistingInDummyTable != toString(it->typeMD))
+					{
+						// Need to cast to correct type in view				
+						string castString = getCastString(it->typeMD);
+							
+						viewCols += "CAST(" + it->existingName + " AS " + castString + ") AS " + it->existingName;
+					}
 					else
 						viewCols += colName;
 
