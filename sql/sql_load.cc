@@ -976,6 +976,8 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
   bool err;
   DBUG_ENTER("read_sep_field");
 
+  enclosed_length=enclosed.length();
+
   uint warning_count = thd->get_stmt_da()->current_statement_warn_count();
   uint wc = warning_count;
   for (;;it.rewind())
