@@ -26,13 +26,14 @@ class AdaptSchema {
   schema_update_method method;
   bool relaxed_schema_inference;
   unsigned int sample_size;
+  TABLE_LIST* insert_table;
 
   public:
   AdaptSchema(READER* reader, THD* thd, sql_exchange* ex, List<Item>* field_list, schema_update_method method, bool relaxed_schema_inference, unsigned int infer_sample_size);
 
   vector<string> getHeader() { return header; }
 
-  bool update_schema_to_accomodate_data(TABLE_LIST **table_list_ptr, string& newSchema);
+  bool update_schema_to_accomodate_data(TABLE_LIST** table_list, string& newSchema);
 
   string schema_from_row(string& db, string& table_name, vector<string>& row);
 
@@ -42,6 +43,8 @@ class AdaptSchema {
   void prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr);
   void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr);		
 };
+
+void add_table_to_select_lex(THD* thd, TABLE_LIST **table_list_ptr, string db, string table_name);
 
 void swapTableWithView(THD * thd, string db, string table_name);
 
