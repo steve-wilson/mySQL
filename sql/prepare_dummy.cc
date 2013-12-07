@@ -259,8 +259,8 @@ string getCastString(typeAndMD type)
        
 static void stringToUpper(string &s)
 {
-        for(unsigned int i = 0; i < s.length(); ++i)
-                s[i] = toupper(s[i]);
+ 	for(unsigned int i = 0; i < s.length(); ++i)
+     	s[i] = toupper(s[i]);
 }
 
 string findDummyColType(string type)
