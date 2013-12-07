@@ -8,6 +8,9 @@
 #include "sql_prepare.h"
 #include "simplesql.h"
 #include "computeNextSchema.h"
+#include "subtables.h"
+
+set<string> indexedColumns;
 
 // Gets table name from schema and removes this from schema.
 string findTableName(string &schema)
@@ -50,6 +53,25 @@ string resultToSchema(string db, string table, List<Ed_row> list) {
   return ss.str();
 }
 
+bool columnHasIndex(string colName)
+{
+	if(indexedColumns.find(colName) != indexedColumns.end())
+    	return true;
+
+	return false;
+}
+
+void populateIndexedColumns(List<Ed_row> list)
+{
+  List_iterator<Ed_row> it(list);
+
+  Ed_row* row;
+  while((row=it++)!=NULL) {
+      if(!((string)row->get_column(3)->str).empty())
+      	indexedColumns.insert((string)row->get_column(0)->str);
+  }
+}
+
 string AdaptSchema::schema_from_row(string& db, string& table, vector<string>& row) {
   vector<typeAndMD> types;
   for(unsigned int i=0; i<row.size(); i++) {
@@ -75,6 +97,17 @@ AdaptSchema::AdaptSchema(READER* reader_in, THD* thd_in, sql_exchange* ex_in, Li
  relaxed_schema_inference(relaxed_schema_inference_in), sample_size(infer_sample_size_in)
 {
   insert_table = thd->lex->select_lex.table_list.first;
+ 
+  Ed_connection c(thd);
+
+
+  // Find the indexed columns for a table   
+  List<Ed_row> actualTableList = executeQuery(c, "describe " + (string)insert_table->db  + "." +(string)insert_table->table_name);
+  populateIndexedColumns(actualTableList);
+  
+  // Find the indexed columns for dummy table  
+  List<Ed_row> dummyList = executeQuery(c, "describe " + (string)insert_table->db  + "." + getSubTableName((string)insert_table->table_name, 1));
+  populateIndexedColumns(dummyList);
 }
 
 bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, string& newSchema) {

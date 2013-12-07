@@ -50,4 +50,5 @@ void swapTableWithView(THD * thd, string db, string table_name);
 
 string findTableName(string &schema);
 bool oldSchemaDoesntExist(string oldSchema); 
+bool columnHasIndex(string colName);
 #endif

@@ -1,6 +1,7 @@
 #include "adapt_schema.h"
 #include "sql_prepare.h"
 #include "simplesql.h"
+#include "subtables.h"
 
 #include <sstream>
 #include <map>
@@ -311,8 +312,8 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 
     string table_name = table_list->table_name;
     string db = table_list->db;
-
-	string dummy_table_name = column_delimiter + table_name + column_delimiter;
+	
+	string dummy_table_name = getSubTableName(table_name, 1);
     
 	// Initial creation of table and view
 	if(oldSchemaDoesntExist(oldSchema))
@@ -333,6 +334,8 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 		map<string, string> currentType;
 		set<int> alreadyUsedDummyIndexes;
 		vector<string> viewColumns;
+		bool modifyingIndexedColumn = false;
+		bool dummyTableExists = false;
 
 		// Store all available dummy cols in dummyFieldString vector also store modified indexes 
 		while((row = dummyFieldsIT++) != NULL)
@@ -385,6 +388,15 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 				currentType[(string)row->get_column(0)->str] = (string) row->get_column(1)->str;
 				viewColumns.push_back((string)row->get_column(0)->str);
 			}
+		}
+
+		List<Ed_row> availableTables = executeQuery(c, "show tables like '" + dummy_table_name + "'");
+		List_iterator<Ed_row> availableTablesIT(availableTables);
+	
+		while((row = availableTablesIT++) != NULL)
+		{
+			if(((string)row->get_column(0)->str) == dummy_table_name)
+				dummyTableExists = true;
 		}
 
 		// Find which fields are added from original schema and which are modified from original.
@@ -447,6 +459,9 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 			{
 				viewColumns.push_back(it->newName);
 				fieldsModified.push_back(*it);
+				
+				// Want to extend table if modifying an indexed column
+				modifyingIndexedColumn = columnHasIndex(it->newName);
 			}
 			else 
 				viewColumns.push_back(it->existingName);
@@ -471,8 +486,9 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 
 		bool cantFitInDummyCols = numNewVarchars > dummyColsThatFitVarchars;
 		
-		// Need to add columns so add the exact type instead of storing in dummy cols
-		if(cantFitInDummyCols)
+		// Need to add columns so add the exact type instead of storing in dummy cols, do this for when we cannot fit in 
+		// existing dummy cols or we are modifying an existing index
+		if(cantFitInDummyCols || modifyingIndexedColumn)
 		{
 			// Handle added columns
 			if(fieldsAdded.size() > 0 || fieldsModified.size() > 0)
@@ -542,9 +558,15 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 
 				// Create table like old underyling table
 				string dummy_table_copy_name = dummy_table_name + "copy";
-				string createTableString = "CREATE TABLE " + db + "." + dummy_table_copy_name + " LIKE " + db + "." + dummy_table_name;
-				executeQuery(c, createTableString);
+				string createTableString;
+				
+				if(dummyTableExists)
+					createTableString = "CREATE TABLE " + db + "." + dummy_table_copy_name + " LIKE " + db + "." + dummy_table_name;
+				else
+					createTableString = "CREATE TABLE " + db + "." + dummy_table_copy_name + " LIKE " + db + "." + table_name;	
 
+				executeQuery(c, createTableString);
+				
 				// Alter the new table adding columns and renaming old columns
 				string alterTableString = "ALTER TABLE " + db + "." + dummy_table_copy_name + " " + alterAddColString + alterDummyColString;
 				executeQuery(c, alterTableString);
@@ -554,7 +576,13 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 				executeQuery(c, insertString);
 
 				// Drop old table
-				string dropTableString = "DROP TABLE " + db + "." + dummy_table_name;
+				string dropTableString;
+				
+				if(dummyTableExists)
+					dropTableString = "DROP TABLE " + db + "." + dummy_table_name;
+				else
+					dropTableString = "DROP TABLE " + db + "." + table_name;
+
 				executeQuery(c, dropTableString);
 
 				// Rename new table to old table name
@@ -562,7 +590,9 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 				executeQuery(c, renameTableString);
 				
 				// Now drop old view and make a new view that casts the datatypes when appropriate  
-				executeQuery(c, "DROP VIEW " + db + "." + table_name);
+				if(dummyTableExists)
+					executeQuery(c, "DROP VIEW " + db + "." + table_name);
+				
 				executeQuery(c, "CREATE VIEW " + db + "." + table_name + " AS SELECT " + finalViewCols + " FROM " + db + "." + dummy_table_name);
 			}
 		}
