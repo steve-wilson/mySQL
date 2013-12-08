@@ -312,8 +312,13 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 
     string table_name = table_list->table_name;
     string db = table_list->db;
+
+	int highestTID = getHighestTID(thd, db, table_name);
 	
-	string dummy_table_name = getSubTableName(table_name, 1);
+	if(highestTID == 0)
+		++highestTID;
+
+	string dummy_table_name = getSubTableName(table_name, highestTID);
     
 	// Initial creation of table and view
 	if(oldSchemaDoesntExist(oldSchema))
