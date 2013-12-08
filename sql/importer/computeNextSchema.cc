@@ -566,7 +566,10 @@ int findNewMForTypeMD(typeAndMD typeMD, string outputType, bool outputUnsignedVa
 
 int findOutputM(typeAndMD existingTypeMD, typeAndMD insertTypeMD, string outputType, bool outputUnsignedVal)
 {
-	return max(findNewMForTypeMD(existingTypeMD, outputType, outputUnsignedVal), findNewMForTypeMD(insertTypeMD, outputType, outputUnsignedVal));
+    int type1M = findNewMForTypeMD(existingTypeMD, outputType, outputUnsignedVal) + ((existingTypeMD.d==-1 && insertTypeMD.d!=-1)? insertTypeMD.d : 0);
+    int type2M = findNewMForTypeMD(insertTypeMD, outputType, outputUnsignedVal) + ((insertTypeMD.d==-1 && existingTypeMD.d!=-1)? existingTypeMD.d : 0);
+    
+	return max(type1M, type2M);
 }
 
 vector<column> generateNewSchema(string existingSchema, string insertSchema)

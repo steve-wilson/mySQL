@@ -525,7 +525,6 @@ continue_inserting:
           DBUG_RETURN(TRUE);
 
         table_list->reinit_before_use(thd);
-
         open_temporary_tables(thd, table_list);
 
         goto continue_inserting;

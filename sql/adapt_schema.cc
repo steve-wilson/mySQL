@@ -8,6 +8,9 @@
 #include "sql_prepare.h"
 #include "simplesql.h"
 #include "computeNextSchema.h"
+#include "subtables.h"
+
+set<string> indexedColumns;
 
 // Gets table name from schema and removes this from schema.
 string findTableName(string &schema)
@@ -108,6 +111,25 @@ string AdaptSchema::makeAlterStatement(string tableName, const vector<column> &m
     return alterStatement;
 }
                                                                                       
+bool columnHasIndex(string colName)
+{
+	if(indexedColumns.find(colName) != indexedColumns.end())
+    	return true;
+
+	return false;
+}
+
+void populateIndexedColumns(List<Ed_row> list)
+{
+  List_iterator<Ed_row> it(list);
+
+  Ed_row* row;
+  while((row=it++)!=NULL) {
+      if(!((string)row->get_column(3)->str).empty())
+      	indexedColumns.insert((string)row->get_column(0)->str);
+  }
+}
+
 string AdaptSchema::schema_from_row(string& db, string& table, vector<string>& row) {
   vector<typeAndMD> types;
   for(unsigned int i=0; i<row.size(); i++) {
@@ -132,10 +154,21 @@ AdaptSchema::AdaptSchema(READER* reader_in, THD* thd_in, sql_exchange* ex_in, Li
  thd(thd_in), ex(ex_in), field_list(fields_vars_in), method(method_in),
  relaxed_schema_inference(relaxed_schema_inference_in), sample_size(infer_sample_size_in)
 {
+  insert_table = thd->lex->select_lex.table_list.first;
+ 
+  Ed_connection c(thd);
+
+
+  // Find the indexed columns for a table   
+  List<Ed_row> actualTableList = executeQuery(c, "describe " + (string)insert_table->db  + "." +(string)insert_table->table_name);
+  populateIndexedColumns(actualTableList);
   
+  // Find the indexed columns for dummy table  
+  List<Ed_row> dummyList = executeQuery(c, "describe " + (string)insert_table->db  + "." + getSubTableName((string)insert_table->table_name, 1));
+  populateIndexedColumns(dummyList);
 }
 
-bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST **table_list_ptr, string& newSchema) {
+bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, string& newSchema) {
     /*
         In this function we can make whatever calls are necessary
         in order to update the schema to accomodate the incoming data
@@ -144,6 +177,8 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST **table_list_ptr, 
 
         Update: ex->file_name is the name of the csv file
     */
+    thd->lex->select_lex.table_list.save_and_clear(&thd->lex->auxiliary_table_list);
+    add_table_to_select_lex(thd, table_list_ptr, insert_table->db, insert_table->table_name);
 
     bool is_partial_read = sample_size>0;
 
@@ -218,6 +253,32 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST **table_list_ptr, 
     }
 
   return 0;
+}
+
+void add_table_to_select_lex(THD* thd, TABLE_LIST **table_list_ptr, string db, string table_name) {
+  char * table_name_cstr = new char[table_name.length()];
+  strcpy(table_name_cstr, table_name.c_str());
+  
+  char * db_cstr = new char[db.length()];
+  strcpy(db_cstr, db.c_str());
+
+  // create lex string in order to create a new table identifier
+  LEX_STRING table_ls = { C_STRING_WITH_LEN(table_name_cstr) };
+  table_ls.length = table_name.length();
+
+  LEX_STRING db_ls = { C_STRING_WITH_LEN(db_cstr) };  
+  db_ls.length = db.length();
+
+  Table_ident* tid = new Table_ident(thd, db_ls, table_ls, true);
+  // add the new table (the one data should be loaded into) to the table list  
+  thd->lex->select_lex.add_table_to_list(thd, tid, NULL, TL_OPTION_UPDATING,
+                                                TL_WRITE_DEFAULT, MDL_SHARED_WRITE, NULL, 0);
+
+  // changing table_list itself to point to the new table
+  // load data can now proceed
+  *table_list_ptr = thd->lex->select_lex.table_list.first;
+  // BL:  I had to add this line to get autocalculating the field list to work
+  thd->lex->select_lex.context.first_name_resolution_table = thd->lex->select_lex.table_list.first;
 }
 
 bool AdaptSchema::finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_method method){

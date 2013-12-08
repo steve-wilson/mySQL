@@ -508,7 +508,10 @@ int findNewMForTypeMD(typeAndMD typeMD, string outputType, bool outputUnsignedVa
 
 int findOutputM(typeAndMD existingTypeMD, typeAndMD insertTypeMD, string outputType, bool outputUnsignedVal)
 {
-	return max(findNewMForTypeMD(existingTypeMD, outputType, outputUnsignedVal), findNewMForTypeMD(insertTypeMD, outputType, outputUnsignedVal));
+    int type1M = findNewMForTypeMD(existingTypeMD, outputType, outputUnsignedVal) + ((existingTypeMD.d==-1 && insertTypeMD.d!=-1)? insertTypeMD.d : 0);
+    int type2M = findNewMForTypeMD(insertTypeMD, outputType, outputUnsignedVal) + ((insertTypeMD.d==-1 && existingTypeMD.d!=-1)? existingTypeMD.d : 0);
+    
+	return max(type1M, type2M);
 }
 
     typeManager::typeManager(FitPolicy policy_in) 
@@ -537,6 +540,10 @@ typeAndMD typeManager::leastCommonTypeAndMD(typeAndMD &type1, typeAndMD &type2) 
 	typeUnsigned = type1.unsignedVal && type2.unsignedVal;
 				
     finalM = findOutputM(type1, type2, lcsType, typeUnsigned);
+
+    // If going from a type with no d to a type with a d, we need to make sure there
+    // are enough digits to the left of the decimal point
+
     finalD = max(type1.d, type2.d);
 
     typeAndMD ret = {static_cast<TypeWrapper::Type>(type),lcsType,finalM, finalD, typeUnsigned};
