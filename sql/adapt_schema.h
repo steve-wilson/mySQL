@@ -35,6 +35,10 @@ class AdaptSchema {
 
   bool update_schema_to_accomodate_data(TABLE_LIST** table_list, string& newSchema);
 
+  string getColName(const column &curCol);
+
+  string makeAlterStatement(string tableName, const vector<column> &matches);
+
   string schema_from_row(string& db, string& table_name, vector<string>& row);
 
   bool finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_method method);
