@@ -10,7 +10,7 @@
 static const string column_delimiter = "___";
 static const string modified_delimiter = "xxx";
 
-static const int MIN_DUMMY_COLS = 7;
+static const int MIN_DUMMY_COLS = 4;
 static const float DUMMY_COL_FRACTION = .25;
 
 #define DUMMY_STRING "DUMMY"
@@ -632,7 +632,7 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 					{
 						string dummyColToStoreIn = VARCHAR_STRING;
 	
-						if(typeToUnusedDummyCols[DECIMAL_STRING].size() > numNewDecimals)
+						if(typeToUnusedDummyCols[DECIMAL_STRING].size() > (unsigned int)numNewDecimals)
 							dummyColToStoreIn = DECIMAL_STRING;
 						
 						dummyCol dc = typeToUnusedDummyCols[dummyColToStoreIn].back();
@@ -688,7 +688,7 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 					{
 						string dummyColToStoreIn = VARCHAR_STRING;
 	
-						if(typeToUnusedDummyCols[DECIMAL_STRING].size() > numNewDecimals)
+						if(typeToUnusedDummyCols[DECIMAL_STRING].size() > (unsigned int)numNewDecimals)
 							dummyColToStoreIn = DECIMAL_STRING;
 						
 						dummyCol dc = typeToUnusedDummyCols[dummyColToStoreIn].back();

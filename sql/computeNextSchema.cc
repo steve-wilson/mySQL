@@ -561,6 +561,18 @@ inline ParsedType typeManager::match(const char* d, unsigned int length, int & d
   }
 }
 
+// Function to parse an ull from string quickly
+// Assumes the string is well behaved (which it should be
+// due to previous checks)
+unsigned long long atoull(char *p) {
+  unsigned long long k = 0;
+  while (*p) {
+    k = (k<<3)+(k<<1)+(*p)-'0';
+    p++;
+  }
+  return k;
+}
+
 typeAndMD typeManager::inferType_int(char* value, unsigned int length) {
   if(length==0)
     return (typeAndMD){(TypeWrapper::Type) -1, "NULL",-1,-1,false};
@@ -575,34 +587,36 @@ typeAndMD typeManager::inferType_int(char* value, unsigned int length) {
       if(length>19)  
         return (typeAndMD){TypeWrapper::VARCHAR, "VARCHAR", length, -1, false};    
 
-      if(value[0]=='-')
+      if(value[0]=='-') {
           length--;
-
-      long long v = atoll(value);
-
-      if(v<0) {
-        if(v>=-128)   
-          return (typeAndMD){TypeWrapper::TINYINT, "TINYINT", length, -1, false};
-        else if(v>=-32768)   
-          return (typeAndMD){TypeWrapper::SMALLINT, "SMALLINT", length, -1, false};
-        else if(v>=-8388608)   
-          return (typeAndMD){TypeWrapper::MEDIUMINT, "MEDIUMINT", length, -1, false};
-        else   
-          return (typeAndMD){TypeWrapper::INT, "INT", length, -1, false};
-      } else {
-        if(v<=255)
-            return (typeAndMD){TypeWrapper::TINYINT, "TINYINT", length, -1, true};
-        else if(v<=65535)
-            return (typeAndMD){TypeWrapper::SMALLINT, "SMALLINT", length, -1, true};
-        else if(v<=16777215)
-            return (typeAndMD){TypeWrapper::MEDIUMINT, "MEDIUMINT", length, -1, true};
-        else if(v<=2147483647)
-            return (typeAndMD){TypeWrapper::INT, "INT", length, -1, true};
-        else if(v<=18446744073709551615)
-            return (typeAndMD){TypeWrapper::BIGINT, "BIGINT", length, -1, true};
-        else
+          long long v = atoll(value);
+          if(v>=-128)   
+            return (typeAndMD){TypeWrapper::TINYINT, "TINYINT", length, -1, false};
+          else if(v>=-32768)   
+            return (typeAndMD){TypeWrapper::SMALLINT, "SMALLINT", length, -1, false};
+          else if(v>=-8388608)   
+            return (typeAndMD){TypeWrapper::MEDIUMINT, "MEDIUMINT", length, -1, false};
+          else if(v>=-2147483648) 
+            return (typeAndMD){TypeWrapper::INT, "INT", length, -1, false};
+          else if(v>=-9223372036854775807)
+            return (typeAndMD){TypeWrapper::BIGINT, "BIGINT", length, -1, false};
+          else
             return (typeAndMD){TypeWrapper::VARCHAR, "VARCHAR", length, -1, false};    
-      }   
+      } else {
+          unsigned long long v = atoull(value);
+          if(v<=255)
+            return (typeAndMD){TypeWrapper::TINYINT, "TINYINT", length, -1, true};
+          else if(v<=65535)
+            return (typeAndMD){TypeWrapper::SMALLINT, "SMALLINT", length, -1, true};
+          else if(v<=16777215)
+            return (typeAndMD){TypeWrapper::MEDIUMINT, "MEDIUMINT", length, -1, true};
+          else if(v<=2147483647)
+            return (typeAndMD){TypeWrapper::INT, "INT", length, -1, true};
+          else if(v<=18446744073709551615U)
+            return (typeAndMD){TypeWrapper::BIGINT, "BIGINT", length, -1, true};
+          else
+            return (typeAndMD){TypeWrapper::VARCHAR, "VARCHAR", length, -1, false};    
+      }
     }
     case P_DECIMAL:
     {

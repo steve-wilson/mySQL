@@ -6,6 +6,7 @@
 #include "adapt_schema_methods.h"
 #include "computeNextSchema.h"
 #include "reader.h"
+#include "loadcsv.h"
 
 using std::vector;
 
@@ -26,10 +27,14 @@ class AdaptSchema {
   schema_update_method method;
   bool relaxed_schema_inference;
   unsigned int sample_size;
-  TABLE_LIST* insert_table;
+  string db;
+  string table_name;
+  LoadCSV csv;
 
   public:
-  AdaptSchema(READER* reader, THD* thd, sql_exchange* ex, List<Item>* field_list, schema_update_method method, bool relaxed_schema_inference, unsigned int infer_sample_size);
+  AdaptSchema(READER* reader, THD* thd, string db_in, string table_name_in,
+          sql_exchange* ex, List<Item>* field_list, schema_update_method method, 
+          bool relaxed_schema_inference, unsigned int infer_sample_size);
 
   vector<string> getHeader() { return header; }
 

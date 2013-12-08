@@ -279,7 +279,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
 
   /*!EMBEDDED_LIBRARY*/
 
-  AdaptSchema as(&read_info, thd, ex, &fields_vars, merge_method, 
+  AdaptSchema as(&read_info, thd, db_s, table_name_s, ex, &fields_vars, merge_method, 
               relaxed_schema_inference, infer_sample_size);
   // make changes to schema if desired and required
   if (merge_method !=  SCHEMA_UPDATE_NONE) {
@@ -512,6 +512,7 @@ continue_inserting:
         // Now, fix up the schema
         cout << "Fixing schema: \n";
         read_info.reset_line();
+/*
         lastRow.clear();
         while(!read_info.read_field()) {
           (*read_info.row_end)='\0';
@@ -519,7 +520,7 @@ continue_inserting:
         }
         read_info.reset_line();
         newSchema = as.schema_from_row(db_s, table_name_s, lastRow);  
-
+*/
         fields_vars.delete_elements();
         if (as.update_schema_to_accomodate_data(&table_list, newSchema))
           DBUG_RETURN(TRUE);

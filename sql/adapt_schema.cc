@@ -149,23 +149,25 @@ string AdaptSchema::schema_from_row(string& db, string& table, vector<string>& r
   return ss.str();
 }
 
-AdaptSchema::AdaptSchema(READER* reader_in, THD* thd_in, sql_exchange* ex_in, List<Item>* fields_vars_in, schema_update_method method_in, bool relaxed_schema_inference_in, unsigned int infer_sample_size_in)
+AdaptSchema::AdaptSchema(READER* reader_in, THD* thd_in, string db_in, string table_name_in, sql_exchange* ex_in, List<Item>* fields_vars_in, schema_update_method method_in, bool relaxed_schema_inference_in, unsigned int infer_sample_size_in)
  : tm(relaxed_schema_inference_in? typeManager::RELAXED_POW2 : typeManager::STRICT), reader(reader_in),
  thd(thd_in), ex(ex_in), field_list(fields_vars_in), method(method_in),
- relaxed_schema_inference(relaxed_schema_inference_in), sample_size(infer_sample_size_in)
+ relaxed_schema_inference(relaxed_schema_inference_in), 
+ sample_size(infer_sample_size_in), db(db_in), table_name(table_name_in),
+ csv(db, table_name, reader, tm)
 {
-  insert_table = thd->lex->select_lex.table_list.first;
- 
   Ed_connection c(thd);
 
 
   // Find the indexed columns for a table   
-  List<Ed_row> actualTableList = executeQuery(c, "describe " + (string)insert_table->db  + "." +(string)insert_table->table_name);
+  List<Ed_row> actualTableList = executeQuery(c, "describe " + db + "." +table_name);
   populateIndexedColumns(actualTableList);
   
   // Find the indexed columns for dummy table  
-  List<Ed_row> dummyList = executeQuery(c, "describe " + (string)insert_table->db  + "." + getSubTableName((string)insert_table->table_name, 1));
+  List<Ed_row> dummyList = executeQuery(c, "describe " + db  + "." + getSubTableName(table_name, 1));
   populateIndexedColumns(dummyList);
+
+  header = csv.getHeader();
 }
 
 bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, string& newSchema) {
@@ -178,7 +180,7 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
         Update: ex->file_name is the name of the csv file
     */
     thd->lex->select_lex.table_list.save_and_clear(&thd->lex->auxiliary_table_list);
-    add_table_to_select_lex(thd, table_list_ptr, insert_table->db, insert_table->table_name);
+    add_table_to_select_lex(thd, table_list_ptr, db, table_name);
 
     bool is_partial_read = sample_size>0;
 
@@ -196,14 +198,9 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
     if(reader->error)
       return 1;
 
-    LoadCSV csv(table_list->db, table_list->table_name, reader, tm);
-
-    if(header.empty())
-      header = csv.getHeader();
-
     if(is_partial_read)
       reader->set_checkpoint();
-    if(newSchema.length()==0) {
+    //if(newSchema.length()==0) {
       newSchema = csv.calculateSchema(relaxed_schema_inference, sample_size);
 
       // Printf generated schema to outfile
@@ -212,7 +209,7 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
       outfile << oldSchema << std::endl;
       outfile << newSchema << std::endl;
       outfile.close();
-    }
+    //}
  
     if(is_partial_read) 
       reader->reset_line();
