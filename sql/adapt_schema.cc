@@ -149,6 +149,19 @@ string AdaptSchema::schema_from_row(string& db, string& table, vector<string>& r
   return ss.str();
 }
 
+string AdaptSchema::makeViewStatement(string& db, const string& table_name, THD* thd){
+
+        SubTableList subTables(thd, table_name, db);
+        subTables.update_all(thd, &matches);
+
+        stringstream queryStream;
+        queryStream << "CREATE OR REPLACE VIEW " << db << "." << table_name << " AS SELECT ";
+        queryStream << subTables.make_string("UNION ALL SELECT");
+
+        return queryStream.str();
+
+}
+
 AdaptSchema::AdaptSchema(READER* reader_in, THD* thd_in, sql_exchange* ex_in, List<Item>* fields_vars_in, schema_update_method method_in, bool relaxed_schema_inference_in, unsigned int infer_sample_size_in)
  : tm(relaxed_schema_inference_in? typeManager::RELAXED_POW2 : typeManager::STRICT), reader(reader_in),
  thd(thd_in), ex(ex_in), field_list(fields_vars_in), method(method_in),

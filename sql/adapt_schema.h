@@ -39,11 +39,13 @@ class AdaptSchema {
 
   string makeAlterStatement(string tableName, const vector<column> &matches);
 
+  string makeViewStatement(string& db_and_table_name);
+
   string schema_from_row(string& db, string& table_name, vector<string>& row);
 
   bool finalize_schema_update(THD * thd, TABLE_LIST * table_list, schema_update_method method);
 
-  void prepareNaive(THD* thd, string oldSchema, string newSchema, vector<column> matches);
+  void prepareNaive(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr);
   void prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr);
   void prepareDummy(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr);		
 };
