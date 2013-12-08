@@ -7,14 +7,12 @@
 
 using namespace std;
 
-// TODO: add commands/pseudo-triggers to clean up all of the sub tables used to make views work
 void AdaptSchema::prepareViews(THD* thd, string oldSchema, string newSchema, vector<column> matches, TABLE_LIST** table_list_ptr) {
     TABLE_LIST* table_list = *table_list_ptr;
 
     string table_name = table_list->table_name;
     string db = table_list->db;
 
-    int i = getHighestTID(thd, db, table_name);
     Ed_connection c(thd);
 
     // Look for an exact match on table_name
@@ -22,17 +20,29 @@ void AdaptSchema::prepareViews(THD* thd, string oldSchema, string newSchema, vec
     // If table/view already exists
     if (!results.is_empty()){
 
+        int i = getHighestTID(thd, db, table_name);
+
         // in this case, the original table exists (no view created yet)
         // so need to rename original table to subtable before continuing
         if (i==0){
-            string sub_table_name = getSubTableName(table_name, i+1);
-            executeQuery(c,"RENAME TABLE " + db + "." + table_name + " TO " + db + "." + sub_table_name);
+            ++i;
+            string orig_sub_table_name = getSubTableName(table_name, i);
+            executeQuery(c,"RENAME TABLE " + db + "." + table_name + " TO " + db + "." + orig_sub_table_name);
+            // i has already been used for subtable id, so increment
             ++i;
         }
-        executeQuery(c,"DROP VIEW " + db + "." + table_name);
-        executeQuery(c,"CREATE TABLE " + newSchema);
-        string sub_table_name = getSubTableName(table_name, i+1);
-        executeQuery(c,"RENAME TABLE " + db + "." + table_name + " TO " + db + "." + sub_table_name);
+
+        // some subtables and view already exist
+        //else{
+//            executeQuery(c,"DROP VIEW " + db + "." + table_name);
+        //}
+        string sub_table_name = getSubTableName(table_name, i);
+        string new_sub_table_name = getSubTableName(table_name, i+1);
+        // create new table with structure of current table
+        executeQuery(c,"CREATE TABLE " + db + "." + new_sub_table_name + " LIKE " + db + "." + sub_table_name);
+
+        string alter_statement = makeAlterStatement(new_sub_table_name, matches);
+        executeQuery(c, alter_statement);
 
         SubTableList subTables(thd, table_name, db);
         subTables.update_all(thd, &matches);
@@ -42,7 +52,7 @@ void AdaptSchema::prepareViews(THD* thd, string oldSchema, string newSchema, vec
         queryStream << subTables.make_string("UNION ALL SELECT");
 
         string create_view_sql = queryStream.str();
-        executeQuery(c,create_view_sql);
+        executeQuery(c, create_view_sql);
 
         // save the original table in aux list, just in case it is needed later
         // then clear the table list
