@@ -170,6 +170,19 @@ AdaptSchema::AdaptSchema(READER* reader_in, THD* thd_in, string db_in, string ta
   header = csv.getHeader();
 }
 
+string AdaptSchema::makeViewStatement(string& db, const string& table_name, THD* thd, vector<column> * matches_ptr){
+
+        SubTableList subTables(thd, table_name, db);
+        subTables.update_all(thd, matches_ptr);
+
+        stringstream queryStream;
+        queryStream << "CREATE OR REPLACE VIEW " << db << "." << table_name << " AS SELECT ";
+        queryStream << subTables.make_string("UNION ALL SELECT");
+
+        return queryStream.str();
+
+}
+
 bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, string& newSchema) {
     /*
         In this function we can make whatever calls are necessary
@@ -225,7 +238,7 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
           case SCHEMA_UPDATE_ALTER:
           // TODO: move default to AUTO once completed
           case SCHEMA_UPDATE_DEFAULT:
-            prepareNaive(thd, oldSchema, newSchema, matches);
+            prepareNaive(thd, oldSchema, newSchema, matches, table_list_ptr);
             break;
           case SCHEMA_UPDATE_VIEW:
             prepareViews(thd, oldSchema, newSchema, matches, table_list_ptr);

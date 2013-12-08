@@ -30,7 +30,7 @@ string getSubTableName(string table_name, int i);
 void swapTableWithView(THD* thd, string db, string table_name);
 
 // do a "drop table" on all subtables
-void drop_all_subtables(THD * thd, string db, string table_name);
+void drop_all_subtables(THD * thd, string db, string table_name, bool keep_latest = false);
 
 class SubTable{
     

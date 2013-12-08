@@ -230,7 +230,7 @@ void createTableAndView(string db, string dummy_table_name, string table_name, s
 	executeQuery(c, viewStatement);
  }
 
-string getCastString(typeAndMD type)
+static string getCastString(typeAndMD type)
 {
 	// Get m and d strings
 	string d, m;
@@ -312,8 +312,13 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 
     string table_name = table_list->table_name;
     string db = table_list->db;
+
+	int highestTID = getHighestTID(thd, db, table_name);
 	
-	string dummy_table_name = getSubTableName(table_name, 1);
+	if(highestTID == 0)
+		++highestTID;
+
+	string dummy_table_name = getSubTableName(table_name, highestTID);
     
 	// Initial creation of table and view
 	if(oldSchemaDoesntExist(oldSchema))
@@ -594,6 +599,8 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 					executeQuery(c, "DROP VIEW " + db + "." + table_name);
 				
 				executeQuery(c, "CREATE VIEW " + db + "." + table_name + " AS SELECT " + finalViewCols + " FROM " + db + "." + dummy_table_name);
+
+                drop_all_subtables(thd, db, table_name, true);
 			}
 		}
 		// We can just rename the exisitng dummy cols
@@ -705,7 +712,7 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 						alterAddColString += "CHANGE " + dc.colName + " " + it->newName + " " + VARCHAR_STRING;
 					}
 				}
-
+/*
 				// Coalesce columns that have modified columns
 				set<int>::reverse_iterator sit;
 				map<string, set<int> >::iterator cit;
@@ -751,7 +758,7 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 					if(it + 1 != matches.end())
 						viewCols += ",";
 				}
-
+*/
 				if(alterAddColString.length() > 0)
 				{
 					// Alter the table adding columns and renaming old columns
@@ -760,7 +767,8 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 	 
 					// Now drop old view and make a new view that casts the datatypes when appropriate  
 					executeQuery(c, "DROP VIEW " + db + "." + table_name);
-					executeQuery(c, "CREATE VIEW " + db + "." + table_name + " AS SELECT " + viewCols + " FROM " + db + "." + dummy_table_name);
+					//executeQuery(c, "CREATE VIEW " + db + "." + table_name + " AS SELECT " + viewCols + " FROM " + db + "." + dummy_table_name);
+                    executeQuery(c, makeViewStatement(db, table_name, thd, &matches));
 				}
 			}
 		}	
