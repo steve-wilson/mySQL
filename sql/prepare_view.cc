@@ -35,7 +35,7 @@ void AdaptSchema::prepareViews(THD* thd, string oldSchema, string newSchema, vec
         // create new table with structure of current table
         executeQuery(c,"CREATE TABLE " + db + "." + new_sub_table_name + " LIKE " + db + "." + sub_table_name);
 
-        string alter_statement = makeAlterStatement(new_sub_table_name, matches);
+        string alter_statement = makeAlterStatement(db + "." + new_sub_table_name, matches);
         executeQuery(c, alter_statement);
 
         SubTableList subTables(thd, table_name, db);
