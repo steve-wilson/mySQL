@@ -49,7 +49,7 @@ void AdaptSchema::prepareViews(THD* thd, string oldSchema, string newSchema, vec
         queryStream << subTables.make_string("UNION ALL SELECT");
 
         string create_view_sql = queryStream.str();*/
-        string create_view_sql = makeViewStatement(db, table_name, thd);
+        string create_view_sql = makeViewStatement(db, table_name, thd, &matches);
         executeQuery(c, create_view_sql);
 
         // save the original table in aux list, just in case it is needed later

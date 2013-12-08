@@ -9,7 +9,13 @@ static const string modified_delimiter = "xxx";
 
 #define MODIFIED_STRING "MODIFY"
 
-string getCastString(typeAndMD type)
+static void stringToUpper(string &s)
+{
+ 	for(unsigned int i = 0; i < s.length(); ++i)
+     	s[i] = toupper(s[i]);
+}
+
+static string getCastString(typeAndMD type)
 {
 	// Get m and d strings
 	string d, m;
@@ -98,7 +104,7 @@ void swapTableWithView(THD* thd, string db, string table_name){
         executeQuery(c, "RENAME TABLE " + db + "." + tmp_name + " TO " + db + "." + view_name);
 }
 
-void drop_all_subtables(THD * thd, std::string db, std::string table_name, bool keep_latest=false){
+void drop_all_subtables(THD * thd, std::string db, std::string table_name, bool keep_latest){
     Ed_connection c(thd);
     vector<string> to_drop;
     string sub_table_name = sub_table_delimiter + table_name + sub_table_delimiter;
@@ -150,11 +156,11 @@ void SubTable::update_matches(THD* thd, string db, vector<column> * match_cols){
               colNameToModifiedIndexes[baseColName].insert(modifiedIndex);
           }
           my_cols.push_back(colName);
-          col_name_to_type.insert(make_pair(colName,row->get_column(1)->str))
+          col_name_to_type.insert(make_pair(colName,row->get_column(1)->str));
     }
 
     for (vector<column>::iterator it = match_cols->begin(); it!=match_cols->end(); it++){
-        string col_name = ""
+        string col_name = "";
         if (it->addedFromExisting){
             col_name = it->newName;
         }

@@ -39,7 +39,7 @@ class AdaptSchema {
 
   string makeAlterStatement(string tableName, const vector<column> &matches);
 
-  string makeViewStatement(string& db_and_table_name);
+  string makeViewStatement(string& db, const string& table_name, THD* thd, vector<column> * matches_ptr);
 
   string schema_from_row(string& db, string& table_name, vector<string>& row);
 

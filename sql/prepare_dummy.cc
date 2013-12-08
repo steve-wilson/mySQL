@@ -230,7 +230,7 @@ void createTableAndView(string db, string dummy_table_name, string table_name, s
 	executeQuery(c, viewStatement);
  }
 
-string getCastString(typeAndMD type)
+static string getCastString(typeAndMD type)
 {
 	// Get m and d strings
 	string d, m;
@@ -768,7 +768,7 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 					// Now drop old view and make a new view that casts the datatypes when appropriate  
 					executeQuery(c, "DROP VIEW " + db + "." + table_name);
 					//executeQuery(c, "CREATE VIEW " + db + "." + table_name + " AS SELECT " + viewCols + " FROM " + db + "." + dummy_table_name);
-                    executeQuery(c, makeViewStatement(db, table_name, thd);
+                    executeQuery(c, makeViewStatement(db, table_name, thd, &matches));
 				}
 			}
 		}	

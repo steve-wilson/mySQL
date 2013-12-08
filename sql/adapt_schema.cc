@@ -149,10 +149,10 @@ string AdaptSchema::schema_from_row(string& db, string& table, vector<string>& r
   return ss.str();
 }
 
-string AdaptSchema::makeViewStatement(string& db, const string& table_name, THD* thd){
+string AdaptSchema::makeViewStatement(string& db, const string& table_name, THD* thd, vector<column> * matches_ptr){
 
         SubTableList subTables(thd, table_name, db);
-        subTables.update_all(thd, &matches);
+        subTables.update_all(thd, matches_ptr);
 
         stringstream queryStream;
         queryStream << "CREATE OR REPLACE VIEW " << db << "." << table_name << " AS SELECT ";
@@ -241,7 +241,7 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
           case SCHEMA_UPDATE_ALTER:
           // TODO: move default to AUTO once completed
           case SCHEMA_UPDATE_DEFAULT:
-            prepareNaive(thd, oldSchema, newSchema, matches);
+            prepareNaive(thd, oldSchema, newSchema, matches, table_list_ptr);
             break;
           case SCHEMA_UPDATE_VIEW:
             prepareViews(thd, oldSchema, newSchema, matches, table_list_ptr);
