@@ -28,13 +28,8 @@ void AdaptSchema::prepareViews(THD* thd, string oldSchema, string newSchema, vec
             ++i;
             string orig_sub_table_name = getSubTableName(table_name, i);
             executeQuery(c,"RENAME TABLE " + db + "." + table_name + " TO " + db + "." + orig_sub_table_name);
-            // i has already been used for subtable id, so increment
         }
 
-        // some subtables and view already exist
-        //else{
-//            executeQuery(c,"DROP VIEW " + db + "." + table_name);
-        //}
         string sub_table_name = getSubTableName(table_name, i);
         string new_sub_table_name = getSubTableName(table_name, i+1);
         // create new table with structure of current table
@@ -43,7 +38,7 @@ void AdaptSchema::prepareViews(THD* thd, string oldSchema, string newSchema, vec
         string alter_statement = makeAlterStatement(new_sub_table_name, matches);
         executeQuery(c, alter_statement);
 
-        SubTableList subTables(thd, table_name, db
+        SubTableList subTables(thd, table_name, db);
         subTables.update_all(thd, &matches);
 
         stringstream queryStream;
