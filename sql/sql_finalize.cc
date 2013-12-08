@@ -14,10 +14,10 @@ int finalize_schema(THD * thd){
     string sub_table_name = getSubTableName(table_name,i);
     Ed_connection c(thd);
     string final_table_name = getSubTableName(table_name,i+1);
-    executeQuery(c, "CREATE TABLE " + db + "." + final_table_name + " LIKE " + sub_table_name);
+    executeQuery(c, "CREATE TABLE " + db + "." + final_table_name + " LIKE " + db +"."+sub_table_name);
     bool is_error = false;
     const char* error = NULL;
-    executeQuery(c, "INSERT INTO " + db + "." + final_table_name + " SELECT * FROM " + table_name, is_error, error);
+    executeQuery(c, "INSERT INTO " + db + "." + final_table_name + " SELECT * FROM " + db + "." + table_name, is_error, error);
 
     executeQuery(c, "DROP VIEW " + db + "." + table_name);
     executeQuery(c, "RENAME TABLE " + db + "." + final_table_name + " TO " + db + "." + table_name);

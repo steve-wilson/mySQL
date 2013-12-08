@@ -390,7 +390,7 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 			}
 		}
 
-		List<Ed_row> availableTables = executeQuery(c, "show tables like '" + dummy_table_name + "'");
+		List<Ed_row> availableTables = executeQuery(c, "show tables from " + db + "  like '" + dummy_table_name + "'");
 		List_iterator<Ed_row> availableTablesIT(availableTables);
 	
 		while((row = availableTablesIT++) != NULL)

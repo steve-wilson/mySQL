@@ -1022,7 +1022,7 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
       if ((!read_info.enclosed &&
 	  (enclosed_length && length == 4 &&
            !memcmp(pos, STRING_WITH_LEN("NULL")))) ||
-	  (length == 1 && read_info.found_null))
+	  (length == 1 && read_info.found_null) || length==0)
       {
 
         if (real_item->type() == Item::FIELD_ITEM)
