@@ -161,12 +161,8 @@ void SubTable::update_matches(THD* thd, string db, vector<column> * match_cols){
 
     for (vector<column>::iterator it = match_cols->begin(); it!=match_cols->end(); it++){
         string col_name = "";
-        if (it->addedFromExisting){
-            col_name = it->newName;
-        }
-        else{
-            col_name = it->existingName;
-        }
+
+        col_name = (!it->newName.empty())? it->newName : it->existingName;
         // if it->newName or it->existingName is in mycols
         if (find(my_cols.begin(),my_cols.end(),col_name)!=my_cols.end()){
             string col_to_add = col_name;
