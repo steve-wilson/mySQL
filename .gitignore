@@ -25,3 +25,6 @@ bld/
 *.app
 
 *.swp
+
+# tags file
+tags
