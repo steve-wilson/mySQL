@@ -211,8 +211,8 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
     if(reader->error)
       return 1;
 
-    if(is_partial_read)
-      reader->set_checkpoint();
+    //if(is_partial_read)
+    //  reader->set_checkpoint();
     //if(newSchema.length()==0) {
       newSchema = csv.calculateSchema(relaxed_schema_inference, sample_size);
 
@@ -224,8 +224,8 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
       outfile.close();
     //}
  
-    if(is_partial_read) 
-      reader->reset_line();
+    //if(is_partial_read) 
+      //reader->reset_line();
 
     cout << "existing schema: " << oldSchema << "\n";
     cout << "schema derived from file: " << newSchema << "\n";

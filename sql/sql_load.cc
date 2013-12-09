@@ -279,10 +279,12 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
 
   /*!EMBEDDED_LIBRARY*/
 
-  AdaptSchema as(&read_info, thd, db_s, table_name_s, ex, &fields_vars, merge_method, 
-              relaxed_schema_inference, infer_sample_size);
+  AdaptSchema as(&read_info, thd, db_s, table_name_s, ex, &fields_vars, merge_method, relaxed_schema_inference, infer_sample_size);
   // make changes to schema if desired and required
   if (merge_method !=  SCHEMA_UPDATE_NONE) {
+    if(is_partial_read)
+      read_info.set_checkpoint();
+
     if (as.update_schema_to_accomodate_data(&table_list, newSchema))
           DBUG_RETURN(TRUE);
 
@@ -295,6 +297,8 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
       open_file(thd, name, tdb, ex, read_file_from_client, file, is_fifo);
       read_info.init_io(read_file_from_client, is_fifo);
       skip_lines++;
+    } else {
+      read_info.reset_line();
     }
   }
 
@@ -481,7 +485,7 @@ continue_inserting:
         error= read_sep_field(thd, info, table_list, fields_vars,
                              set_fields, set_values, read_info,
 	  		    *enclosed, skip_lines, ignore, checkSchema, 
-                lastRow, is_partial_read, 1, rownum);
+                lastRow, is_partial_read, infer_sample_size, rownum);
 
       // If there was warning on the last row, check to see if we can update the schema
       if(checkSchema && merge_method != SCHEMA_UPDATE_NONE) { 
@@ -524,6 +528,8 @@ continue_inserting:
         fields_vars.delete_elements();
         if (as.update_schema_to_accomodate_data(&table_list, newSchema))
           DBUG_RETURN(TRUE);
+
+        read_info.reset_line();
 
         table_list->reinit_before_use(thd);
         open_temporary_tables(thd, table_list);
