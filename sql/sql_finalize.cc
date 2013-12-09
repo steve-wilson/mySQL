@@ -21,6 +21,10 @@ int finalize_schema(THD * thd){
     string db = thd->lex->select_lex.table_list.first->db;
     string table_name = thd->lex->select_lex.table_list.first->table_name;
     int i = getHighestTID(thd, db, table_name);
+    // If we can't find the table, just stop
+    if(i==0)
+      return 0;
+
     string sub_table_name = getSubTableName(table_name,i);
     Ed_connection c(thd);
     string final_table_name = getSubTableName(table_name,i+1);
