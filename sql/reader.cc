@@ -74,8 +74,12 @@ inline int do_read(IO_CACHE* cache, map<int,BufStruct>& buffers, uint& read_pos,
     cache->read_end = buf + readend;
     cache->read_pos = cache->read_end;
 */
+  int readend = cache->read_end-cache->request_pos;
   cache->request_pos = allocated_buffer;
   cache->buffer = allocated_buffer;
+  cache->read_end = allocated_buffer + readend;
+  cache->read_pos = cache->read_end;
+
   int r = _my_b_get(cache);
 
   if(cache->request_pos==NULL)
@@ -507,9 +511,8 @@ int READER::set_checkpoint() {
   line_start = cache.read_pos-cache.request_pos;
   line_end = cache.read_end-cache.request_pos;
 
-  last_start_pos = read_pos;
-
   if(last_start_pos<read_pos) { 
+    last_start_pos = read_pos;
     int d = read_pos - 1;
     while(true) {
       if(buffers.find(d)==buffers.end())
@@ -526,7 +529,7 @@ int READER::set_checkpoint() {
 
 int READER::reset_line() {
   cache.request_pos = buffers[last_start_pos].request_pos;
-  cache.buffer = buffers[last_start_pos].request_pos;
+  cache.buffer = cache.request_pos;
   cache.read_pos = cache.request_pos+line_start;
   cache.read_end = cache.request_pos+line_end;
   read_pos = last_start_pos;

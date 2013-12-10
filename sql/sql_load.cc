@@ -516,15 +516,7 @@ continue_inserting:
         // Now, fix up the schema
         cout << "Fixing schema: \n";
         read_info.reset_line();
-/*
-        lastRow.clear();
-        while(!read_info.read_field()) {
-          (*read_info.row_end)='\0';
-          lastRow.push_back((const char*)read_info.row_start);
-        }
-        read_info.reset_line();
-        newSchema = as.schema_from_row(db_s, table_name_s, lastRow);  
-*/
+
         fields_vars.delete_elements();
         if (as.update_schema_to_accomodate_data(&table_list, newSchema))
           DBUG_RETURN(TRUE);

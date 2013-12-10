@@ -187,7 +187,7 @@ void SubTable::update_matches(THD* thd, string db, vector<column> * match_cols){
             cols.push_back(col_to_add);
         }
         else{
-            cols.push_back("NULL");
+            cols.push_back("NULL AS " + col_name);
         }
     }
     //sanity check
