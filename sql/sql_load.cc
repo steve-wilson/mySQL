@@ -980,6 +980,7 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
 
   uint warning_count = thd->get_stmt_da()->current_statement_warn_count();
   uint wc = warning_count;
+  bool possible_precision_loss = false;
   for (;;it.rewind())
   {
     rownum++;
@@ -1071,6 +1072,24 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
         if (field == table->next_number_field)
           table->auto_increment_field_not_null= TRUE;
         field->store((char*) pos, length, read_info.read_charset);
+
+        // manually check for possible floating point truncation
+        // mysql will not warn for this
+        // only need to check if it has not occured yet
+        if (!possible_precision_loss){
+            char type_buf[MAX_FIELD_WIDTH];
+            String data_type_S(type_buf, sizeof(type_buf), system_charset_info);
+            field->sql_type(data_type_S);
+            string data_type_s(data_type_S.ptr());
+            if (data_type_s.find("int")!=string::npos){
+                for(uchar * uc_ptr = pos; uc_ptr!=read_info.row_end; ++uc_ptr){
+                    if (*uc_ptr=='.'){
+                        possible_precision_loss = true;
+                    }
+                }
+            }
+         }
+         
       }
       else if (item->type() == Item::STRING_ITEM)
       {
@@ -1161,9 +1180,10 @@ read_sep_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
     }
 
     // If we are supposed to halt on warnings AND this is not a row we should ignore
-    // AND there has been a warning, halt and check the schema
+    // AND there has been a warning (or manually determined loss of precision)
+    // halt and check the schema
     wc = thd->get_stmt_da()->current_statement_warn_count();
-    if(halt_on_warning && rownum>ignore_warning_before && wc>warning_count) {
+    if(halt_on_warning && rownum>ignore_warning_before && (wc>warning_count||possible_precision_loss)) {
       warning_count = wc;
       cout << "warning for line " << rownum << "\n";
       checkSchema = true;
