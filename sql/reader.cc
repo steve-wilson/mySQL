@@ -10,7 +10,7 @@ using std::vector;
 #define my_b_get2(info, cache, read_pos) \
        ((info)->read_pos != (info)->read_end ?\
        ((info)->read_pos++, (int) (uchar) (info)->read_pos[-1]) :\
-       do_read(info, cache, read_pos, freeBuffers))
+       do_read(info, cache, read_pos, freeBuffers, allocated_buffer))
 
 /*
 #define my_b_get2(info, cache) \
@@ -35,7 +35,7 @@ inline int do_read(IO_CACHE* cache, map<int,BufStruct>* buffers, int& read_pos) 
 }
 */
 
-inline int do_read(IO_CACHE* cache, map<int,BufStruct>& buffers, uint& read_pos, vector<uchar*>& freeBuffers) {
+inline int do_read(IO_CACHE* cache, map<int,BufStruct>& buffers, uint& read_pos, vector<uchar*>& freeBuffers, uchar* allocated_buffer) {
   read_pos++;
 
   if(buffers.find(read_pos)!=buffers.end()) {
@@ -74,6 +74,8 @@ inline int do_read(IO_CACHE* cache, map<int,BufStruct>& buffers, uint& read_pos,
     cache->read_end = buf + readend;
     cache->read_pos = cache->read_end;
 */
+  cache->request_pos = allocated_buffer;
+  cache->buffer = allocated_buffer;
   int r = _my_b_get(cache);
 
   if(cache->request_pos==NULL)
@@ -195,6 +197,8 @@ READER::READER(File file_par, uint tot_length, const CHARSET_INFO *cs,
 #endif
     }
   }
+
+  allocated_buffer = cache.request_pos;
 }
 
 void READER::init_io(bool get_it_from_net, bool is_fifo){
@@ -204,6 +208,8 @@ void READER::init_io(bool get_it_from_net, bool is_fifo){
 		      MYF(MY_WME));
   need_end_io_cache = 1;
   eof = false;
+
+  allocated_buffer = cache.request_pos;
 }
 
 READER::~READER()
@@ -501,9 +507,9 @@ int READER::set_checkpoint() {
   line_start = cache.read_pos-cache.request_pos;
   line_end = cache.read_end-cache.request_pos;
 
-  if(last_start_pos<read_pos) {
-    last_start_pos = read_pos;
- 
+  last_start_pos = read_pos;
+
+  if(last_start_pos<read_pos) { 
     int d = read_pos - 1;
     while(true) {
       if(buffers.find(d)==buffers.end())

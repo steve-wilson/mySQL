@@ -44,7 +44,8 @@ public:
 class READER {
   File        file;
   uchar        *buffer,                        /* Buffer for read text */
-        *end_of_buff;                        /* Data in bufferts ends here */
+        *end_of_buff;/* Data in bufferts ends here */
+  uchar* allocated_buffer;
   uint        buff_length,                        /* Length of buffert */
         max_length;                        /* Max length of row */
   const char *field_term_ptr, *line_term_ptr, *line_start_ptr, *line_start_end;
