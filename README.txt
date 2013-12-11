@@ -9,8 +9,8 @@ LOAD DATA [LOW_PRIORITY | CONCURRENT] [LOCAL] INFILE 'file_name'
     INTO TABLE tbl_name
     [SCHEMA_MERGE 
         [STRICT|RELAXED]
-        [ALTER|DUMMY|VIEW|AUTO]
-        [INFER_SAMPLE_SIZE size]
+        [ALTER|DUMMY|VIEW]
+        [INFER_SAMPLE_SIZE rows]
     ]
      [PARTITION (partition_name,...)]
     [CHARACTER SET charset_name]
@@ -31,6 +31,19 @@ Finalize Command:
 
 FINALIZE_SCHEMA tbl_name
 
+Added Keyword descriptions:
+
+SCHEMA_MERGE : specificy that schema should be updated if necessary during load.
+
+STRICT : infer smallest possible data size that can hold data
+RELAXED : infer a data size that can hold data, plus a buffer to allow for expansion
+
+ALTER : use the alter schema update method. table will be modifed using alter table statements sql statements.
+DUMMY : use the dummy schema update method. dummy columns will provide additional storage to avoid alter table modify/add statements when possible.
+VIEW : use the view schema update method. subtables will be added to accomodate nonconforming data, and a view is created to display all data.
+
+INFER_SAMPLE_SIZE <rows> : number of rows to be read when infering the table schema
+
 --------
 Examples
 --------
@@ -44,7 +57,6 @@ NOTE: Some example data sets, including "adults" can be found at mySQL/datasets/
             2. unzipping all zipped directories
                e.g.:
                     % unzip -x <dirname>
-
 */
 
 // This shows how to use our code for the DUMMY METHOD
