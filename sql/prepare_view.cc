@@ -37,28 +37,12 @@ void AdaptSchema::prepareViews(THD* thd, string oldSchema, string newSchema, vec
 
         string alter_statement = makeAlterStatement(db + "." + new_sub_table_name, matches);
         executeQuery(c, alter_statement);
-/*
-        SubTableList subTables(thd, table_name, db);
-        subTables.update_all(thd, &matches);
-        else if(find(my_cols.begin(),my_cols.end(),it->existingName)!=my_cols.end()){
-            cols.push_back(it->existingName);
-        }
-
-        stringstream queryStream;
-        queryStream << "CREATE OR REPLACE VIEW " << db << "." << table_name << " AS SELECT ";
-        queryStream << subTables.make_string("UNION ALL SELECT");
-
-        string create_view_sql = queryStream.str();*/
         string create_view_sql = makeViewStatement(db, table_name, thd, &matches);
         executeQuery(c, create_view_sql);
 
         // save the original table in aux list, just in case it is needed later
         // then clear the table list
         thd->lex->select_lex.table_list.save_and_clear(&thd->lex->auxiliary_table_list);
-
-        // important: create dynamic string or it will get truncated later and cause errors
-        //TODO: make sure this is deleted later
-//        char * sub_table_name_cstr = new char[sub_table_name2.length()];
         add_table_to_select_lex(thd, table_list_ptr, db, new_sub_table_name);
     }
     else{
