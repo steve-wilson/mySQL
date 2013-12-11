@@ -3,6 +3,25 @@
 Installation instructions
 -------------------------
 
+-------------------------------------
+0.Install dependencies (if necessary)
+-------------------------------------
+1. cmake
+
+$ sudo apt-get install cmake
+
+2. Curses
+
+$ sudo apt-get install libncurses5-dev
+
+3. g++
+
+$ sudo apt-get install g++
+
+4. Bison
+
+$ sudo apt-get install bison
+
 -----------------
 I.Configure MySQL
 -----------------
@@ -28,11 +47,11 @@ IV.Postinstallation Setup
 
 1. Make a mysql user group
 
-$ groupadd mysql
+$ sudo groupadd mysql
 
 2. Add yourself to the group
 
-$ usermod -a -G mysql <username>
+$ sudo usermod -a -G mysql <username>
 
 3. Run mysql_install_db and set permissions
 
@@ -43,9 +62,10 @@ $ usermod -a -G mysql <username>
     $ sudo chown -R root .
     $ sudo chown -R <username> data
 
-4. Make sure data dir permissions are correct (defaulted is /var/lib/mysql)
+4. Make sure data dir exists and permissions are correct (default is /var/lib/mysql)
    Check current permissions to see if they are <username> mysql
 
+    $ sudo mkdir /var/lib/mysql
     $ ls -la /var/lib/mysql
 
 If not, set them:
@@ -67,3 +87,6 @@ Confirm installation by starting up the server
 
     $ /usr/local/mysql/bin/mysqld_safe &
 
+As well as a client, with username root
+
+    $ /usr/local/mysql/bin/mysql -u root

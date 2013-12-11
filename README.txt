@@ -35,9 +35,17 @@ FINALIZE_SCHEMA tbl_name
 Examples
 --------
 
+/*
 The following tests demonstrate how to use our system and shows some essential features of our project. The commands assume that the data files are located in some directory, $DATADIR, and can be reached at ‘$DATADIR/FILENAME’.
 
 NOTE: Some example data sets, including "adults" can be found at mySQL/datasets/
+        They can be extacted by:
+            1. navigating to to directory <path_to_mysql>/mySQL/datasets
+            2. unzipping all zipped directories
+               e.g.:
+                    % unzip -x <dirname>
+
+*/
 
 // This shows how to use our code for the DUMMY METHOD
 
