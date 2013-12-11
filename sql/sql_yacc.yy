@@ -13129,7 +13129,6 @@ opt_schema_merge_method:
             | ALTER { Lex->schema_merge = SCHEMA_UPDATE_ALTER;}
             | VIEW_SYM { Lex->schema_merge = SCHEMA_UPDATE_VIEW;}
 			| DUMMY_SYM { Lex->schema_merge = SCHEMA_UPDATE_DUMMY;}
-			| AUTO_SYM { Lex->schema_merge = SCHEMA_UPDATE_AUTO;}
             ;
 
 opt_inference_sample_size:

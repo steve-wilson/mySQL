@@ -127,6 +127,8 @@ SubTable::SubTable(string name_in) :
     name(name_in) {
 }
 
+// determine columns that should be selected from this table
+// when creating a view
 void SubTable::update_matches(THD* thd, string db, vector<column> * match_cols){
 
     Ed_connection c(thd);
@@ -194,6 +196,7 @@ void SubTable::update_matches(THD* thd, string db, vector<column> * match_cols){
     assert(cols.size()==match_cols->size());
 }
 
+// return a string based on cols determined during update_matches
 string SubTable::make_string(string sep, string db){
     stringstream ss;
     for (vector<string>::iterator it = cols.begin();
@@ -223,12 +226,14 @@ SubTableList::SubTableList(THD* thd, string table_name, string db_in) :
     }
 }
 
+// call update_matches on all tables in list
 void SubTableList::update_all(THD* thd, vector<column> * cols){
     for (vector<SubTable>::iterator it = tables.begin(); it!=tables.end(); it++){
         it->update_matches(thd,db,cols);
     }
 }
 
+// convert to string, used to make UNION ALL statements by prepare_view.cc
 string SubTableList::make_string(string sep){
     stringstream ss;
     for (vector<SubTable>::reverse_iterator rit = tables.rbegin();

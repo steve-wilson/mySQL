@@ -108,7 +108,7 @@ DROP TABLE adult;
 Project Code
 ------------
 
-mySQL/sql/sql_yacc.cc:
+mySQL/sql/sql_yacc.yy:
 mySQL/sql/lex.h:
 Parser modifications are done in these files. This allows us to use our custom SQL statements: SCHEMA_MERGE with all corresponding parameters and also the FINALIZE_SCHEMA command. We modify data structures to ensure control flow into our functions as necessary.
 

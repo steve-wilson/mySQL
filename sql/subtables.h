@@ -12,7 +12,7 @@ using namespace std;
 /*
  
    Shared functions that help deal with subtables.
-   Subtables store portions of a whole table during
+   Subtables store portions of a whole logical table during
    the schema merge process.
  
  */

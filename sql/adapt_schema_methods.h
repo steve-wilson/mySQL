@@ -6,8 +6,7 @@ enum schema_update_method {
     SCHEMA_UPDATE_DEFAULT, 
     SCHEMA_UPDATE_ALTER, 
     SCHEMA_UPDATE_VIEW,
-	SCHEMA_UPDATE_DUMMY,
-    SCHEMA_UPDATE_AUTO };
+	SCHEMA_UPDATE_DUMMY };
 
 #endif
 

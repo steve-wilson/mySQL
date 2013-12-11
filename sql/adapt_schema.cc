@@ -195,8 +195,6 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
     thd->lex->select_lex.table_list.save_and_clear(&thd->lex->auxiliary_table_list);
     add_table_to_select_lex(thd, table_list_ptr, db, table_name);
 
-    bool is_partial_read = sample_size>0;
-
     Ed_connection c(thd);
     TABLE_LIST * table_list = *table_list_ptr;
 
@@ -211,9 +209,6 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
     if(reader->error)
       return 1;
 
-    //if(is_partial_read)
-    //  reader->set_checkpoint();
-    //if(newSchema.length()==0) {
       newSchema = csv.calculateSchema(relaxed_schema_inference, sample_size);
 
       // Printf generated schema to outfile
@@ -222,11 +217,7 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
       outfile << oldSchema << std::endl;
       outfile << newSchema << std::endl;
       outfile.close();
-    //}
  
-    //if(is_partial_read) 
-      //reader->reset_line();
-
     cout << "existing schema: " << oldSchema << "\n";
     cout << "schema derived from file: " << newSchema << "\n";
     vector<column> matches = csv.match(oldSchema, newSchema);
@@ -236,7 +227,6 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
       switch(method) {
           //case SCHEMA_UPDATE_NAIVE:
           case SCHEMA_UPDATE_ALTER:
-          // TODO: move default to AUTO once completed
           case SCHEMA_UPDATE_DEFAULT:
             prepareNaive(thd, oldSchema, newSchema, matches, table_list_ptr);
             break;
@@ -246,9 +236,6 @@ bool AdaptSchema::update_schema_to_accomodate_data(TABLE_LIST** table_list_ptr, 
 		  case SCHEMA_UPDATE_DUMMY:
 			prepareDummy(thd, oldSchema, newSchema, matches, table_list_ptr);
 			break;
-		  case SCHEMA_UPDATE_AUTO:
-            // call to decision engine here
-            break;
           case SCHEMA_UPDATE_NONE:
             // shouldn't get here, i.e. there is a check that method isn't 'none' earlier
             break;
