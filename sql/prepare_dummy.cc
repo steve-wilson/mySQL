@@ -10,7 +10,7 @@
 static const string column_delimiter = "___";
 static const string modified_delimiter = "xxx";
 
-static const int MIN_DUMMY_COLS = 6;
+static const int MIN_DUMMY_COLS = 7;
 static const float DUMMY_COL_FRACTION = .25;
 
 #define DUMMY_STRING "DUMMY"
