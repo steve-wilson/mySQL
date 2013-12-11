@@ -10,7 +10,7 @@
 static const string column_delimiter = "___";
 static const string modified_delimiter = "xxx";
 
-static const int MIN_DUMMY_COLS = 4;
+static const int MIN_DUMMY_COLS = 5;
 static const float DUMMY_COL_FRACTION = .25;
 
 #define DUMMY_STRING "DUMMY"
@@ -416,6 +416,7 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 		int numNewVarchars = 0;
 		string finalViewCols = "";
 		map<string, typeAndMD> colNameToTypeMD;
+		bool needToExpand = false;
 
 		// Find added and modifed cols and store in vectors. Also compute counts of existing cols for computing dummyCols to add next
 		// Also maps column name to its type string
@@ -432,6 +433,9 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 			finalViewCols += colName;
 
 			colNameToTypeMD[colName] = it->typeMD;
+
+			if(it->typeMD.m > 255)
+				needToExpand = true;
 
 			if(intTypes.find(it->typeMD.type) != intTypes.end())
 			{
@@ -493,7 +497,7 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 		
 		// Need to add columns so add the exact type instead of storing in dummy cols, do this for when we cannot fit in 
 		// existing dummy cols or we are modifying an existing index
-		if(cantFitInDummyCols || modifyingIndexedColumn)
+		if(cantFitInDummyCols || modifyingIndexedColumn || needToExpand)
 		{
 			// Handle added columns
 			if(fieldsAdded.size() > 0 || fieldsModified.size() > 0)
