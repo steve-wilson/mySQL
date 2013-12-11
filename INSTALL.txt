@@ -1,0 +1,69 @@
+
+-------------------------
+Installation instructions
+-------------------------
+
+-----------------
+I.Configure MySQL
+-----------------
+
+$ cd mySQL/bld
+$ cmake ..
+
+--------
+II.Build
+--------
+
+$ make
+
+-----------
+III.Install
+-----------
+
+$ sudo make install
+
+-------------------------
+IV.Postinstallation Setup
+-------------------------
+
+1. Make a mysql user group
+
+$ groupadd mysql
+
+2. Add yourself to the group
+
+$ usermod -a -G mysql <username>
+
+3. Run mysql_install_db and set permissions
+
+    $ cd /usr/local/mysql
+    $ sudo chown -R <username> .
+    $ sudo chgrp -R mysql .
+    $ ./scripts/mysql_install_db --user=<username>
+    $ sudo chown -R root .
+    $ sudo chown -R <username> data
+
+4. Make sure data dir permissions are correct (defaulted is /var/lib/mysql)
+   Check current permissions to see if they are <username> mysql
+
+    $ ls -la /var/lib/mysql
+
+If not, set them:
+
+    $ sudo chown -R <username> /var/lib/mysql
+    $ sudo chgrp -R mysql /var/lib/mysql
+
+Any other permissions problems, probably have to set user to <username> and group to mysql
+e.g., /var/run/mysqld : 
+
+    $ sudo mkdir /var/run/mysqld
+    $ sudo 
+
+------------------
+V.Start the Server
+------------------
+
+Confirm installation by starting up the server
+
+    $ /usr/local/mysql/bin/mysqld_safe &
+
