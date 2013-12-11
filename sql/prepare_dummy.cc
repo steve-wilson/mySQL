@@ -735,7 +735,7 @@ void AdaptSchema::prepareDummy(THD* thd, string oldSchema, string newSchema, vec
 					viewCol += ") AS " + getCastString(colNameToTypeMD[cit->first]) + ") AS " + cit->first;
 					colNameToViewColString.insert(make_pair<string, string>(cit->first, viewCol)); 
 				}
-
+		
 				for(it = matches.begin(); it != matches.end(); ++it)
 				{
 					string colName = it->existingName;
