@@ -59,6 +59,9 @@ NOTE: Some example data sets, including "adults" can be found at mySQL/datasets/
                     % unzip -x <dirname>
 */
 
+// Set the database
+use test;
+
 // This shows how to use our code for the DUMMY METHOD
 
 LOAD DATA INFILE '$DATADIR/adult_0.csv' INTO TABLE adult_dummy SCHEMA_MERGE DUMMY;
