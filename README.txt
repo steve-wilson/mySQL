@@ -92,15 +92,11 @@ DESCRIBE ___adult_dummy___1;
 // The table has now been expanded removing the modified column for the salary and 
 // adding additional dummy columns again
 
-DROP TABLE adult_dummy;
-
-DROP VIEW adult_dummy;
-
 FINALIZE_SCHEMA adult_dummy;
 // Materializes the view and drops the underlying table with dummy columns
 
 show tables;
-select * from adult_dummy;
+select count(*) from adult_dummy;
 DROP TABLE adult_dummy;
 
 // The following statements use and show results from the View method
